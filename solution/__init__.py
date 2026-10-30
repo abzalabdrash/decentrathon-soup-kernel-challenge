@@ -26,7 +26,12 @@ Modules:
   the head computed in one streamed pass over the vocabulary (own kernels); switched on from
   fused_ce.patch_qwen2_causal_lm (SOUP_SOLUTION_HEAD_STREAM=0 turns it off);
 - weight_stream.py: the layers' 4-bit weights in pinned host memory, a ring of K layers on the GPU;
-- warmup.py: the kernels compiled by a background thread while Soup loads the model;
+- warmup.py: the kernels compiled by a helper process during apply(), loaded by a background
+  thread while Soup loads the model;
+- startup.py: apply()'s imports without work the run does not use (trl's second metadata scan,
+  scikit-learn, wandb, bitsandbytes' Inductor), the imported objects frozen for the garbage
+  collector, the tokenizer hashed fast by datasets in Soup's setup; a first-step phase mark; a
+  profile of the trainer build (diagnostics);
 - phases.py: wall-clock marks of the run's phases in the log;
 - diag.py: diagnostics of a run (SOUP_SOLUTION_DIAG=1 only): memory at the marks, a PCIe probe,
   an allocation snapshot of one step, a chrome trace of two steps.
@@ -37,7 +42,8 @@ SOUP_SOLUTION_NF4=0, SOUP_SOLUTION_ROPE=0, SOUP_SOLUTION_FUSED_PROJ=0, SOUP_SOLU
 offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0,
 SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARLEN_ATTN=0,
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
-(SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head).
+(SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
+SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0; diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
 import os
@@ -51,6 +57,14 @@ def apply():
     from .phases import mark, patch_soup_phases
 
     mark("apply begin")
+    if _on("SOUP_SOLUTION_WARMUP"):
+        from .warmup import start_compile_helper
+
+        start_compile_helper()  # Triton compiles in a helper process while apply() imports
+    if _on("SOUP_SOLUTION_IMPORT_DIET"):
+        from .startup import prepare_imports
+
+        prepare_imports()  # trl without a second metadata scan, without sklearn and wandb
     from .embed16 import patch_soup_setup
     from .fused_ce import patch_qwen2_causal_lm
     from .mlp16 import patch_qwen2_mlp_half
@@ -98,13 +112,26 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
+                          patch_soup_startup_profile)
+
+    patch_soup_first_step_mark()
+    if _on("SOUP_SOLUTION_DATASET_HASH"):
+        patch_soup_dataset_hashing()  # datasets hashes the tokenizer in 0.09 s instead of 1 s
+    if os.environ.get("SOUP_SOLUTION_PROFILE_STARTUP", "0") not in ("0", "false", "no", ""):
+        patch_soup_startup_profile()  # off by default: cProfile of the trainer build, see startup.py
     if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):
         from .diag import patch_soup_diag
 
         patch_soup_diag()  # off by default: memory marks, PCIe probe, one step's allocation history, a trace
     if _on("SOUP_SOLUTION_WARMUP"):
-        from .warmup import patch_soup_warmup, start_background_warmup
+        from .warmup import patch_soup_warmup, start_background_warmup, watch_compiles
 
+        watch_compiles()  # logs any kernel compiled or loaded outside the warm-up
         patch_soup_warmup(start_in_setup=False)
-        start_background_warmup()
+        start_background_warmup()  # waits for the helper, then loads its kernels from the cache
+    if _on("SOUP_SOLUTION_IMPORT_DIET"):
+        from .startup import freeze_imported_objects
+
+        freeze_imported_objects()  # later full garbage collections skip the imported objects
     mark("apply end")
