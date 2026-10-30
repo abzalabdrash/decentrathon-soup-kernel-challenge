@@ -15,6 +15,12 @@ into the same kernel: it reads the residual (fp32) and the attention output (fp1
 bitsandbytes' o_proj under autocast), writes the new residual and the normed rows in one pass, and
 its backward writes the gradient of both addends at once.
 
+Inside the packed training step (unpad.varlen_model_forward) the layer-end `residual + mlp_out` is
+fused the same way, into the next layer's input norm (and the final norm): the layers hand the two
+addends on unsummed. And `norm_source` / `rebuild` let a consumer of a norm's output drop its own
+half copy of it for the backward: the output is recomputed bit for bit from the input (or sum) and
+rstd that the norm keeps anyway (fused_proj.py's q/k/v projection does this).
+
 The numerics follow Qwen2RMSNorm step for step: fp32 math, the normed rows rounded back to the input
 dtype before the fp32 weight multiply, the output in `promote_types(weight, input)`; in the backward,
 dL/d(normed) is rounded to the input dtype where eager autograd rounds it. Only the order of the sum
@@ -245,6 +251,36 @@ def rmsnorm(x, weight, eps):
     return RMSNormFunction.apply(x, weight, float(eps))
 
 
+def norm_source(y):
+    """The autograd node of the norm whose output `y` is (RMSNormFunction's output, or the normed
+    output of AddRMSNormFunction), when `rebuild` can recompute y from what that node keeps for its
+    own backward; else None. The node's saved tensors live until its backward, which runs after the
+    backward of anything that consumed y."""
+    node = getattr(y, "grad_fn", None)
+    if node is None or y.dtype != torch.float32:
+        return None
+    if isinstance(node, RMSNormFunction._backward_cls) and y.output_nr == 0:
+        return node
+    if isinstance(node, AddRMSNormFunction._backward_cls) and y.output_nr == 1:
+        return node
+    return None
+
+
+def rebuild(node, dtype):
+    """The output of the norm `node` (from `norm_source`) rounded to `dtype`, (rows, C), bit for bit
+    what `y.to(dtype)` gave in the forward: the saved input (or sum) times the saved rstd, rounded to
+    the input dtype, times the weight, the fp32 product rounded to `dtype`. Two elementwise launches,
+    no reduction, so no dependence on the order of the sum of squares."""
+    source, weight, rstd = node.saved_tensors
+    with torch.no_grad():
+        normed = torch.mul(source, rstd[:, None], out=torch.empty(
+            source.shape, dtype=torch.float32, device=source.device))
+        if source.dtype != torch.float32:
+            normed = normed.to(source.dtype).to(torch.float32)
+        return torch.mul(normed, weight, out=torch.empty(source.shape, dtype=dtype,
+                                                         device=source.device))
+
+
 def add_rmsnorm(residual, branch, weight, eps):
     """(r, y) with r = residual + branch and y = Qwen2RMSNorm(r), same shapes."""
     return AddRMSNormFunction.apply(residual, branch, weight, float(eps))
@@ -299,9 +335,32 @@ def _plain_norm(norm, norm_cls):
             and "forward" not in norm.__dict__ and _number(getattr(norm, "variance_epsilon", None)))
 
 
+def _addable(residual, branch):
+    return (torch.is_tensor(branch) and branch.shape == residual.shape
+            and branch.device == residual.device and branch.dtype in DTYPES)
+
+
+def add_norm(norm, residual, branch, norm_cls):
+    """(residual + branch, norm(residual + branch)) for a Qwen2RMSNorm `norm`: one kernel when the
+    norm is a plain one the kernel fits, else the add and the norm's own forward. The sum is the
+    base's `residual + branch` (fp32 residual, half branch: summed and kept in fp32)."""
+    if (_plain_norm(norm, norm_cls) and fits(residual, norm.weight) and _addable(residual, branch)):
+        return add_rmsnorm(residual, branch, norm.weight, norm.variance_epsilon)
+    total = residual + branch
+    return total, norm(total)
+
+
 def patch_qwen2_decoder_layer():
     """Qwen2DecoderLayer.forward with `residual + attn_out` and post_attention_layernorm in one
-    kernel; the calls of input_layernorm, self_attn and mlp and their arguments are the original's."""
+    kernel; the calls of input_layernorm, self_attn and mlp and their arguments are the original's.
+
+    Inside unpad.varlen_model_forward the layer-end `residual + mlp_out` is carried to the next
+    layer and summed in that layer's input norm kernel instead (one fp32 add per layer less each
+    way): called with `_soup_carry=True` the layer returns (mlp_out, residual) unsummed, and called
+    with `_soup_branch=mlp_out` of the previous layer it starts from `hidden_states + branch`. The
+    branch comes first: weight_stream.py marks output[0] of a layer to bring the layer's weights in
+    before its backward, and the branch's gradient is the one that leads into this layer's MLP (the
+    residual's leads into the post-attention norm, which also waits for the MLP's)."""
     from transformers.models.qwen2 import modeling_qwen2
 
     cls = modeling_qwen2.Qwen2DecoderLayer
@@ -311,14 +370,21 @@ def patch_qwen2_decoder_layer():
     norm_cls = modeling_qwen2.Qwen2RMSNorm
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
-                use_cache=False, position_embeddings=None, **kwargs):
+                use_cache=False, position_embeddings=None, _soup_branch=None, _soup_carry=False,
+                **kwargs):
         norm = getattr(self, "post_attention_layernorm", None)
         if not _plain_norm(norm, norm_cls) or not fits(hidden_states, norm.weight):
+            if _soup_branch is not None:
+                hidden_states = hidden_states + _soup_branch
             return original(self, hidden_states, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if _soup_branch is not None:
+            residual, hidden_states = add_norm(self.input_layernorm, hidden_states, _soup_branch,
+                                               norm_cls)
+        else:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -337,9 +403,12 @@ def patch_qwen2_decoder_layer():
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if _soup_carry and _addable(residual, hidden_states):
+            return hidden_states, residual
         hidden_states = residual + hidden_states
         return hidden_states
 
+    forward._soup_carries = True  # unpad.varlen_model_forward carries the residual through it
     cls.forward = forward
     cls._soup_original_forward = original
     cls._soup_add_rmsnorm = True

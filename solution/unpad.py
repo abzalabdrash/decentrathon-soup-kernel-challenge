@@ -21,6 +21,11 @@ to none of the spans; attention treats it as one more sequence (`sequences`), so
 finite values: no real token attends to them, they get no loss, so their gradient is exactly zero
 and they add exactly nothing to the LoRA weight gradients (sums over all rows).
 
+Residual carry: with rmsnorm.py's decoder layer, each layer hands its MLP output and its residual
+on unsummed and the next layer's input norm adds them in its kernel (the final norm for the last
+layer), with the base's rounding: one fp32 add less per layer in the forward, and its gradient
+accumulation and half cast less in the backward. `SOUP_SOLUTION_CARRY_RESIDUAL=0` turns it off.
+
 Attention (`attention`): one launch of the CUTLASS memory-efficient kernel each way per layer for
 all the sequences at once (`aten::_efficient_attention_forward/backward` with `cu_seqlens`, the
 variable-length form of the kernel SDPA's mem-efficient backend runs; the per-row SDPA calls it
@@ -52,6 +57,7 @@ def _env_flag(name, default):
 _STATE = {
     "pad": int(os.environ.get("SOUP_SOLUTION_PAD_TOKENS", "16") or "0"),
     "varlen": _env_flag("SOUP_SOLUTION_VARLEN_ATTN", "1"),
+    "carry": _env_flag("SOUP_SOLUTION_CARRY_RESIDUAL", "1"),
 }
 _CTX = {"spans": None, "cu": None}
 _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
@@ -123,17 +129,43 @@ def varlen_model_forward(model, input_ids, position_ids, spans):
         position_ids = torch.cat([position_ids, tail.unsqueeze(0)], dim=1)
     hidden = model.embed_tokens(input_ids)
     position_embeddings = model.rotary_emb(hidden, position_ids)
+    layers = model.layers[: model.config.num_hidden_layers]
+    carry = _carries(layers)
+    branch = None  # the previous layer's MLP output, not yet added to `hidden` (see rmsnorm.py)
     with varlen(spans):
         bounds = sequences(spans, n + pad)
         if bounds is not None and hidden.is_cuda:
             _cu_seqlens(bounds, hidden.device)  # here, before any layer's work is queued
-        for layer in model.layers[: model.config.num_hidden_layers]:
-            hidden = layer(hidden, attention_mask=None, position_ids=position_ids,
-                           past_key_values=None, use_cache=False,
-                           position_embeddings=position_embeddings)
-    if pad:
-        hidden = hidden[:, :n]
-    return model.norm(hidden)
+        for layer in layers:
+            extra = {"_soup_branch": branch, "_soup_carry": True} if carry else {}
+            out = layer(hidden, attention_mask=None, position_ids=position_ids,
+                        past_key_values=None, use_cache=False,
+                        position_embeddings=position_embeddings, **extra)
+            if carry and isinstance(out, tuple):
+                branch, hidden = out
+            else:
+                hidden, branch = out, None
+    if branch is None:
+        hidden = model.norm(hidden)
+    else:
+        from transformers.models.qwen2 import modeling_qwen2 as mq
+
+        from .rmsnorm import add_norm
+
+        hidden = add_norm(model.norm, hidden, branch, mq.Qwen2RMSNorm)[1]
+    # the norm works row by row: the real rows are the same with or without the tail
+    return hidden[:, :n] if pad else hidden
+
+
+def _carries(layers):
+    """Whether the layers' forward is rmsnorm.py's, which carries `residual + mlp_out` into the next
+    layer's input norm (`SOUP_SOLUTION_CARRY_RESIDUAL=0` turns it off)."""
+    if not _STATE["carry"] or len(layers) == 0:
+        return False
+    forward = type(layers[0]).forward
+    return (getattr(forward, "_soup_carries", False)
+            and all(type(layer).forward is forward and "forward" not in vars(layer)
+                    and not getattr(layer, "gradient_checkpointing", False) for layer in layers))
 
 
 # ---------------------------------------------------------------------------------------------

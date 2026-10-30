@@ -78,7 +78,7 @@ def _run(fn, qkv, q, k, v, bounds, grad):
 @pytest.fixture(autouse=True)
 def _defaults():
     saved = dict(unpad._STATE)
-    unpad._STATE.update(pad=16, varlen=True)
+    unpad._STATE.update(pad=16, varlen=True, carry=True)
     yield
     unpad._STATE.update(saved)
 
@@ -446,3 +446,89 @@ def test_patched_attention_outside_varlen_is_original(attention_patch):
             bad, _ = attn(x, pe, None)
     assert _rel(out, ref) < 2e-3
     assert torch.equal(bad, ref)  # took the original forward
+
+
+# ------------------------------------------------------------------------------------------------
+# the residual carried into the next layer's input norm (rmsnorm.py's decoder layer)
+
+
+@pytest.fixture()
+def layer_patches():
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    from solution import rmsnorm
+
+    names = ("forward", "_soup_original_forward", "_soup_varlen", "_soup_rmsnorm",
+             "_soup_add_rmsnorm")
+    owners = (mq.Qwen2Attention, mq.Qwen2RMSNorm, mq.Qwen2DecoderLayer)
+    saved = [(cls, name, vars(cls).get(name, _MISSING)) for cls in owners for name in names]
+    unpad.patch_qwen2_attention()
+    rmsnorm.patch_qwen2_rmsnorm()
+    rmsnorm.patch_qwen2_decoder_layer()
+    yield
+    for cls, name, value in saved:
+        if value is _MISSING:
+            if name in vars(cls):
+                delattr(cls, name)
+        else:
+            setattr(cls, name, value)
+
+
+def _launches(fn):
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        result = fn()
+        torch.cuda.synchronize()
+    return sum(e.device_type == torch.autograd.DeviceType.CUDA for e in prof.events()), result
+
+
+@pytest.mark.parametrize("lengths", [[40, 31, 17], [100, 1, 64, 7]])
+def test_residual_carry_matches_the_plain_loop(layer_patches, lengths):
+    model = _tiny_model()
+    assert unpad._carries(model.model.layers)
+    results = []
+    for carry in (False, True, False, True):  # the second pair after warm-up, for the counts
+        unpad._STATE["carry"] = carry
+        results.append(_launches(lambda: _model_step(model, lengths, [])))
+    (n_plain, (ref_hidden, ref_grads)), (n_carry, (hidden, grads)) = results[2], results[3]
+    # the forward: the same sums in the same fp32 rounding, bitwise the plain loop's. The backward
+    # adds the residual's gradient inside the norm kernel (an fma, as the post-attention fusion
+    # does), and the attention backward's dq is not bit-reproducible anyway
+    assert torch.equal(hidden, ref_hidden)
+    for g, ref in zip(grads, ref_grads):
+        assert _rel(g, ref) < 1e-3
+    # per layer: the forward add, and the half cast of the branch's gradient when the MLP returns
+    # half (it does unless another test module left an MLP patch in place); per boundary between
+    # layers: the sum of the residual's two gradients; one fill more (the final norm's unused sum
+    # output gets a zero gradient, which keeps the backward on its warmed-up kernel variant)
+    layers = len(model.model.layers)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+        half_branch = model.model.layers[0].mlp(torch.randn(1, 4, 256, device="cuda")).dtype != \
+            torch.float32
+    expected = (3 if half_branch else 2) * layers - 2
+    assert n_plain - n_carry == expected, (n_plain, n_carry, half_branch)
+
+
+def test_residual_carry_falls_back_per_layer(layer_patches):
+    """A hook on a layer's input norm: that layer adds the carried branch itself and runs its norm as
+    the original would; the results stay those of the plain loop."""
+    model = _tiny_model()
+    lengths = [40, 31, 17]
+    unpad._STATE["carry"] = False
+    ref_hidden, ref_grads = _model_step(model, lengths, [])
+    seen = []
+    handle = model.model.layers[1].input_layernorm.register_forward_hook(
+        lambda *a: seen.append(1))
+    try:
+        unpad._STATE["carry"] = True
+        hidden, grads = _model_step(model, lengths, [])
+    finally:
+        handle.remove()
+    assert seen == [1]
+    assert torch.equal(hidden, ref_hidden)
+    for g, ref in zip(grads, ref_grads):
+        assert _rel(g, ref) < 1e-3
+    model.model.layers[0].gradient_checkpointing = True  # never carried through a checkpoint
+    assert not unpad._carries(model.model.layers)
