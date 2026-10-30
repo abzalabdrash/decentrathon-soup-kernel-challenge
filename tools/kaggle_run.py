@@ -84,12 +84,6 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
-    if env:  # experiment switches for solution.apply(); the measured subprocesses inherit os.environ
-        lines = ["import os\n"] + [f"os.environ[{k!r}] = {v!r}\n" for k, v in env]
-        for cell in code_cells:
-            if "harness/run_task.py" in "".join(cell["source"]):
-                cell["source"] = lines + cell["source"]
-                break
     # cell 1: REPO_URL / COMMIT
     code_cells[0]["source"] = [f'REPO_URL = "{repo_url}"  # your repository\n',
                                f'COMMIT = "{commit}"  # the commit you submit; empty = the default branch\n']
@@ -103,6 +97,12 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
             cell["source"] = CHECK_CELLS[mode]
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
             sys.exit("the clone cell of the template changed: cannot inject the token fallback")
+    if env:  # experiment switches for solution.apply(); the measured subprocesses inherit os.environ
+        lines = ["import os\n"] + [f"os.environ[{k!r}] = {v!r}\n" for k, v in env]
+        for cell in code_cells:
+            if "harness/run_task.py" in "".join(cell["source"]):
+                cell["source"] = lines + cell["source"]
+                break
     for cell in cells:
         if cell["cell_type"] == "code":  # markdown cells must not carry outputs (nbformat rejects it)
             cell["outputs"] = []
