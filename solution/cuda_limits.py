@@ -9,10 +9,14 @@ soup-night-ctx): device memory outside the allocator 132.9 MiB after a cuBLAS GE
 the limit at 512 B, 102.9 MiB at 256 B, still 102.9 MiB after the attention forward/backward, the
 NF4 dequantization and the GEMM ran again (none of them grew it back).
 
-SOUP_SOLUTION_STACK_LIMIT: bytes per thread, set once when training starts (offload.py's train
-wrapper, after the warm-up); 0 leaves the context alone. The call goes to the CUDA runtime library
+SOUP_SOLUTION_STACK_LIMIT: bytes per thread (256 by default), set once when training starts
+(offload.py's train wrapper, after the warm-up); 0 leaves the context alone. T4, training
+(soup-night-stack, ABBA): nvidia-smi peak 479 MiB at the default 1 KiB, 459 at 512 B, 449 at 256 B,
+steps 3+ within the session's noise, eval loss unchanged; the peak never grew back during training. The call goes to the CUDA runtime library
 torch's wheels ship (the same primary context); any failure leaves the limit as it was. A kernel that
-needs more stack than the limit still runs: the driver grows the reservation for it.
+needs more stack than the limit still runs: the driver raises the limit for it ("The driver
+automatically increases the per-thread stack size for each kernel launch as needed", cuCtxSetLimit),
+and the raised value stays.
 """
 
 import ctypes
@@ -25,7 +29,7 @@ _STATE = {"bytes": None, "lib": None}
 
 def _env_bytes():
     try:
-        return max(0, int(os.environ.get("SOUP_SOLUTION_STACK_LIMIT", "0") or "0"))
+        return max(0, int(os.environ.get("SOUP_SOLUTION_STACK_LIMIT", "256") or "0"))
     except ValueError:
         return 0
 

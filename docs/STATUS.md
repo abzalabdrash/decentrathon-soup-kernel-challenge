@@ -2,6 +2,14 @@
 
 Обновляется главной сессией после каждого влитого модуля и каждого прогона на Kaggle. Для передачи эстафеты: читать этот файл, `docs/TASKS.md`, `README.md`.
 
+## Ночь: память вне аллокатора, лимит стека CUDA (в `claude/night-combined`, включено)
+
+**Диагностика** (`solution/bench_ctx.py`, peagverr, soup-night-ctx): на T4 память вне аллокатора torch (то, что nvidia-smi видит сверх `memory_reserved`): контекст 104,9 MiB, после первого GEMM cuBLAS 132,9 (+28: библиотека cuBLAS/cuBLASLt), дальше attention, bitsandbytes и наши ядра Triton ничего не добавляют. Лимиты контекста: стек 1 024 Б на поток (резерв 1 КиБ × 1 024 потока × 40 SM = 40 MiB), printf FIFO 1,25 MiB, куча malloc 8 MiB (не выделяется без device malloc). Лимит стека 512 Б: −20 MiB, 256 Б: −30 MiB; после этого attention forward/backward, распаковка NF4 и GEMM идут без ошибок и резерв не растёт обратно.
+
+**Переключатель** `SOUP_SOLUTION_STACK_LIMIT` (`solution/cuda_limits.py`, по умолчанию **256**; ставится один раз в начале обучения после прогрева через `cudaDeviceSetLimit` той же библиотеки рантайма, что у torch; 0 оставляет как есть). По документации драйвера ядро, которому нужно больше стека, всё равно запустится: драйвер сам поднимет лимит, и поднятое значение останется. Тест `test_cuda_limits.py`.
+
+**T4** (peagverr, soup-night-stack, 2e99a07, ABBA, 2 раунда + холостой; умолчания с ранним оффлоадом): стена / шаги 3+ / пик nvidia-smi: base 42,70 с / 24,38 / 479 MiB; стек 512 Б 42,82 / 24,56 / **459**; стек 256 Б 43,00 / 24,64 / **449**; reserved и alloc у всех 312 / 279,1; eval 2,04933–2,04939; лог: `CUDA stack limit 1024 -> 256 bytes per thread`. Разница по шагам в шуме сессии (два прогона base разошлись на 1,15 с). Итог: **−30 MiB (−6 %)**, m ≈ 31,9 на публичных данных.
+
 ## Ночь: ранний оффлоад gate|up (ветка `claude/night-early`, влита в `claude/night-combined`, включена)
 
 **Что сделано.** `SOUP_SOLUTION_OFFLOAD_EARLY` (offload.py, fused_proj.py; по умолчанию **1**): копия gate|up слоя на хост начинается сразу после GEMM gate|up (`offload_early`, хук упаковки после forward MLP берёт тот же дескриптор, копия одна), а каждый forward MLP сначала ждёт на GPU копии в полёте (`drain_inflight`): копия предыдущего слоя успевает пройти под SwiGLU, GEMM down и блоком attention следующего слоя, и его gate|up освобождается до того, как следующий слой выделит свой. С ним по умолчанию окно префетча backward в один тензор: распаковка gate|up слоя тянет его вход, распаковка входа (пост-attention норма) тянет gate|up предыдущего слоя, так что в backward MLP два gate|up больше не живут одновременно. Тест `test_xoffload.py::test_mlp_activation_copy_starts_early`. Попутно `SOUP_SOLUTION_GC_PAUSE=freeze|off` (сборщик мусора на время обучения, по умолчанию выключен, замер soup-night-gc идёт) и `solution/bench_ctx.py` (память вне аллокатора по стадиям, замер ещё не запускался).
