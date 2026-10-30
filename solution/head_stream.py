@@ -78,7 +78,10 @@ DEFAULT_SLOTS = 2
 # where a training forward starts copying the head's first chunks: "embedding" (the start of the
 # forward: the ring alive through the forward; the lowest reserved peak on the T4), "norm" (the final
 # norm, after the last layer), "head" (no early copies)
-DEFAULT_PREFETCH = "embedding"
+# "norm" since the night session: with the layers' activations offloaded or recomputed the step's
+# peak is a layer's MLP forward, where a ring made at the embedding would still be alive (T4, one
+# session: 581 -> 541 MiB nvidia-smi, +0.3 s); "embedding" was better while the head set the peak
+DEFAULT_PREFETCH = "norm"
 MAX_ROWS = 32768  # one Triton block holds a row's whole chunk
 BLOCK_D = 512
 STAGING_ROWS = 4096  # pinned staging rows of the embedding lookup (grows on demand)

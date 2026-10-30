@@ -100,7 +100,7 @@ RESIDUAL_MIN_NUMEL = 256 * 1024  # an armed fp32 residual below this (170 tokens
 # Python Function's saved tensors are packed after its forward returns, so the mark has to outlive
 # the save_for_backward call; a mark nobody takes (no graph) only means one fp32 tensor at that
 # address may later go to host too, which is still correct
-_RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "0").strip().lower()
+_RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "1").strip().lower()
              not in ("0", "false", "no", ""), "marked": {}}
 # SOUP_SOLUTION_OFFLOAD_ATTN=1 (night task N1c): instead of fused_proj's attention recompute, the
 # attention's saved q, compact k and v, output and log-sum-exp (unpad.py) and the post-attention
@@ -424,7 +424,7 @@ class Offloader:
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
 # SOUP_SOLUTION_CLEAR_CUBLAS_WS=1: at the start of training, after the warm-up (which waits for its
 # thread first), the cuBLAS workspaces are freed so the warm-up thread's is not kept for the run
-CLEAR_CUBLAS = os.environ.get("SOUP_SOLUTION_CLEAR_CUBLAS_WS", "0").strip().lower() not in (
+CLEAR_CUBLAS = os.environ.get("SOUP_SOLUTION_CLEAR_CUBLAS_WS", "1").strip().lower() not in (
     "0", "false", "no", "")
 # SOUP_SOLUTION_OFFLOAD_DRAIN_LAST=1: the last layer's MLP forward first lets the copies still in
 # flight finish (drain_inflight), so the previous layer's (gate|up) is not alive next to its own

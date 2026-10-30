@@ -708,7 +708,7 @@ class _QKVRope(torch.autograd.Function):
 
 
 def _recompute_mode():
-    value = os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "0").strip().lower()
+    value = os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "1").strip().lower()
     if value in ("1", "true", "yes", "on", "all"):
         return "all"
     return "auto" if value == "auto" else None
@@ -919,7 +919,7 @@ def _fused_attention(attn, x, position_embeddings, plan):
 
 
 _MLP_MEMORY = {"recompute": False,
-               "inplace": os.environ.get("SOUP_SOLUTION_MLP_BWD_INPLACE", "0").strip().lower()
+               "inplace": os.environ.get("SOUP_SOLUTION_MLP_BWD_INPLACE", "1").strip().lower()
                not in ("0", "false", "no", "")}
 
 

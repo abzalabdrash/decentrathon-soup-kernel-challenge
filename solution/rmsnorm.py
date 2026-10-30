@@ -54,7 +54,7 @@ DW_PROGRAMS_PER_SM = 4  # programs of the dweight path; each keeps a partial sum
 
 # SOUP_SOLUTION_SPLIT_SUM=1: the post-attention norm keeps (residual, attention output) for its
 # backward instead of their fp32 sum (see the module doc); read at import, like the other switches
-_SPLIT = {"keep": os.environ.get("SOUP_SOLUTION_SPLIT_SUM", "0").strip().lower()
+_SPLIT = {"keep": os.environ.get("SOUP_SOLUTION_SPLIT_SUM", "1").strip().lower()
           not in ("0", "false", "no", "")}
 KEEP_BRANCH = "keep-branch"  # AddRMSNormFunction's `addends`: save the branch itself
 
@@ -586,7 +586,7 @@ def patch_qwen2_decoder_layer():
     cls = modeling_qwen2.Qwen2DecoderLayer
     if getattr(cls, "_soup_add_rmsnorm", False):
         return
-    if _SPLIT["keep"] or os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "0").strip().lower() not in (
+    if _SPLIT["keep"] or os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "1").strip().lower() not in (
             "0", "false", "no", "off", ""):
         from .warmup import register
 
