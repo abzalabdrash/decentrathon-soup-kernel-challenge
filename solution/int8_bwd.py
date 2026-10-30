@@ -13,8 +13,9 @@ less. The MLP backward of fused_proj.py becomes, with M the step's tokens (padde
 3. acc_h (I, M) int32 = W_down^T_q @ g_q^T (`torch._int_mm`, "TN");
 4. `int8_swiglu_bwd_kernel`: dL/dhidden = acc_h * s_w[i] * s_g[m] in fp32, the SwiGLU derivative
    with the saved (gate|up), dL/d(gate|up) written over (gate|up) in half, and every token's absmax
-   of it by an atomic max;
-5. dL/d(gate|up) (2I, M) -> (M, 2I) int8 with those per-token scales (`quant_t_int8_kernel`);
+   of it per group of features (no atomics);
+5. dL/d(gate|up) (2I, M) -> (M, 2I) int8 with the per-token scales, the max over the groups
+   (`quant_t_int8_kernel`);
 6. W_gate, W_up (I, D) NF4 -> [W_gate^T | W_up^T] (D, 2I) int8, one scale per input feature shared
    by both (the contraction runs over gate and up together);
 7. acc_x (M, D) int32 = dgu_q @ W^T_q^T (`torch._int_mm`), and `int8_scale_kernel` gives the fp32
@@ -42,7 +43,7 @@ _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "0").strip().lower()
           not in ("0", "false", "no", "")}
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
-TILE_I, TILE_M = 32, 128  # (features, tokens) tile of the SwiGLU backward: rows along the tokens
+TILE_I, TILE_M, GROUPS = 32, 32, 10  # SwiGLU backward: (features, tokens) tile, feature groups
 TQ_R, TQ_M = 64, 64  # (rows, tokens) tile of the transposing quantization: 128-byte loads, 64-byte stores
 
 
@@ -86,41 +87,51 @@ def quant_rows_int8_kernel(x_ptr, q_ptr, scale_ptr, n_cols, BLOCK: tl.constexpr)
 
 
 @triton.jit
-def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, amax_ptr, inter, tokens,
-                           TI: tl.constexpr, TM: tl.constexpr):
-    # dL/dhidden from the int32 product and its two scale vectors, then the SwiGLU derivative over
-    # (gate | up) stored as (2I, tokens), written back over it in half; per token, the absmax of
-    # what was written, by an atomic max on its fp32 bits (all non-negative: integer order)
-    feat = tl.program_id(0) * TI + tl.arange(0, TI)
-    tok = tl.program_id(1) * TM + tl.arange(0, TM)
+def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, pmax_ptr, inter, tokens,
+                           per_group, TI: tl.constexpr, TM: tl.constexpr):
+    # program (t, grp): tokens [t*TM, +TM) over the features [grp*per_group, +per_group), TI at a
+    # time. dL/dhidden from the int32 product and its two scale vectors, the SwiGLU derivative over
+    # (gate | up) stored as (2I, tokens), written back over it in half; the group's per-token absmax
+    # of what was written goes to pmax[grp, token] (no atomics: quant_t_int8_kernel takes the max)
+    tok = tl.program_id(0) * TM + tl.arange(0, TM)
+    grp = tl.program_id(1)
     live = tok < tokens
-    at = feat[:, None].to(tl.int64) * tokens + tok[None, :]
-    up_at = at + inter.to(tl.int64) * tokens
-    dhid = tl.load(acc_ptr + at, mask=live[None, :], other=0).to(tl.float32)
-    dhid = dhid * tl.load(w_scale_ptr + feat)[:, None]
-    dhid = dhid * tl.load(g_scale_ptr + tok, mask=live, other=0.0)[None, :]
-    g = tl.load(gate_up_ptr + at, mask=live[None, :], other=0.0).to(tl.float32)
-    u = tl.load(gate_up_ptr + up_at, mask=live[None, :], other=0.0).to(tl.float32)
-    sig = tl.sigmoid(g)
-    silu = g * sig
-    d_u = (dhid * silu).to(gate_up_ptr.dtype.element_ty)
-    d_g = (dhid * u * (sig + silu * (1.0 - sig))).to(gate_up_ptr.dtype.element_ty)
-    tl.store(gate_up_ptr + at, d_g, mask=live[None, :])
-    tl.store(gate_up_ptr + up_at, d_u, mask=live[None, :])
-    peak = tl.maximum(tl.max(tl.abs(d_g.to(tl.float32)), axis=0),
-                      tl.max(tl.abs(d_u.to(tl.float32)), axis=0))
-    tl.atomic_max(amax_ptr + tok, peak.to(tl.int32, bitcast=True), mask=live)
+    s_tok = tl.load(g_scale_ptr + tok, mask=live, other=0.0)
+    peak = tl.zeros([TM], dtype=tl.float32)
+    up_shift = inter.to(tl.int64) * tokens
+    for f0 in range(0, per_group, TI):
+        feat = grp * per_group + f0 + tl.arange(0, TI)
+        at = feat[:, None].to(tl.int64) * tokens + tok[None, :]
+        dhid = tl.load(acc_ptr + at, mask=live[None, :], other=0).to(tl.float32)
+        dhid = dhid * tl.load(w_scale_ptr + feat)[:, None] * s_tok[None, :]
+        g = tl.load(gate_up_ptr + at, mask=live[None, :], other=0.0).to(tl.float32)
+        u = tl.load(gate_up_ptr + up_shift + at, mask=live[None, :], other=0.0).to(tl.float32)
+        sig = tl.sigmoid(g)
+        silu = g * sig
+        d_u = (dhid * silu).to(gate_up_ptr.dtype.element_ty)
+        d_g = (dhid * u * (sig + silu * (1.0 - sig))).to(gate_up_ptr.dtype.element_ty)
+        tl.store(gate_up_ptr + at, d_g, mask=live[None, :])
+        tl.store(gate_up_ptr + up_shift + at, d_u, mask=live[None, :])
+        peak = tl.maximum(peak, tl.maximum(tl.max(tl.abs(d_g.to(tl.float32)), axis=0),
+                                           tl.max(tl.abs(d_u.to(tl.float32)), axis=0)))
+    tl.store(pmax_ptr + grp * tokens + tok, peak, mask=live)
 
 
 @triton.jit
-def quant_t_int8_kernel(src_ptr, amax_ptr, q_ptr, n_rows, tokens, TR: tl.constexpr, TM: tl.constexpr):
-    # src (n_rows, tokens) half -> q (tokens, n_rows) int8, scale of token t = amax[t] / 127
+def quant_t_int8_kernel(src_ptr, pmax_ptr, amax_ptr, q_ptr, n_rows, tokens,
+                        GROUPS: tl.constexpr, TR: tl.constexpr, TM: tl.constexpr):
+    # src (n_rows, tokens) half -> q (tokens, n_rows) int8; token t's scale is amax[t] / 127 with
+    # amax[t] the max of its GROUPS partial maxima (written out once, by the first row tile)
     rows = tl.program_id(0) * TR + tl.arange(0, TR)
     tok = tl.program_id(1) * TM + tl.arange(0, TM)
     live = tok < tokens
+    amax = tl.zeros([TM], dtype=tl.float32)
+    for grp in range(GROUPS):
+        amax = tl.maximum(amax, tl.load(pmax_ptr + grp * tokens + tok, mask=live, other=0.0))
+    if tl.program_id(0) == 0:
+        tl.store(amax_ptr + tok, amax, mask=live)
     x = tl.load(src_ptr + rows[:, None].to(tl.int64) * tokens + tok[None, :], mask=live[None, :],
                 other=0.0).to(tl.float32)
-    amax = tl.load(amax_ptr + tok, mask=live, other=0).to(tl.float32, bitcast=True)
     inv = tl.where(amax > 0.0, 127.0 / amax, 0.0)
     q8 = tl.minimum(tl.maximum(tl.floor(x * inv[None, :] + 0.5), -127.0), 127.0).to(tl.int8)
     dest = tok[:, None].to(tl.int64) * n_rows + rows[None, :]
@@ -134,7 +145,7 @@ def int8_scale_kernel(acc_ptr, amax_ptr, w_scale_ptr, out_ptr, n_cols, BLOCK: tl
     cols = tl.arange(0, BLOCK)
     ok = cols < n_cols
     acc = tl.load(acc_ptr + row * n_cols + cols, mask=ok, other=0).to(tl.float32)
-    s_row = tl.load(amax_ptr + row).to(tl.float32, bitcast=True) / 127.0
+    s_row = tl.load(amax_ptr + row) / 127.0
     out = acc * s_row * tl.load(w_scale_ptr + cols, mask=ok, other=0.0)
     tl.store(out_ptr + row * n_cols + cols, out, mask=ok)
 
@@ -181,7 +192,9 @@ def usable(plan, tokens):
             return False
         if not nf4._fast_path(base.weight.data, base.weight.quant_state, plan.half):
             return False
-    return plan.down.in_features % 8 == 0 and plan.down.out_features % 8 == 0
+    inter = plan.gate.out_features
+    return (plan.down.in_features % 8 == 0 and plan.down.out_features % 8 == 0
+            and inter % (GROUPS * TILE_I) == 0 and (2 * inter) % TQ_R == 0)
 
 
 def mlp_backward(plan, gate_up, grad16, buffer):
@@ -201,15 +214,16 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     w_down_t = i8[:inter * d].view(inter, d)
     _decode_t(plan.down, inv_d, w_down_t, d, 0)
     acc_h = torch._int_mm(w_down_t, g_q.t())
-    # 4. the SwiGLU backward in place over (gate|up), per-token absmax
-    amax = torch.zeros(tokens, dtype=torch.int32, device=device)
-    int8_swiglu_bwd_kernel[(inter // TILE_I, triton.cdiv(tokens, TILE_M))](
-        acc_h, scale_d, s_g, gate_up, amax, inter, tokens, TI=TILE_I, TM=TILE_M)
+    # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group
+    pmax = torch.empty((GROUPS, tokens), dtype=torch.float32, device=device)
+    int8_swiglu_bwd_kernel[(triton.cdiv(tokens, TILE_M), GROUPS)](
+        acc_h, scale_d, s_g, gate_up, pmax, inter, tokens, inter // GROUPS, TI=TILE_I, TM=TILE_M)
     del acc_h
     # 5. dL/d(gate|up) per token, transposed to (tokens, 2I)
+    amax = torch.empty(tokens, dtype=torch.float32, device=device)
     dgu_q = torch.empty((tokens, 2 * inter), dtype=torch.int8, device=device)
     quant_t_int8_kernel[(2 * inter // TQ_R, triton.cdiv(tokens, TQ_M))](
-        gate_up, amax, dgu_q, 2 * inter, tokens, TR=TQ_R, TM=TQ_M)
+        gate_up, pmax, amax, dgu_q, 2 * inter, tokens, GROUPS=GROUPS, TR=TQ_R, TM=TQ_M)
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
     inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
     inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
@@ -240,8 +254,9 @@ def _warm():
                            n_cols // QBLOCK, stride, offset, ROWS=W_ROWS, QBLOCK=QBLOCK,
                            ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
     compile_kernel(quant_rows_int8_kernel, half, i8, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
-    compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, i32, INTERMEDIATE, tokens,
-                   TI=TILE_I, TM=TILE_M)
-    compile_kernel(quant_t_int8_kernel, half, i32, i8, 2 * INTERMEDIATE, tokens, TR=TQ_R, TM=TQ_M)
-    compile_kernel(int8_scale_kernel, i32, i32, f32, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
+    compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, f32, INTERMEDIATE, tokens,
+                   INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M)
+    compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
+                   TR=TQ_R, TM=TQ_M)
+    compile_kernel(int8_scale_kernel, i32, f32, f32, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
     return None
