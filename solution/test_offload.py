@@ -310,7 +310,10 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     off.close()
     torch.cuda.synchronize()
     s = off.stats
-    assert s["offloaded"] == k and s["waited"] == k - 1 and s["prefetch_hits"] == k - 1, off.summary()
+    # how many copies are still queued at the next pack depends on the card's timing (the T4 shows
+    # 2-5 of 5): at least one stream wait, never a CPU one (calls above)
+    assert s["offloaded"] == k and 1 <= s["waited"] <= k - 1 and s["prefetch_hits"] == k - 1, \
+        off.summary()
     for x, v in zip(xs, values):
         assert torch.equal(x.grad, v)
 
