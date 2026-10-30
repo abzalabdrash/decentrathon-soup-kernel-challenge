@@ -47,10 +47,12 @@ def test_row_quant_and_scale_epilogue(int8_on):
     s = torch.empty(832, dtype=torch.float32, device="cuda")
     int8_on.quant_rows_int8_kernel[(832,)](g, q, s, 1536, BLOCK=triton.next_power_of_2(1536))
     amax = g.float().abs().amax(1)
-    assert torch.equal(s, amax / 127.0)
+    # Triton's fp32 division is not IEEE-rounded: scales to a few ulp, codes to one step at ties
+    assert torch.allclose(s, amax / 127.0, rtol=1e-6, atol=0)
     ref = _round(g.float() * torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))[:, None])
-    assert torch.equal(q.float(), ref)
-    assert torch.all(q[-16:] == 0)
+    diff = (q.float() - ref).abs()
+    assert diff.max().item() <= 1 and (diff > 0).float().mean().item() < 1e-3
+    assert torch.all(q[-16:] == 0) and torch.all(s[-16:] == 0)
 
 
 def test_mlp_backward_int8_close_to_fp16(int8_on, monkeypatch):
