@@ -6,14 +6,24 @@ the fused head (fused_ce.py) the model leaves the per-token entropy, loss and co
 values and hands Soup's rewind recorder the per-token losses through the attribute it already reads
 (`_soup_chunked_step`, see soup_cli.trainer.rewind_hf: `row_losses_from_token_losses`).
 
+The three values stay on the GPU until TRL's `log()` reads them (every step here, logging_steps 1):
+TRL's compute_loss takes them with `.item()` between the forward and the backward, and each `.item()`
+waits for the forward to finish, so the GPU ran dry while the CPU started queueing the backward. Here
+`_log_trl_metrics` keeps detached device scalars on the trainer and the patched `SFTTrainer.log`
+turns them into the same Python numbers, in the same order, right before TRL averages them: after
+the backward and the optimizer step have been queued, next to the step's other end-of-step syncs.
+
 Soup's trainer is a subclass of trl.SFTTrainer built at setup time; patching the attribute on the
 base class reaches it because Python looks the method up on every call. A step that is not training,
 has no labels, or where the model did not take the fused path goes through TRL's original code.
 """
 
+import os
+
 from . import fused_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR
+PENDING_ATTR = "_soup_pending_metrics"  # device scalars of the steps not logged yet
 
 
 def _log_trl_metrics(trainer, mode, inputs, step):
@@ -24,18 +34,35 @@ def _log_trl_metrics(trainer, mode, inputs, step):
     attention_mask = inputs.get("attention_mask")
     if attention_mask is not None:
         entropy = (step.token_entropy * attention_mask).sum() / attention_mask.sum()
-        tokens = gather(attention_mask.sum()).sum().item()
+        tokens = gather(attention_mask.sum()).sum().detach()
     else:
         entropy = step.token_entropy.mean()
         tokens = None
-    metrics[mode]["entropy"].append(gather(entropy).mean().item())
-    if mode == "train" and tokens is not None and hasattr(trainer, "_total_train_tokens"):
-        trainer._total_train_tokens += tokens
-    if hasattr(trainer, "_total_train_tokens"):
-        metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
-    labelled = gather(step.labelled).sum()
-    accuracy = (gather(step.correct).sum() / labelled).item() if labelled > 0 else 0.0
-    metrics[mode]["mean_token_accuracy"].append(accuracy)
+    labelled = gather(step.labelled).sum().detach()
+    accuracy = (gather(step.correct).sum() / labelled).detach()  # read only when labelled > 0
+    trainer.__dict__.setdefault(PENDING_ATTR, []).append(
+        (mode, gather(entropy).mean().detach(), tokens, labelled, accuracy))
+    if os.environ.get("SOUP_SOLUTION_DEFER_METRICS", "1") in ("0", "false", "no"):
+        flush_pending_metrics(trainer)  # read right after the forward, as TRL does (A/B switch)
+
+
+def flush_pending_metrics(trainer):
+    """The pending steps' values into TRL's `_metrics` and `_total_train_tokens`, as TRL's
+    compute_loss would have put them there: entropy, num_tokens, mean_token_accuracy."""
+    pending = trainer.__dict__.get(PENDING_ATTR)
+    if not pending:
+        return
+    trainer.__dict__[PENDING_ATTR] = []
+    metrics = trainer._metrics
+    for mode, entropy, tokens, labelled, accuracy in pending:
+        metrics[mode]["entropy"].append(entropy.item())
+        if tokens is not None:
+            tokens = tokens.item()
+            if mode == "train" and hasattr(trainer, "_total_train_tokens"):
+                trainer._total_train_tokens += tokens
+        if hasattr(trainer, "_total_train_tokens"):
+            metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
+        metrics[mode]["mean_token_accuracy"].append(accuracy.item() if labelled.item() > 0 else 0.0)
 
 
 def patch_sft_trainer():
@@ -74,7 +101,14 @@ def patch_sft_trainer():
             self._metrics[mode]["aux_loss"].append(aux)
         return (loss, outputs) if return_outputs else loss
 
+    original_log = cls.log
+
+    def log(self, logs, *args, **kwargs):
+        flush_pending_metrics(self)
+        return original_log(self, logs, *args, **kwargs)
+
     cls.compute_loss = compute_loss
+    cls.log = log
     cls._soup_fused_metrics = True
 
 
@@ -85,6 +119,7 @@ def _metrics_from_logits(trainer, mode, inputs, outputs):
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError("the model returned neither logits nor a fused step")
+    flush_pending_metrics(trainer)  # keep the steps' order in _metrics
     labels = inputs["labels"]
     with torch.no_grad():
         per_token_entropy = entropy_from_logits(logits)
