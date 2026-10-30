@@ -58,3 +58,16 @@ against the helper (00499585: 11.44 + 0.51) it is better, but sessions differ (T
 Next: try begin + w2 together, and w2 + sw5; then set the default (WORKERS=2 is one line in
 warmup.py: `WORKERS = ...` or the env default) and remeasure. The soup-t15p profile run (setup
 split) was still queued: rerun if it did not start.
+
+## RESULT of the setup profile (soup-t15p, 3f5b14c, PROFILE_STARTUP=1; runs_kaggle/20261031-000004-solution-soup-t15p)
+Under cProfile (inflated): apply 3.38, cli 1.16, model setup 5.99, trainer 2.20, step 0 0.58.
+- The model setup no longer shows hashlib / libtriton.so reads: the early hash (start_early) works.
+  The loader's `.to` is 0.44 s cumulative (it was 3.45 s when the hash ran next to it).
+- In-process warm-up during the setup: 14 kernels compiled in 5.5 s (rms_norm fwd 1.96, rope
+  1.61, nf4 1.26, bwd 1.51, rebuild 0.92, masked_pair_sum 0.42 (a new registration from main),
+  swiglu 0.88/0.67, head_stream...) plus cublas 0.22, step_ops 0.42; subprocess waits (ptxas, gcc)
+  0.48 s and _init_handles 0.43 s show in the main-thread table because cProfile records all
+  threads. This compile work is what still lengthens the model setup (5.05 vs 3.20 s without it in
+  the variants).
+- torchvision is STILL loaded after prepare_imports (and at the first step), even with 3deb206's
+  window over trl's import: another importer (find with --mode diag); worth ~0.13 s only.
