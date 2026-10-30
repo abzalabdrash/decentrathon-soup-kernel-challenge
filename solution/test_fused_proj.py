@@ -704,3 +704,84 @@ def test_launches_and_saved_memory_per_layer(layer_1p5b):
         # the MLP keeps (gate|up) with the token axis padded to a multiple of 8 (GEMM alignment):
         # at most 7 columns of 2 x 8960 halves more than mlp16's gate and up
         assert m1 <= m0 + (2 * 8960 * 7 * 2 if name == "mlp" else 0)
+
+
+# ------------------------------------------------------------------------------------------------
+# x16 rebuilt from the norm in the MLP's recompute mode, the adapters' masked gradient sum
+
+
+@pytest.mark.parametrize("tokens", [832, 826])
+def test_mlp_recompute_rebuilds_x16_from_the_post_attention_norm(layer_1p5b, mlp_recompute, tokens):
+    """x straight out of the post-attention add + norm, as the decoder layer feeds the MLP: in recompute
+    mode the MLP keeps nothing and rebuilds x16 from the norm's saved sum and rstd; the output and
+    every gradient are bitwise those of keeping x16. With a token count that is not a multiple of 8
+    (x16 gets zero padding rows; not after unpad's alignment tail) it keeps x16 as before."""
+    from solution import fused_proj, rmsnorm
+
+    _, _, mlp, _ = layer_1p5b
+    g = torch.Generator("cuda").manual_seed(31)
+    residual = torch.randn(1, tokens, 1536, device="cuda", generator=g)
+    branch = torch.randn(1, tokens, 1536, device="cuda", generator=g).half()
+    weight = 1.0 + 0.3 * torch.randn(1536, device="cuda", generator=g)
+    grad = torch.randn(1, tokens, 1536, device="cuda", generator=g, dtype=torch.float16)
+    _fused(True)
+    mlp_recompute(True)
+    results = []
+    try:
+        for rebuild in (False, True):
+            fused_proj._ATTN["rebuild_x16"] = rebuild
+            r = residual.detach().requires_grad_(True)
+            saved = []
+
+            def pack(t):
+                saved.append((tuple(t.shape), t.dtype))
+                return t
+
+            with torch.autocast("cuda", dtype=torch.float16):
+                _, x = rmsnorm.add_rmsnorm(r, branch, weight, 1e-6)
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                    out = mlp(x)
+            out.backward(grad)
+            results.append((out.detach(), r.grad, saved))
+    finally:
+        fused_proj._ATTN["rebuild_x16"] = True
+    (out0, dr0, saved0), (out1, dr1, saved1) = results
+    assert torch.equal(out1, out0) and torch.equal(dr1, dr0)
+    padded = -(-tokens // 8) * 8
+    assert saved0 == [((padded, 1536), torch.float16)]
+    assert saved1 == ([] if padded == tokens else saved0)
+
+
+def test_masked_pair_sum_matches_mul_addcmul():
+    """The adapters' share of the input gradient through the two dropout masks, one launch: bitwise
+    torch's mul (half by bool into fp32) then addcmul_, signed zeros included."""
+    from solution.fused_proj import _masked_pair_sum
+
+    g = torch.Generator("cuda").manual_seed(32)
+    grads = torch.randn(2, 838, 1536, device="cuda", generator=g).half()
+    grads[:, :5] = 0.0
+    grads[:, 5:9] = -0.0
+    mask = torch.rand(2, 838, 1536, device="cuda", generator=g) > 0.05
+    ref = torch.mul(grads[0], mask[0], out=torch.empty(838, 1536, device="cuda"))
+    ref.addcmul_(grads[1], mask[1])
+    out = _masked_pair_sum(grads, mask)
+    assert out.dtype == torch.float32 and out.shape == (838, 1536)
+    assert torch.equal(out, ref) and torch.equal(torch.signbit(out), torch.signbit(ref))
+
+
+def test_attention_kernels_are_warmed_up():
+    """The warm-ups fused_proj registers with warmup.py compile the classes training launches."""
+    from solution import fused_proj, warmup
+
+    compiles = warmup.watch_compiles(log=False)
+    fused_proj.masked_pair_sum_kernel.device_caches.clear()
+    compiles.clear()
+    fused_proj._warm_masked_pair_sum()
+    assert [c["kernel"] for c in compiles] == ["masked_pair_sum_kernel"]
+    compiles.clear()
+    for n in (838, 1440):
+        grads = torch.randn(2, n, 1536, device="cuda").to(warmup.training_half_dtype())
+        fused_proj._masked_pair_sum(grads, torch.rand(2, n, 1536, device="cuda") > 0.05)
+    assert [c for c in compiles if c["kernel"] == "masked_pair_sum_kernel"] == []
+    names = [name for name, _ in warmup.WARMUPS]
+    assert "fused_proj_masked_pair_sum" in names and "fused_proj_x16_rebuild" in names

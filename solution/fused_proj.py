@@ -66,6 +66,7 @@ import os
 import torch
 import torch.nn.functional as F
 import triton
+import triton.language as tl
 
 from . import rope
 from .nf4 import dequantize_nf4
@@ -338,6 +339,45 @@ _ATTN = {"rebuild_x16": os.environ.get("SOUP_SOLUTION_REBUILD_X16", "1").strip()
          not in ("0", "false", "no", "")}
 
 
+MASKED_SUM_BLOCK = 1024
+
+
+@triton.jit
+def masked_pair_sum_kernel(g_ptr, m_ptr, out_ptr, n_elements, BLOCK: tl.constexpr):
+    # out = g[0] * m[0] + g[1] * m[1] in fp32 for g (2, n) half and m (2, n) bool: the adapters'
+    # share of the input gradient through their two dropout masks. The products are exact (a mask
+    # is 0 or 1, the sign of a zero included), so the one rounding of the sum is torch's
+    # mul-then-addcmul_ rounding, contracted or not
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    ok = offs < n_elements
+    g0 = tl.load(g_ptr + offs, mask=ok, other=0.0).to(tl.float32)
+    g1 = tl.load(g_ptr + n_elements + offs, mask=ok, other=0.0).to(tl.float32)
+    m0 = tl.load(m_ptr + offs, mask=ok, other=0).to(tl.float32)
+    m1 = tl.load(m_ptr + n_elements + offs, mask=ok, other=0).to(tl.float32)
+    tl.store(out_ptr + offs, g0 * m0 + g1 * m1, mask=ok)
+
+
+def _masked_pair_sum(g, mask):
+    """(N, D) fp32 = g[0] * mask[0] + g[1] * mask[1] for g (2, N, D) half and mask (2, N, D) bool, one
+    launch (torch: a mixed-dtype mul and addcmul_, neither vectorized)."""
+    _, n, d = g.shape
+    g, mask = g.contiguous(), mask.contiguous()
+    out = torch.empty((n, d), dtype=torch.float32, device=g.device)
+    count = n * d
+    masked_pair_sum_kernel[(triton.cdiv(count, MASKED_SUM_BLOCK),)](
+        g, mask, out, count, BLOCK=MASKED_SUM_BLOCK)
+    return out
+
+
+def _warm_masked_pair_sum():
+    """warmup.py registration of masked_pair_sum_kernel: the class training launches (N x 1536
+    elements, always divisible by 16), with the run's half dtype."""
+    from .warmup import HIDDEN, TOKENS, compile_kernel, training_half_dtype
+
+    compile_kernel(masked_pair_sum_kernel, training_half_dtype(), torch.bool, torch.float32,
+                   TOKENS * HIDDEN, BLOCK=MASKED_SUM_BLOCK)
+
+
 def _scaled_mm(a, b, alpha, out):
     """out = alpha * (a @ b), in out's dtype (fp32 out from half a and b accumulates in fp32)."""
     if out.dtype == a.dtype:
@@ -410,7 +450,6 @@ class _QKVRope(torch.autograd.Function):
         n, d, nq, nk, nv, r = ctx.dims
         half, s, p = plan.half, plan.scaling, plan.p
         x16 = kept[0] if kept else rebuild(ctx.source, half).view(n, d)
-        ctx.source = None
         device = x16.device
 
         g = torch.empty((n, nq + nk + nv), dtype=half, device=device)
@@ -440,9 +479,7 @@ class _QKVRope(torch.autograd.Function):
             del dropped
             if need_x:
                 g_drop = torch.bmm(gh, a16.view(2, r, d))  # (2, N, D), half like the base's
-                lora_x = torch.mul(g_drop[0], mask[0],
-                                   out=torch.empty((n, d), dtype=torch.float32, device=device))
-                lora_x.addcmul_(g_drop[1], mask[1])
+                lora_x = _masked_pair_sum(g_drop, mask)
                 beta = 1.0 / (1.0 - p)
                 del g_drop
             grad_aq, grad_av = (grad_a[0], grad_a[1]) if need_a else (None, None)
@@ -644,15 +681,18 @@ class _MLP(torch.autograd.Function):
             gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
         w = _weights((plan.down,), half, x.device)
         out = torch.mm(hidden.t(), w.t())  # (padded, D)
-        # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less
-        ctx.save_for_backward(x16 if plan.recompute else gate_up)
+        # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
+        # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
+        ctx.source = (norm_source(x) if plan.recompute and n == padded and _ATTN["rebuild_x16"]
+                      else None)
+        ctx.save_for_backward(*(() if ctx.source is not None else (x16 if plan.recompute else gate_up,)))
         ctx.plan, ctx.x_shape, ctx.x_dtype, ctx.n, ctx.padded = plan, x.shape, x.dtype, n, padded
         return out[:n].view(*x.shape[:-1], d)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        (saved,) = ctx.saved_tensors
+        saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
         plan, n, padded = ctx.plan, ctx.n, ctx.padded
         half = plan.half
         inter = plan.gate.out_features
@@ -683,7 +723,7 @@ def patch_qwen2_attention_fused():
     from transformers.models.qwen2 import modeling_qwen2 as mq
 
     cls = mq.Qwen2Attention
-    _register_rebuild_warmup()
+    _register_warmups()
     if getattr(cls, "_soup_fused_proj", False):
         return
     previous = cls.forward
@@ -704,14 +744,17 @@ def patch_qwen2_attention_fused():
     cls._soup_fused_proj = True
 
 
-def _register_rebuild_warmup():
-    """The x16 rebuild's kernel (rmsnorm.rms_norm_rows_rebuild) into warmup.py's registry; by name,
-    so registering again replaces the entry."""
+def _register_warmups():
+    """The attention's kernels outside the shared modules (rmsnorm.rms_norm_rows_rebuild for the x16
+    rebuild, masked_pair_sum_kernel) into warmup.py's registry; by name, so registering again
+    replaces the entries."""
+    from .warmup import register
+
     if _ATTN["rebuild_x16"]:
         from .rmsnorm import warm_rebuild
-        from .warmup import register
 
         register(warm_rebuild, name="fused_proj_x16_rebuild")
+    register(_warm_masked_pair_sum, name="fused_proj_masked_pair_sum")
 
 
 def patch_qwen2_mlp_fused():
