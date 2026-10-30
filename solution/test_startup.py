@@ -37,6 +37,11 @@ print("sklearn_answer=" + str(metrics.is_sklearn_available()))
 from solution.startup import _not_installed
 base_trainer = sys.modules["trl.trainer.base_trainer"]
 print("wandb_answer_kept=" + str(base_trainer.is_wandb_available is _not_installed))
+from solution.startup import _not_installed
+detection = importlib.import_module("transformers.loss.loss_for_object_detection")
+image_utils = importlib.import_module("transformers.image_utils")
+print("detection_answers=" + str(detection.is_scipy_available is _not_installed
+                                  and image_utils.is_torchvision_available is _not_installed))
 print("bnb_plain=" + str(type(ops._dequantize_4bit_compute).__name__ == "function"
                          and not hasattr(ops._dequantize_4bit_compute, "_torchdynamo_orig_callable")))
 print("heavy=" + ",".join(m for m in ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx")
@@ -50,13 +55,14 @@ def test_prepare_imports_in_a_fresh_process():
                          text=True, timeout=600, env=env)
     assert out.returncode == 0, out.stderr[-3000:]
     res = dict(line.split("=", 1) for line in out.stdout.splitlines() if "=" in line)
-    assert {"trl", "trl.trainer.sft_trainer", "bitsandbytes", "transformers.data"} <= set(
-        res["imported"].split(","))
+    assert {"trl", "trl.trainer.sft_trainer", "bitsandbytes", "transformers.data",
+            "transformers.loss.loss_utils"} <= set(res["imported"].split(","))
     assert res["restored"] == "True"
     assert res["trl_mapping_exact"] == "True"  # trl got the mapping a scan gives now
     assert res["bnb_plain"] == "True"
     assert res["sklearn_answer"] == "False"  # what the module saw at its import
     assert res["wandb_answer_kept"] == "True"  # trl's base trainer got the replacement
+    assert res["detection_answers"] == "True"  # the loss modules and image_utils kept the answer
     assert res["heavy"] == ""
 
 
