@@ -367,9 +367,11 @@ MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 LOAD_IMPORTS = ("trl", "datasets")  # what Soup imports later and loading the model does not need
 
 
-def child_helper():
+def child_helper(late="0"):
     """The helper process compiles, this process loads: every kernel the in-process warm-up meets
-    must come from the on-disk cache, and no C module (launcher, cuda_utils) is built here."""
+    must come from the on-disk cache, and no C module (launcher, cuda_utils) is built here. With
+    `late` = 1, two warm-ups are registered after the helper started, as patch functions do
+    (rmsnorm.warm_rebuild; head_stream's kernels, a functools.partial): sent to it by name."""
     import triton.runtime.build as build
 
     _prelude()
@@ -385,6 +387,14 @@ def child_helper():
     compiles = warmup.watch_compiles(log=False)
     start = time.perf_counter()
     proc = warmup.start_compile_helper(log=False)
+    if late == "1":
+        import functools
+
+        from solution import head_stream, rmsnorm
+
+        warmup.register(rmsnorm.warm_rebuild, name="fused_proj_x16_rebuild")
+        warmup.register(functools.partial(head_stream._warm_kernels, head_stream.DEFAULT_ROWS),
+                        name="head_stream_kernels")
     warmup.start_background_warmup(log=False)
     assert warmup.wait_for_warmup(600)
     report = warmup.warmup_report()
@@ -395,6 +405,7 @@ def child_helper():
         "helper_cuda": helper.get("cuda_initialized"),
         "helper_errors": ",".join(helper.get("errors", {})) or "-",
         "helper_results": len(helper.get("results", {})), "thread_s": report["seconds"],
+        "helper_names": ",".join(sorted(helper.get("results", {}))),
         "wall": round(time.perf_counter() - start, 3), "misses": len(compiles),
         "cache_hits": sum(1 for c in compiles if c["cache_hit"]),
         "built": ",".join(built) or "-", "errors": ",".join(report["errors"]) or "-",

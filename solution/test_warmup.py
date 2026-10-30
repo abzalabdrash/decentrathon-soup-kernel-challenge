@@ -269,6 +269,48 @@ def test_exit_while_compiling_is_clean(tmp_path, mode):
         assert "done_at_exit=False" in out.stdout  # it did exit in the middle of the warm-up
 
 
+def test_late_registrations_go_to_the_helper(tmp_path):
+    """Warm-ups registered after the helper started (from patch functions) are sent to it by name
+    and compiled there: the training process still only loads from the cache."""
+    from solution.bench_warmup import _child
+
+    res = _child(["child-helper", "1"], str(tmp_path))
+    assert res["helper_errors"] == "-" and res["errors"] == "-", res
+    assert {"fused_proj_x16_rebuild", "head_stream_kernels"} <= set(res["helper_names"].split(","))
+    assert int(res["misses"]) >= 10 and res["cache_hits"] == res["misses"], res
+    assert res["built"] == "-", res
+
+
+def test_reference_only_for_importable_functions():
+    import functools
+
+    from solution import rmsnorm, warmup
+
+    assert warmup._reference("a", rmsnorm.warm_rebuild)["qualname"] == "warm_rebuild"
+    spec = warmup._reference("b", functools.partial(warmup.warm_rope))
+    assert spec["module"] == "solution.warmup" and spec["args"] == []
+
+    def closure():
+        pass
+
+    assert warmup._reference("c", closure) is None
+    assert warmup._reference("d", lambda: None) is None
+    assert warmup._reference("e", functools.partial(rmsnorm.warm_rebuild, object())) is None
+
+
+def test_step_ops_draw_no_random_numbers():
+    """The optimizer / clipping / scaler warm-up runs on its own tensors: the CPU and CUDA random
+    states are the same after it, and it stays out of the helper (it needs the GPU)."""
+    from solution import warmup
+
+    cpu, cuda = torch.get_rng_state(), torch.cuda.get_rng_state()
+    warmup.warm_step_ops()
+    torch.cuda.synchronize()
+    assert torch.equal(torch.get_rng_state(), cpu)
+    assert torch.equal(torch.cuda.get_rng_state(), cuda)
+    assert "step_ops" in warmup.NEEDS_GPU
+
+
 def test_cublas_never_goes_to_the_helper(fresh):
     @fresh.register(name="kernel")
     def kernel():

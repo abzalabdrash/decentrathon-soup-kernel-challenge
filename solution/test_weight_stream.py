@@ -598,10 +598,12 @@ def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
             return _varlen_step(model, lengths=STEP_LENGTHS)
 
     reference = step()
-    # fused_proj ran: qkv, o, gate|up and down rebuilt in the forward and again in the backward
-    # (layer 0's qkv not, when the embedding output needs no gradient)
+    # fused_proj ran: qkv, o, gate|up (gate and up apart with the split buffer, the default) and
+    # down rebuilt in the forward and again in the backward (layer 0's qkv not, when the embedding
+    # output needs no gradient)
+    per_layer = 10 if fused_proj._gate_up_split() else 8
     per_step = len(events)
-    assert per_step in (8 * len(layers), 8 * len(layers) - 1)
+    assert per_step in (per_layer * len(layers), per_layer * len(layers) - 1)
     events.clear()
 
     streamer = stream_model_weights(model, slots=2)
