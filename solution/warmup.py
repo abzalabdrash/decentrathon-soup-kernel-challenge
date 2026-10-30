@@ -331,9 +331,13 @@ def warm_rope():
         return SKIPPED
     import torch
 
-    dtypes = [torch.float32]
+    # fused_proj.py's attention launches it in half; rope.py's own path (fused_proj off, or its
+    # plan declining) in fp32. Kaggle, 3344e16: 3588 launches = 28 layers x 64 steps x 2 + the
+    # warm-up's own, so the fp32 variants never ran with fused_proj on
     if _switched_on("SOUP_SOLUTION_FUSED_PROJ"):
-        dtypes.insert(0, training_half_dtype())  # fused_proj.py's launches, first
+        dtypes = [training_half_dtype()]
+    else:
+        dtypes = [torch.float32]
     for dtype in dtypes:
         _rope(backward=False, dtype=dtype)
         _rope(backward=True, dtype=dtype)
@@ -354,6 +358,10 @@ def warm_fused_ce():
     # (all chunk slices start at a multiple of the 512-row chunk: aligned), grad_scale float.
     # n_grad_rows: 387 stands for a count that is not a multiple of 16 (most chunks), 512 for one
     # that is (0 too: a chunk without labelled rows), 1 is a constant of its own
+    # with head_stream.py on, the head runs head_stream's kernels and this one never launches
+    # (Kaggle, 3344e16: 3 launches in the run, the warm-up's own)
+    if _switched_on("SOUP_SOLUTION_HEAD_STREAM"):
+        return SKIPPED
     import torch
 
     from .fused_ce import BLOCK_V, IGNORE_INDEX, fused_ce_rows_kernel
@@ -712,7 +720,10 @@ def helper_main(argv):
     jobs = [(name, fn) for name, fn in WARMUPS if name in names and name not in NEEDS_GPU]
     results, errors = {}, {}
 
-    workers = int(os.environ.get("SOUP_SOLUTION_WARMUP_WORKERS", "0") or 0) or WORKERS
+    # 2 threads: next to the model load, fewer compiles at a time slow it less (Kaggle variants,
+    # 3344e16, means of 2 rounds, apply begin to the end of step 0: 1 thread 11.07 s, 2 threads
+    # 11.04 s, 3 threads 11.35 s; SOUP_SOLUTION_WARMUP_WORKERS sets it)
+    workers = int(os.environ.get("SOUP_SOLUTION_WARMUP_WORKERS", "0") or 0) or min(2, WORKERS)
 
     def run(batch):
         done, failed = _run_jobs(batch, workers)
