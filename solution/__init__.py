@@ -18,7 +18,13 @@ Modules:
 - nf4.py: NF4 dequantization in one Triton kernel, used by bitsandbytes' MatMul4Bit (own kernel);
 - rope.py: rotary embedding of q and k in one Triton kernel each way (own kernel);
 - fused_proj.py: q+k+v in one GEMM with LoRA by addmm, attention in half, gate+up in one GEMM;
-- offload.py: the MLP's saved gate/up to pinned host memory (or recomputed) during the backward;
+- offload.py: the MLP's saved gate|up to pinned host memory on a side stream with events (prepinned
+  slabs), or recomputed in the backward (SOUP_SOLUTION_MLP_MEMORY=recompute: +50 ms per step for
+  24 MiB on the T4, so off by default);
+- alloc_watch.py: the caching allocator's retries and segment frees, logged once per run;
+- head_stream.py: the tied embedding / lm_head weight in pinned host memory for the whole run,
+  the head computed in one streamed pass over the vocabulary (own kernels); switched on from
+  fused_ce.patch_qwen2_causal_lm (SOUP_SOLUTION_HEAD_STREAM=0 turns it off);
 - weight_stream.py: the layers' 4-bit weights in pinned host memory, a ring of K layers on the GPU;
 - warmup.py: the kernels compiled by a background thread while Soup loads the model;
 - phases.py: wall-clock marks of the run's phases in the log;
@@ -28,7 +34,10 @@ Modules:
 Switches (environment, for experiments): SOUP_SOLUTION_CE_CHUNK (rows of logits per chunk, default
 512), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0, SOUP_SOLUTION_RMSNORM=0,
 SOUP_SOLUTION_NF4=0, SOUP_SOLUTION_ROPE=0, SOUP_SOLUTION_FUSED_PROJ=0, SOUP_SOLUTION_MLP_MEMORY=
-offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0.
+offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0,
+SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARLEN_ATTN=0,
+SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
+(SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head).
 """
 
 import os
@@ -78,12 +87,12 @@ def apply():
 
         patch_qwen2_attention_fused()  # after unpad's attention patch and rope: it falls back to them
         patch_qwen2_mlp_fused()  # after mlp16's patch: it falls back to it
-    mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "offload").strip().lower()
-    if mode == "recompute" and _on("SOUP_SOLUTION_FUSED_PROJ"):
-        mode = "offload"  # recompute replaces the MLP forward; with the fused MLP use the offload
     from .offload import patch_mlp_memory
 
-    patch_mlp_memory(mode)
+    patch_mlp_memory()  # SOUP_SOLUTION_MLP_MEMORY=offload (default, event-based, prepinned)|recompute|none
+    from .alloc_watch import patch_soup_alloc_watch
+
+    patch_soup_alloc_watch()  # one log line per run: allocator retries, segment frees, reserved vs peak
     if _on("SOUP_SOLUTION_WEIGHT_STREAM"):
         from .weight_stream import patch_weight_stream
 
