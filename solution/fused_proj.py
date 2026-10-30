@@ -1,5 +1,5 @@
-"""Fused projections of a Qwen2 layer: q+k+v in one GEMM with the LoRA adapters added by addmm and
-the rotary embedding applied in place, the attention in half from end to end, gate+up in one GEMM.
+"""Fused projections of a Qwen2 layer: q+k+v in one GEMM with the LoRA adapters added by addmm, the
+attention in half from end to end, gate+up in one GEMM.
 
 In the base, every 4-bit linear layer is its own chain: bitsandbytes casts the fp32 input to half,
 rebuilds the weight, runs the GEMM and casts the result back to fp32; peft clones that result, runs
@@ -12,19 +12,21 @@ Attention here (inside `unpad.varlen`, the packed training step):
 - the normed input is cast to half once (x16);
 - the q, k and v weights are dequantized by `nf4.dequantize_nf4` into row slices of one shared
   (2048, 1536) buffer and one addmm with the concatenated bias gives qkv (N, 2048) in half;
-- LoRA of q and v: dropout is drawn once for both adapters on x16 expanded to (2, N, D) (two
-  independent masks, as the base has one dropout call per adapter), one bmm gives both
-  h = dropout(x16) @ A.T, and `addmm_(qkv_slice, h, B.T, alpha=scaling)` adds the adapter output into
-  the q and v columns of qkv with one rounding;
+- LoRA of q and v: the four adapter matrices go to half in one multi-tensor copy; dropout is drawn
+  once for both adapters on x16 expanded to (2, N, D) (two independent masks, as the base has one
+  dropout call per adapter), one bmm gives both h = dropout(x16) @ A.T, and
+  `addmm_(qkv_slice, h, B.T, alpha=scaling)` adds the adapter output into the q and v columns of
+  qkv with one rounding;
 - the rotary embedding of q and k is one launch of rope.py's kernel (fp32 math, half out);
 - q, k, v leave the function as (B, H, N, D) token-major views; repeat_kv and per-row causal SDPA run as
   in unpad.py, the per-row outputs are concatenated token-major (one copy) and o_proj is dequant + GEMM.
 Only x16, h (N x 32), the half adapter weights and the CUDA RNG state are kept for the backward; the
 dropout masks are drawn again from that state in the backward (the same kernel on the same input
 gives the same masks), so no mask and no fp32 q/k/v is stored. The backward rebuilds the weights,
-writes dq and dk through the rope kernel and dv straight into one (N, 2048) gradient, and gets the
-input gradient of all three projections and both adapters from one addmm in fp32
-(`out_dtype=torch.float32`), the adapters' share fed in as the addmm's C.
+writes dq and dk through the rope kernel and dv straight into one (N, 2048) gradient, computes the
+adapters' share of the input gradient in half (one bmm, then the two masks applied by one mul and
+one addcmul into fp32), and adds the three projections' share to it with one in-place addmm in fp32
+(`out_dtype=torch.float32`, the masks' 1 / (1 - p) as the addmm's beta).
 
 MLP: x16 once, gate and up rebuilt into one (17920, 1536) buffer and one GEMM computes (gate|up)
 transposed, (17920, N) with the token axis padded to a multiple of 8, so that gate and up are two
@@ -46,8 +48,9 @@ quant state, adapters other than one plain LoRA on q and on v, merged or disable
 that is not nn.Dropout/Identity, module hooks, shapes where bitsandbytes would run its own small-M
 4-bit GEMM) calls the forward that was in place before this patch.
 
-Order in apply(): after unpad's `patch_qwen2_attention` and mlp16's `patch_qwen2_mlp_half` (those two
-replace the forward from `_soup_original_forward` and would drop this patch if they ran later).
+Order in apply(): after unpad's `patch_qwen2_attention` and mlp16's `patch_qwen2_mlp_half`. Run later,
+unpad's patch would wrap this one and call it only outside `varlen`, and mlp16's would replace the
+forward from `_soup_original_forward` and drop this one.
 """
 
 import os
@@ -442,12 +445,10 @@ class _QKVRope(torch.autograd.Function):
             grad_x = grad_x.view(ctx.x_shape)
             if ctx.x_dtype != torch.float32:
                 grad_x = grad_x.to(ctx.x_dtype)
-        a_q, b_q = plan.lora_q
-        grad_aq = None if grad_aq is None else grad_aq.to(a_q.weight.dtype)
-        grad_av = None if grad_av is None else grad_av.to(a_q.weight.dtype)
-        grad_bq = None if grad_bq is None else grad_bq.to(b_q.weight.dtype)
-        grad_bv = None if grad_bv is None else grad_bv.to(b_q.weight.dtype)
-        return grad_x, grad_aq, grad_bq, grad_av, grad_bv, None, None, None
+        grads = [grad_aq, grad_bq, grad_av, grad_bv]
+        params = [m.weight for m in plan.lora_q + plan.lora_v]
+        grads = [None if g_ is None else g_.to(p_.dtype) for g_, p_ in zip(grads, params)]
+        return (grad_x, *grads, None, None, None)
 
 
 class _Linear4bitHalf(torch.autograd.Function):
