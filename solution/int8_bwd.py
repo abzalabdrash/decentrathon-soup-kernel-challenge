@@ -41,28 +41,30 @@ from . import nf4
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "0").strip().lower()
           not in ("0", "false", "no", "")}
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
-W_ROWS = 64  # weight rows per program of nf4_int8_t_kernel
-TILE_I, TILE_M = 32, 64  # (features, tokens) tile of the SwiGLU backward and the transposing quant
+W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
+TILE_I, TILE_M = 32, 128  # (features, tokens) tile of the SwiGLU backward: rows along the tokens
+TQ_R, TQ_M = 64, 64  # (rows, tokens) tile of the transposing quantization: 128-byte loads, 64-byte stores
 
 
 @triton.jit
-def nf4_int8_t_kernel(packed_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr,
-                      inv_ptr, out_ptr, n_cols, out_stride, row_offset,
+def nf4_int8_t_kernel(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr,
+                      inv_ptr, out_ptr, blocks_per_row, out_stride, row_offset,
                       ROWS: tl.constexpr, QBLOCK: tl.constexpr, ABLOCK: tl.constexpr):
-    # W (n_rows, n_cols) NF4 -> out[col, row_offset + row] = round(W[row, col] * inv[col]) in int8:
-    # program (r, c) decodes rows [r*ROWS, +ROWS) of one absmax block of columns, then stores the
-    # tile transposed (rows of out contiguous)
+    # W (n_rows, n_cols) NF4 -> out[col, row_offset + row] = round(W[row, col] * inv[col]) in int8.
+    # Program (r, c): rows [r*ROWS, +ROWS) of the c-th 64-column block, i.e. one absmax block per
+    # row, read as 8 int32 words of packed codes each (nf4.py's decode), stored transposed
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    col0 = tl.program_id(1) * QBLOCK
-    cols = col0 + tl.arange(0, QBLOCK)
-    blocks = rows * (n_cols // QBLOCK) + tl.program_id(1)
-    q = tl.load(qabsmax_ptr + blocks).to(tl.int32)
-    absmax = tl.load(code2_ptr + q) * tl.load(absmax2_ptr + blocks // ABLOCK)
+    cblk = tl.program_id(1)
+    blk = rows * blocks_per_row + cblk
+    q = tl.load(qabsmax_ptr + blk).to(tl.int32)
+    absmax = tl.load(code2_ptr + q) * tl.load(absmax2_ptr + blk // ABLOCK)
     absmax = absmax + tl.load(offset_ptr)
-    elem = rows[:, None].to(tl.int64) * n_cols + cols[None, :]
-    byte = tl.load(packed_ptr + elem // 2).to(tl.int32)
-    code = (byte >> ((1 - cols[None, :] % 2) * 4)) & 15  # element 2i: the byte's high nibble
-    vals = tl.load(nf4_ptr + code) * absmax[:, None]
+    words: tl.constexpr = QBLOCK // 8
+    w = tl.load(words_ptr + blk[:, None].to(tl.int64) * words + tl.arange(0, words)[None, :])
+    j = tl.arange(0, 8)
+    codes = (w[:, :, None] >> ((j // 2) * 8 + (1 - j % 2) * 4)[None, None, :]) & 15
+    vals = tl.reshape(tl.load(nf4_ptr + codes), (ROWS, QBLOCK)) * absmax[:, None]
+    cols = cblk * QBLOCK + tl.arange(0, QBLOCK)
     scaled = tl.floor(vals * tl.load(inv_ptr + cols)[None, :] + 0.5)
     q8 = tl.minimum(tl.maximum(scaled, -127.0), 127.0).to(tl.int8)
     dest = cols[:, None].to(tl.int64) * out_stride + (row_offset + rows)[None, :]
@@ -164,9 +166,9 @@ def _decode_t(base, inv, out_i8, out_stride, row_offset):
     state2 = state.state2
     n_rows, n_cols = base.out_features, base.in_features
     nf4_int8_t_kernel[(n_rows // W_ROWS, n_cols // QBLOCK)](
-        weight.data.view(-1), state.absmax, state2.code, state2.absmax, state.offset, state.code,
-        inv, out_i8, n_cols, out_stride, row_offset, ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK,
-        num_warps=4, enable_fp_fusion=False)
+        weight.data.view(-1).view(torch.int32), state.absmax, state2.code, state2.absmax,
+        state.offset, state.code, inv, out_i8, n_cols // QBLOCK, out_stride, row_offset,
+        ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
 
 
 def usable(plan, tokens):
@@ -206,8 +208,8 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     del acc_h
     # 5. dL/d(gate|up) per token, transposed to (tokens, 2I)
     dgu_q = torch.empty((tokens, 2 * inter), dtype=torch.int8, device=device)
-    quant_t_int8_kernel[(2 * inter // TILE_I, triton.cdiv(tokens, TILE_M))](
-        gate_up, amax, dgu_q, 2 * inter, tokens, TR=TILE_I, TM=TILE_M)
+    quant_t_int8_kernel[(2 * inter // TQ_R, triton.cdiv(tokens, TQ_M))](
+        gate_up, amax, dgu_q, 2 * inter, tokens, TR=TQ_R, TM=TQ_M)
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
     inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
     inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
@@ -234,12 +236,12 @@ def _warm():
                               torch.uint8)
     for n_cols, stride in ((INTERMEDIATE, HIDDEN), (HIDDEN, 2 * INTERMEDIATE)):
         for offset in (0, INTERMEDIATE):
-            compile_kernel(nf4_int8_t_kernel, u8, u8, f32, f32, f32, f32, f32, i8, n_cols, stride,
-                           offset, ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4,
-                           enable_fp_fusion=False)
+            compile_kernel(nf4_int8_t_kernel, i32, u8, f32, f32, f32, f32, f32, i8,
+                           n_cols // QBLOCK, stride, offset, ROWS=W_ROWS, QBLOCK=QBLOCK,
+                           ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
     compile_kernel(quant_rows_int8_kernel, half, i8, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
     compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, i32, INTERMEDIATE, tokens,
                    TI=TILE_I, TM=TILE_M)
-    compile_kernel(quant_t_int8_kernel, half, i32, i8, 2 * INTERMEDIATE, tokens, TR=TILE_I, TM=TILE_M)
+    compile_kernel(quant_t_int8_kernel, half, i32, i8, 2 * INTERMEDIATE, tokens, TR=TQ_R, TM=TQ_M)
     compile_kernel(int8_scale_kernel, i32, i32, f32, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
     return None
