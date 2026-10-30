@@ -27,6 +27,7 @@ casts the fp32 gradient to fp16 before the backward GEMM; here the statistics ar
 gradient is written in fp16 once.
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -182,15 +183,23 @@ class FusedLMHeadLoss(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_loss, _g1, _g2, _g3):
         dh_sorted, inverse = ctx.saved_tensors
-        grad = dh_sorted[inverse]
+        # in fp32: the upstream gradient carries the AMP loss scale, 65536 on the first step, which
+        # is inf in fp16 (the first step then had a nan grad_norm and was skipped; the base's was not)
+        grad = dh_sorted[inverse].to(torch.float32)
         if grad_loss is not None:
-            grad = grad * grad_loss.to(grad.dtype)
+            grad = grad * grad_loss.to(torch.float32)
         return grad.to(ctx.in_dtype), None, None, None, None
 
 
 def fused_lm_head_loss(hidden2d, weight, targets, num_items=None, chunk=DEFAULT_CHUNK):
     """(loss, token_loss, token_entropy, correct) for hidden states (N, D), head weight (V, D) and
-    next-token targets (N,) with IGNORE_INDEX where there is no label."""
+    next-token targets (N,) with IGNORE_INDEX where there is no label. A weight kept in host memory
+    (head_stream.py) is streamed through the GPU in one pass over the vocabulary."""
+    from .head_stream import streamed_lm_head_loss, streamer_for
+
+    streamer = streamer_for(weight)
+    if streamer is not None:
+        return streamed_lm_head_loss(hidden2d, weight, targets, num_items, streamer)
     return FusedLMHeadLoss.apply(hidden2d, weight, targets, num_items, chunk)
 
 
@@ -281,3 +290,7 @@ def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK, unpad_enabled=True):
     cls.forward = forward
     cls._soup_original_forward = original
     cls._soup_fused_ce = True
+    if os.environ.get("SOUP_SOLUTION_HEAD_STREAM", "1") not in ("0", "false", "no"):
+        from .head_stream import patch_head_stream
+
+        patch_head_stream()  # the head's weight in host memory, streamed (head_stream.py)

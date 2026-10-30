@@ -10,9 +10,35 @@ fp16 when the round trip is exact element for element (it is for an fp16 checkpo
 model on an Ampere card is left alone). A forward hook casts the embedding output to fp32, so the
 residual stream and the rotary tables keep the base's dtype; the fused head (fused_ce.py) uses the
 fp16 weight directly. The parameter is frozen, so nothing else sees the change.
+
+With head_stream.py on (the default), the weight is in pinned host memory before peft's cast and
+never comes back to the GPU: this module then leaves it alone and only serves as the fallback.
 """
 
 import torch
+
+ROWS = 8192  # rows converted and compared at a time
+
+
+def _streamed(weight):
+    from .head_stream import streamer_for
+
+    return streamer_for(weight) is not None
+
+
+def _exact_half(weight):
+    """`weight` (fp32) in fp16 when the round trip is exact, else None. Row blocks at a time: the
+    whole-tensor comparison held an fp32 copy and a bool mask next to the weight (+1.1 GB at the
+    setup's peak, solution/T13 notes)."""
+    half = torch.empty(weight.shape, dtype=torch.float16, device=weight.device)
+    rows = weight.shape[0] if weight.dim() else 1
+    flat_half, flat = half.view(rows, -1), weight.reshape(rows, -1)
+    for start in range(0, rows, ROWS):
+        block = flat[start:start + ROWS]
+        flat_half[start:start + ROWS].copy_(block)
+        if not torch.equal(flat_half[start:start + ROWS].to(torch.float32), block):
+            return None
+    return half
 
 
 def shrink_embeddings(model):
@@ -35,9 +61,10 @@ def shrink_embeddings(model):
         seen.add(id(weight))
         if weight.dtype != torch.float32 or not weight.is_cuda or weight.requires_grad:
             continue
-        half = weight.data.to(torch.float16)
-        if not torch.equal(half.to(torch.float32), weight.data):
-            del half
+        if _streamed(weight):
+            continue  # its values live in host memory (head_stream.py); the GPU holds 4 bytes
+        half = _exact_half(weight.data)
+        if half is None:
             continue
         weight.data = half
         done += 1

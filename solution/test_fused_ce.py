@@ -60,6 +60,21 @@ def test_grad_scales_with_upstream_gradient():
     torch.testing.assert_close(g8, hidden.grad * 8.0, rtol=1e-3, atol=1e-5)
 
 
+def test_backward_with_the_first_amp_scale():
+    """GradScaler starts at 65536, which is inf in fp16: the head's backward must not overflow."""
+    from solution.fused_ce import fused_lm_head_loss
+
+    hidden, weight, targets = _case(9, 1.0, seed=4)
+    loss, *_ = fused_lm_head_loss(hidden, weight, targets, None, 4)
+    (loss * 65536.0).backward()
+    scaled = hidden.grad.clone()
+    hidden.grad = None
+    loss, *_ = fused_lm_head_loss(hidden, weight, targets, None, 4)
+    loss.backward()
+    assert torch.isfinite(scaled).all()
+    torch.testing.assert_close(scaled, hidden.grad * 65536.0, rtol=1e-3, atol=1e-6)
+
+
 def test_kernel_argmax_ties_first_occurrence():
     """torch.argmax returns the first index of the maximum; the kernel must agree on ties."""
     from solution.fused_ce import BLOCK_V, IGNORE_INDEX, fused_ce_rows_kernel
