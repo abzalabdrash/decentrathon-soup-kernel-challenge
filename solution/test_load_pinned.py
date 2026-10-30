@@ -383,9 +383,9 @@ def test_switch_and_hook(monkeypatch):
     from solution import load_pinned, load_stream
 
     monkeypatch.delenv("SOUP_SOLUTION_LOAD_PINNED", raising=False)
-    assert not load_pinned.enabled() and load_pinned.new_copier("cpu") is None
+    assert load_pinned.enabled()  # on by default since the night integration
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", "0")
-    assert not load_pinned.enabled()
+    assert not load_pinned.enabled() and load_pinned.new_copier("cpu") is None
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", "1")
     assert load_pinned.enabled()
     calls = []
