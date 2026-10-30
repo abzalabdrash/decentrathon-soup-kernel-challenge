@@ -3,7 +3,10 @@
 
     python tools/bench_nf4.py            # from the repository root, on a CUDA GPU
 
-Times are CUDA events over 50 iterations after a warm-up, the median of 5 repeats, in ms.
+Wall times are CUDA events over 50 back-to-back calls after a warm-up, the median of 5 repeats, in ms
+(small shapes are bound by the CPU cost of a call). GPU times are the sum of the CUDA kernels of one
+call (torch.profiler, 20 calls): bitsandbytes' three kernels (absmax dequantization, offset add, 4-bit
+dequantization) against our one.
 """
 
 import statistics
@@ -46,6 +49,20 @@ def timed(fn):
     return statistics.median(times)
 
 
+def gpu_ms(fn, calls=20):
+    """Sum of the CUDA kernel times of one call of `fn`."""
+    from torch.profiler import ProfilerActivity, profile
+
+    for _ in range(WARMUP):
+        fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(calls):
+            fn()
+        torch.cuda.synchronize()
+    return sum(e.device_time_total for e in prof.key_averages()) / calls / 1000
+
+
 def main():
     import bitsandbytes.functional as bnb_functional
     from bitsandbytes.autograd import _functions as bnb_autograd
@@ -53,16 +70,20 @@ def main():
     from solution.nf4 import dequantize_nf4, patch_bnb_matmul4bit
 
     print(torch.cuda.get_device_name(), f"torch {torch.__version__}")
-    print("\ndequantization to fp16, ms (GB/s = bytes read + written / time)")
-    print(f"{'out x in':>12} {'bitsandbytes':>13} {'triton':>8} {'speedup':>8} {'GB/s':>6}")
+    print("\ndequantization to fp16, ms (GB/s = bytes read + written / GPU time of the kernel)")
+    print(f"{'out x in':>12} {'wall bnb':>9} {'wall ours':>9} {'GPU bnb':>8} {'GPU ours':>8} "
+          f"{'GPU speedup':>11} {'GB/s':>5}")
     for k, n in SHAPES:
         layer = make_layer(k, n)
         qs = layer.weight.quant_state
         assert torch.equal(dequantize_nf4(layer.weight, qs), bnb_functional.dequantize_4bit(layer.weight, qs))
         t_bnb = timed(lambda: bnb_functional.dequantize_4bit(layer.weight, qs))
         t_ours = timed(lambda: dequantize_nf4(layer.weight, qs))
+        g_bnb = gpu_ms(lambda: bnb_functional.dequantize_4bit(layer.weight, qs))
+        g_ours = gpu_ms(lambda: dequantize_nf4(layer.weight, qs))
         moved = n * k * 2 + n * k // 2 + qs.absmax.numel()
-        print(f"{f'{n}x{k}':>12} {t_bnb:13.4f} {t_ours:8.4f} {t_bnb / t_ours:7.2f}x {moved / t_ours / 1e6:6.0f}")
+        print(f"{f'{n}x{k}':>12} {t_bnb:9.4f} {t_ours:9.4f} {g_bnb:8.4f} {g_ours:8.4f} "
+              f"{g_bnb / g_ours:10.2f}x {moved / g_ours / 1e6:5.0f}")
 
     patch_bnb_matmul4bit()
     cls = bnb_autograd.MatMul4Bit

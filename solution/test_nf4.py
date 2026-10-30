@@ -84,6 +84,49 @@ def test_dequant_other_formats_fall_back(quant_type, compress_statistics):
     assert torch.equal(dequantize_nf4(layer.weight, qs), bnb_functional.dequantize_4bit(layer.weight, qs))
 
 
+@pytest.mark.parametrize("rows", [(1536, 256, 256), (8960, 8960)])  # q+k+v, gate+up
+def test_dequant_into_row_slices_of_one_buffer(rows, launches):
+    import bitsandbytes.functional as bnb_functional
+
+    from solution.nf4 import dequantize_nf4
+
+    layers = [_layer(1536, n, seed=i) for i, n in enumerate(rows)]
+    buf = torch.full((sum(rows) + 3, 1536), float("nan"), device="cuda", dtype=torch.float16)
+    start = 0
+    for layer, n in zip(layers, rows):
+        view = buf[start:start + n]
+        assert dequantize_nf4(layer.weight, layer.weight.quant_state, out=view) is view
+        start += n
+    assert len(launches) == len(rows)  # straight into the buffer, no copies
+    ref = torch.cat([bnb_functional.dequantize_4bit(layer.weight, layer.weight.quant_state) for layer in layers])
+    assert torch.equal(buf[:start], ref)
+    assert torch.isnan(buf[start:]).all()
+
+
+def test_dequant_out_strided_fallback_and_errors():
+    import bitsandbytes.functional as bnb_functional
+
+    from solution.nf4 import dequantize_nf4
+
+    layer = _layer(256, 64, seed=2)
+    qs = layer.weight.quant_state
+    ref = bnb_functional.dequantize_4bit(layer.weight, qs)
+    wide = torch.zeros(64, 300, device="cuda", dtype=torch.float16)
+    dequantize_nf4(layer.weight, qs, out=wide[:, 10:266])  # not contiguous: written through a copy
+    assert torch.equal(wide[:, 10:266], ref) and not wide[:, :10].any() and not wide[:, 266:].any()
+
+    other = _layer(256, 64, seed=2, compress_statistics=False)  # bitsandbytes' path, then a copy
+    out = torch.empty(64, 256, device="cuda", dtype=torch.float16)
+    dequantize_nf4(other.weight, other.weight.quant_state, out=out)
+    assert torch.equal(out, bnb_functional.dequantize_4bit(other.weight, other.weight.quant_state))
+
+    with pytest.raises(ValueError):
+        dequantize_nf4(layer.weight, qs, out=torch.empty(65, 256, device="cuda", dtype=torch.float16))
+    with pytest.raises(ValueError):
+        dequantize_nf4(layer.weight, qs, dtype=torch.float16,
+                       out=torch.empty(64, 256, device="cuda", dtype=torch.float32))
+
+
 def _forward_backward(layer, x, autocast):
     x = x.detach().clone().requires_grad_(True)
     with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
