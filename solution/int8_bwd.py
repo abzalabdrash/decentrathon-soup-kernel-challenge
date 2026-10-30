@@ -97,7 +97,7 @@ def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, pmax_
     grp = tl.program_id(1)
     live = tok < tokens
     s_tok = tl.load(g_scale_ptr + tok, mask=live, other=0.0)
-    peak = tl.zeros([TM], dtype=tl.float32)
+    peak = tl.zeros([TI, TM], dtype=tl.float32)  # elementwise over the loop, reduced once at the end
     up_shift = inter.to(tl.int64) * tokens
     for f0 in range(0, per_group, TI):
         feat = grp * per_group + f0 + tl.arange(0, TI)
@@ -112,9 +112,8 @@ def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, pmax_
         d_g = (dhid * u * (sig + silu * (1.0 - sig))).to(gate_up_ptr.dtype.element_ty)
         tl.store(gate_up_ptr + at, d_g, mask=live[None, :])
         tl.store(gate_up_ptr + up_shift + at, d_u, mask=live[None, :])
-        peak = tl.maximum(peak, tl.maximum(tl.max(tl.abs(d_g.to(tl.float32)), axis=0),
-                                           tl.max(tl.abs(d_u.to(tl.float32)), axis=0)))
-    tl.store(pmax_ptr + grp * tokens + tok, peak, mask=live)
+        peak = tl.maximum(peak, tl.maximum(tl.abs(d_g.to(tl.float32)), tl.abs(d_u.to(tl.float32))))
+    tl.store(pmax_ptr + grp * tokens + tok, tl.max(peak, axis=0), mask=live)
 
 
 @triton.jit
