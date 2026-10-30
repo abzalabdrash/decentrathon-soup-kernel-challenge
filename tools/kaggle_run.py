@@ -100,11 +100,15 @@ def inject_token_fallback(cell):
     return False
 
 
-def variant_runs(variants, rounds):
-    """[(run name, {env})] in the order the notebook runs them: every variant once per round."""
-    runs = []
+def variant_runs(variants, rounds, abba=False, warm=False):
+    """[(run name, {env})] in the order the notebook runs them: every variant once per round; with
+    `abba` the even rounds run the variants in reverse order (the T4 heats up and slows down over a
+    session: the first runs of a session have faster steps), with `warm` one unmeasured run of the
+    first variant comes first (the first run also pays a cold disk cache, ~8 s before setup)."""
+    runs = [("warm_0", variants[0][1])] if warm and variants else []
     for r in range(1, rounds + 1):
-        for label, env in variants:
+        order = list(reversed(variants)) if abba and r % 2 == 0 else variants
+        for label, env in order:
             runs.append((f"{label}_{r}", env))
     return runs
 
@@ -121,7 +125,7 @@ def parse_variant(text):
 
 
 def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=(),
-                   bench="", skip_pytest=False):
+                   bench="", skip_pytest=False, abba=False, warm=False):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -129,7 +133,7 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
     code_cells[0]["source"] = [f'REPO_URL = "{repo_url}"  # your repository\n',
                                f'COMMIT = "{commit}"  # the commit you submit; empty = the default branch\n']
     # the measurement cell is the one that calls run_task.py; the check cell calls check_rules.py
-    runs = variant_runs(variants, repeats) if mode == "variants" else []
+    runs = variant_runs(variants, repeats, abba, warm) if mode == "variants" else []
     for cell in code_cells:
         text = "".join(cell["source"])
         if "harness/run_task.py" in text:
@@ -242,8 +246,8 @@ def summarize_variants(out_dir):
         print(f"{r['label'] + '_' + r['round']:24s} "
               + " ".join(f"{r[k]!s:>9s}" for k in keys) + f"  {r['c9']!s:4s} {r['alloc']}"
               + ("" if r["ok"] else "  FAILED"))
-    print("mean per variant (finished runs):")
-    for label in dict.fromkeys(r["label"] for r in rows):
+    print("mean per variant (finished runs; the warm-up run excluded):")
+    for label in dict.fromkeys(r["label"] for r in rows if r["label"] != "warm"):
         good = [r for r in rows if r["label"] == label and r["ok"]]
         means = {k: [r[k] for r in good if isinstance(r[k], (int, float))] for k in keys}
         print(f"{label:24s} " + " ".join(
@@ -348,6 +352,10 @@ def main():
                              "with --mode variants, the number of rounds")
     parser.add_argument("--bench", default="", metavar="MODULE [ARGS]",
                         help="--mode bench: the module to run with python -m, and its arguments")
+    parser.add_argument("--abba", action="store_true",
+                        help="--mode variants: even rounds in reverse order (A B C, C B A, ...)")
+    parser.add_argument("--warm-run", action="store_true",
+                        help="--mode variants: one unmeasured run of the first variant first")
     parser.add_argument("--skip-pytest", action="store_true",
                         help="drop the notebook's pytest solution line (measurement runs)")
     parser.add_argument("--poll", type=int, default=30)
@@ -398,7 +406,7 @@ def main():
     (push_dir / nb_name).write_text(
         json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
                                   [tuple(e.split("=", 1)) for e in args.env], variants,
-                                  args.bench, args.skip_pytest),
+                                  args.bench, args.skip_pytest, args.abba, args.warm_run),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
