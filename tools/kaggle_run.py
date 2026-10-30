@@ -284,15 +284,39 @@ def summarize_jury(out_dir):
                   f"{100 * own / (1000 * loop) if loop else 0:5.1f}")
     print(f"evals: {json.dumps(result.get('evals'))[:300]}")
     print(f"summary: {json.dumps(result.get('summary', {}).get('ratios'))}")
-    base = (result.get("runs", {}).get("base") or [{}])[0]
+    runs = result.get("runs", {})
+    base = (runs.get("base") or [{}])[0]
+    cumulative = (base.get("log") or {}).get("num_tokens") or []
+    if cumulative and all(isinstance(t, (int, float)) for t in cumulative):
+        steps = [cumulative[0]] + [b - a for a, b in zip(cumulative, cumulative[1:])]
+        print(f"tokens per step ({base.get('run')}, attention mask): min {min(steps):.0f}, max "
+              f"{max(steps):.0f} (public data: 1,427), {sum(t > 1427 for t in steps)} steps above 1,427, "
+              f"{sum(t % 16 != 0 for t in steps)} of {len(steps)} not a multiple of 16")
     rewind = base.get("rewind") or []
     if rewind:
-        batches = [sum(b[1] or []) for b in rewind]
         rows = [t for b in rewind for t in (b[1] or [])]
-        print(f"rewind ({base.get('run')}): {len(batches)} batches; tokens per batch max {max(batches)} "
-              f"(public data: 1,427), {sum(t > 1427 for t in batches)} batches above 1,427, "
-              f"{sum(t % 16 != 0 for t in batches)} not a multiple of 16; tokens per row min {min(rows)}, "
-              f"max {max(rows)}, {sum(t <= 2 for t in rows)} rows of 1-2 tokens")
+        print(f"loss tokens per row (rewind): min {min(rows)}, max {max(rows)}, "
+              f"{sum(t <= 2 for t in rows)} rows of 1-2")
+    sys.path.insert(0, str(REPO / "harness"))
+    from check_rules import mean_relative, relative  # the gaps exactly as checks 5 and 6 compute them
+
+    if base.get("log"):
+        b_log = base["log"]
+        b_rows = [x for b in rewind for x in (b[2] or [])]
+        for run in runs.get("base", [])[1:] + runs.get("solution", []):
+            log = run.get("log") or {}
+            try:
+                rows = [x for s in run.get("rewind") or [] for x in (s[2] or [])]
+                gaps = {"loss first": relative(log["loss"][0], b_log["loss"][0]),
+                        "loss mean": mean_relative(log["loss"], b_log["loss"]),
+                        "entropy": mean_relative(log["entropy"], b_log["entropy"]),
+                        "accuracy": mean_relative(log["mean_token_accuracy"], b_log["mean_token_accuracy"]),
+                        "rewind row loss": mean_relative(rows, b_rows)}
+            except (KeyError, IndexError, TypeError) as exc:
+                print(f"{run.get('run')}: gaps not comparable ({exc!r})")
+                continue
+            print(f"{run.get('run')} gaps against {base.get('run')} (limits 1% first, 3% others): "
+                  + ", ".join(f"{k} {100 * v:.3f}%" if v is not None else f"{k} -" for k, v in gaps.items()))
     checks_path = path.parent / "checks.json"
     if checks_path.exists():
         checks = json.loads(checks_path.read_text(encoding="utf-8"))
