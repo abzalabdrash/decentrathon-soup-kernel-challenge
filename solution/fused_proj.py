@@ -69,7 +69,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import nf4, rope
+from . import int8_bwd, nf4, rope
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -866,6 +866,14 @@ class _MLP(torch.autograd.Function):
         half = plan.half
         inter = plan.gate.out_features
         grad16 = _padded_half(grad.reshape(n, grad.shape[-1]), n, padded, half)
+        if not plan.recompute and int8_bwd.usable(plan, padded):
+            # SOUP_SOLUTION_INT8_BWD=1: both input-gradient GEMMs on int8 tensor cores, the int8
+            # weights in the shared buffer, (gate|up) overwritten with its gradient
+            buffer = _buffer(grad.device, half, plan.down.out_features * plan.down.in_features)
+            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer)[:n]
+            if ctx.x_dtype != torch.float32:
+                grad_x = grad_x.to(ctx.x_dtype)
+            return grad_x.view(ctx.x_shape), None
         w = _weights((plan.down,), half, grad.device)
         grad_hidden = torch.mm(w.t(), grad16.t())  # (I, padded)
         if plan.recompute:
@@ -936,6 +944,10 @@ def patch_qwen2_mlp_fused():
     cls = mq.Qwen2MLP
     if getattr(cls, "_soup_fused_proj", False):
         return
+    if int8_bwd._STATE["on"]:
+        from .warmup import register
+
+        register(int8_bwd._warm, name="int8_bwd_kernels")
     previous = cls.forward
 
     def forward(self, x):
