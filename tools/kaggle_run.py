@@ -223,6 +223,8 @@ def main():
                         help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base)")
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--no-wait", action="store_true")
+    parser.add_argument("--attach", action="store_true",
+                        help="do not push: wait for the kernel <user>/<slug> already running, then fetch its outputs")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle"))
     args = parser.parse_args()
     if not args.user:
@@ -231,6 +233,20 @@ def main():
         if not args.github_token_file:
             sys.exit("--setup-secrets needs --github-token-file")
         setup_secrets(args.user, args.github_token_file, args.out)
+        return
+    if args.attach:
+        kernel = f"{args.user}/{args.slug}"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = Path(args.out) / f"{stamp}-{args.mode}-{args.slug}" / "output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        status = wait_for(kernel, args.poll)
+        print(kaggle("kernels", "output", kernel, "-p", str(out_dir), "-o", "-q",
+                     "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$",
+                     check=False).strip())
+        print(f"\n=== {status}: outputs in {out_dir} ===")
+        summarize(out_dir, args.mode)
+        for log in out_dir.glob("*.log"):
+            print(f"\n--- tail of {log.name} ---\n{log_tail(log)}")
         return
     if not args.repo:
         sys.exit("--repo is required")
