@@ -10,12 +10,35 @@
 # Modes: solution (~7 min, our run only), diag (solution run with SOUP_SOLUTION_DIAG=1: memory snapshot,
 # chrome trace, import times), full (base + solution + the 10 checks, ~10 min), profile.
 # Results: runs_kaggle/<stamp>-<mode>-<slug>/output/ (gitignored). The CLI needs Python >= 3.11, hence WSL.
+#
+# Kaggle runs at most two GPU notebooks per account at a time (a third push fails or the kernel dies at
+# once). Several sessions on this laptop share account 1, so this script takes one of MAX_SLOTS slot
+# files in a directory shared by every worktree and waits while both are taken; a slot older than
+# 50 minutes counts as stale (a crashed run).
 acct=$1; shift
 case "$acct" in
   1) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle1.token; user=namedesign ;;
   2) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle2.token; user=peagverr ;;
   *) echo "first argument: account 1 (namedesign) or 2 (peagverr)"; exit 2 ;;
 esac
+slug=soup-kernel-run
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--slug" ]; then slug=$arg; fi
+  prev=$arg
+done
+MAX_SLOTS=2
+LOCKDIR=/mnt/c/Users/abdra/Projects/soup/runs_kaggle/.kaggle_slots_$user
+mkdir -p "$LOCKDIR"
+find "$LOCKDIR" -name '*.lock' -mmin +50 -delete 2>/dev/null
+sleep $((RANDOM % 7))
+while [ "$(ls "$LOCKDIR"/*.lock 2>/dev/null | wc -l)" -ge "$MAX_SLOTS" ]; do
+  echo "[kaggle_wsl] both GPU slots of $user are taken ($(ls "$LOCKDIR" | tr '\n' ' ')); waiting 60 s"
+  sleep 60
+  find "$LOCKDIR" -name '*.lock' -mmin +50 -delete 2>/dev/null
+done
+echo "$$ $(date) $slug" > "$LOCKDIR/$slug.lock"
+trap 'rm -f "$LOCKDIR/$slug.lock"' EXIT
 export KAGGLE_API_TOKEN=$(tr -d '\r\n ' < "$tok")
 export PATH=$HOME/miniforge3/envs/soup/bin:$PATH
 python tools/kaggle_run.py --user "$user" --repo https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers.git --poll 30 "$@"

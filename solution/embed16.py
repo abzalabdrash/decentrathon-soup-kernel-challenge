@@ -15,6 +15,23 @@ fp16 weight directly. The parameter is frozen, so nothing else sees the change.
 import torch
 
 
+ROWS_PER_CHUNK = 8192  # 8192 x 1536 fp32 = 48 MiB per comparison chunk
+
+
+def _round_trip_exact(half, full):
+    """True when `half` cast back to fp32 equals `full` element for element. Compared in row chunks:
+    one `half.to(fp32)` of the whole embedding would add a third 933 MiB tensor next to the fp32
+    weight and its fp16 copy, a setup spike that nvidia-smi (100 ms sampling) misses while torch's
+    reserved peak records it, which fails check 9 (peaks must agree within 3%)."""
+    rows = full.shape[0] if full.dim() > 1 else 1
+    half2, full2 = half.reshape(rows, -1), full.reshape(rows, -1)
+    for start in range(0, rows, ROWS_PER_CHUNK):
+        end = min(start + ROWS_PER_CHUNK, rows)
+        if not torch.equal(half2[start:end].to(torch.float32), full2[start:end]):
+            return False
+    return True
+
+
 def shrink_embeddings(model):
     """Returns the number of embedding parameters moved to fp16 (0, 1 or 2)."""
     if not isinstance(model, torch.nn.Module):
@@ -36,7 +53,7 @@ def shrink_embeddings(model):
         if weight.dtype != torch.float32 or not weight.is_cuda or weight.requires_grad:
             continue
         half = weight.data.to(torch.float16)
-        if not torch.equal(half.to(torch.float32), weight.data):
+        if not _round_trip_exact(half, weight.data):
             del half
             continue
         weight.data = half
