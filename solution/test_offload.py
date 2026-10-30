@@ -553,7 +553,12 @@ def test_offload_of_fused_proj_mlp(restore_classes):
 
     ref_out, ref_gx = go(None)
     off = Offloader(weights=[p for m in mlps for p in m.parameters()])
-    assert off.max_inflight == 1 and off.prefetch == 1  # one tensor per layer with the fused MLP
+    from solution import offload
+
+    # one tensor per layer with the fused MLP, plus the layer input with the residual offload
+    # (SOUP_SOLUTION_OFFLOAD_RESIDUAL) and the attention's six with SOUP_SOLUTION_OFFLOAD_ATTN
+    window = 1 + (1 if offload._RESIDUAL["on"] else 0) + (6 if offload.ATTN else 0)
+    assert off.max_inflight == window and off.prefetch == window
     out, gx = go(off)
     assert torch.equal(out, ref_out) and torch.equal(gx, ref_gx)
     assert shapes == [((2 * inter, 832), True)] * layers, shapes
