@@ -28,6 +28,11 @@ Modes:
   profile   harness/run_task.py --profile (full run plus a profiled solution run)
   diag      import times, then --only solution with SOUP_SOLUTION_DIAG=1 (solution/diag.py): memory
             at the phases, PCIe probe, allocation snapshot of one step, chrome trace of two steps
+  variants  several solution-only runs in one Kaggle session, one per --variant LABEL:K=V,K=V (an
+            empty env is the defaults), interleaved over --repeats rounds (A B C A B C), each in
+            runs_var/<label>_<round>; ends with a table per variant: wall, median step, steps 3+,
+            step 0, peaks, own-kernel share, check 9. Sessions differ by up to 10% in speed, so
+            compare variants within one session. ~1.5 min per run after the ~3 min setup.
 """
 
 import argparse
@@ -53,6 +58,7 @@ RUN_CELLS = {
     # (memory at the phases, PCIe probe, allocation snapshot of one step, chrome trace of two)
     "diag": ["!cd /kaggle/working/repo && mkdir -p runs_diag && SOUP_SOLUTION_WARMUP=0 python -X importtime -c \"import torch; torch.empty(1, device='cuda'); import transformers; import sys; sys.path.insert(0, '.'); import solution; solution.apply(); import soup_cli.cli\" 2> runs_diag/importtime.log; wc -l runs_diag/importtime.log\n",
              "!cd /kaggle/working/repo && SOUP_SOLUTION_DIAG=1 python harness/run_task.py --only solution --out runs_diag\n"],
+    "variants": [],  # one line per run, built from --variant by build_notebook
 }
 CHECK_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
@@ -62,6 +68,7 @@ CHECK_CELLS = {
                 "!cd /kaggle/working/repo && python harness/score.py runs/result.json\n"],
     "diag": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_diag/result.json --skip-tests\n",
              "!cd /kaggle/working/repo && ls -la runs_diag/solution_1/ && head -c 300 runs_diag/importtime.log\n"],
+    "variants": [],  # one line per run, built from --variant by build_notebook
 }
 
 
@@ -88,7 +95,27 @@ def inject_token_fallback(cell):
     return False
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=()):
+def variant_runs(variants, rounds):
+    """[(run name, {env})] in the order the notebook runs them: every variant once per round."""
+    runs = []
+    for r in range(1, rounds + 1):
+        for label, env in variants:
+            runs.append((f"{label}_{r}", env))
+    return runs
+
+
+def parse_variant(text):
+    label, _, pairs = text.partition(":")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+        sys.exit(f"--variant {text!r}: the label must be [A-Za-z0-9_.-]+")
+    env = dict(pair.split("=", 1) for pair in pairs.split(",") if pair)
+    for key, value in env.items():
+        if not re.fullmatch(r"[A-Z0-9_]+", key) or not re.fullmatch(r"[A-Za-z0-9_.:-]*", value):
+            sys.exit(f"--variant {text!r}: {key}={value} is not a plain environment setting")
+    return label, env
+
+
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=()):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -96,13 +123,28 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
     code_cells[0]["source"] = [f'REPO_URL = "{repo_url}"  # your repository\n',
                                f'COMMIT = "{commit}"  # the commit you submit; empty = the default branch\n']
     # the measurement cell is the one that calls run_task.py; the check cell calls check_rules.py
+    runs = variant_runs(variants, repeats) if mode == "variants" else []
     for cell in code_cells:
         text = "".join(cell["source"])
         if "harness/run_task.py" in text:
-            cell["source"] = [line.replace("run_task.py", f"run_task.py --repeats {repeats}")
-                              if repeats > 1 else line for line in RUN_CELLS[mode]]
+            if mode == "variants":
+                cell["source"] = [
+                    "!cd /kaggle/working/repo && "
+                    + "".join(f"{k}={v} " for k, v in run_env.items())
+                    + f"python harness/run_task.py --only solution --out runs_var/{name}\n"
+                    for name, run_env in runs]
+            else:
+                cell["source"] = [line.replace("run_task.py", f"run_task.py --repeats {repeats}")
+                                  if repeats > 1 else line for line in RUN_CELLS[mode]]
         elif "harness/check_rules.py" in text:
-            cell["source"] = CHECK_CELLS[mode]
+            if mode == "variants":
+                cell["source"] = [
+                    f"!cd /kaggle/working/repo && python harness/check_rules.py --result "
+                    f"runs_var/{name}/result.json --skip-tests > runs_var/{name}/checks.log 2>&1; "
+                    f"grep -E '^(PASS|FAIL)  [349][.]' runs_var/{name}/checks.log | sed 's/^/{name}: /'\n"
+                    for name, _ in runs]
+            else:
+                cell["source"] = CHECK_CELLS[mode]
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
             sys.exit("the clone cell of the template changed: cannot inject the token fallback")
     if env:  # experiment switches for solution.apply(); the measured subprocesses inherit os.environ
@@ -144,7 +186,63 @@ def wait_for(kernel, poll_s):
         time.sleep(poll_s)
 
 
+def summarize_variants(out_dir):
+    """One line per run of a variants session and the mean per variant."""
+    rows = []
+    for path in sorted(out_dir.rglob("result.json")):
+        if "runs_var" not in path.parts:
+            continue
+        name = path.parent.name
+        label, _, round_ = name.rpartition("_")
+        result = json.loads(path.read_text(encoding="utf-8"))
+        run = (result.get("runs", {}).get("solution") or [{}])[0]
+        m = run.get("metrics", {})
+        steps = []
+        metrics = path.parent / "solution_1" / "metrics.json"
+        if metrics.exists():
+            steps = json.loads(metrics.read_text(encoding="utf-8")).get("step_s") or []
+        own = sum(v for k, v in m.get("own_kernel_ms", {}).items() if not k.startswith("example_"))
+        loop = m.get("timed_loop_s") or 0
+        checks = {}
+        checks_path = path.parent / "checks.json"
+        if checks_path.exists():
+            for c in json.loads(checks_path.read_text(encoding="utf-8")).get("checks", []):
+                checks[c["check"].split(".")[0]] = c["ok"]
+        alloc = ""
+        log = path.parent / "solution_1" / "train.log"
+        if log.exists():
+            found = re.search(r"(\d+) alloc retries, (\d+) segment frees",
+                              log.read_text(encoding="utf-8", errors="replace"))
+            alloc = f"{found.group(1)}/{found.group(2)}" if found else ""
+        rows.append({"label": label, "round": round_, "ok": run.get("exit_code") == 0,
+                     "wall": run.get("wall_s"), "median": m.get("median_step_s"),
+                     "steps3": round(sum(steps[2:]), 2) if steps else None,
+                     "step0": steps[0] if steps else None, "peak": run.get("gpu_peak_mib"),
+                     "reserved": m.get("torch_max_reserved_mib"),
+                     "allocated": m.get("torch_max_allocated_mib"),
+                     "own": round(100 * own / (1000 * loop), 1) if loop else None,
+                     "c9": checks.get("9"), "alloc": alloc})
+    if not rows:
+        print("no runs_var/*/result.json in the output; see the log")
+        return
+    keys = ("wall", "median", "steps3", "step0", "peak", "reserved", "allocated", "own")
+    print(f"{'run':24s} " + " ".join(f"{k:>9s}" for k in keys) + "  c9  retries/frees")
+    for r in sorted(rows, key=lambda r: (r["label"], r["round"])):
+        print(f"{r['label'] + '_' + r['round']:24s} "
+              + " ".join(f"{r[k]!s:>9s}" for k in keys) + f"  {r['c9']!s:4s} {r['alloc']}"
+              + ("" if r["ok"] else "  FAILED"))
+    print("mean per variant (finished runs):")
+    for label in dict.fromkeys(r["label"] for r in rows):
+        good = [r for r in rows if r["label"] == label and r["ok"]]
+        means = {k: [r[k] for r in good if isinstance(r[k], (int, float))] for k in keys}
+        print(f"{label:24s} " + " ".join(
+            f"{sum(v) / len(v):9.3f}" if v else f"{'-':>9s}" for v in means.values()))
+
+
 def summarize(out_dir, mode):
+    if mode == "variants":
+        summarize_variants(out_dir)
+        return
     sub = {"solution": "runs_try", "diag": "runs_diag"}.get(mode, "runs")
     result = None
     for path in out_dir.rglob("result.json"):
@@ -227,8 +325,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=5400, help="max run time in seconds")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                         help="environment variable for the measured runs (repeatable), e.g. SOUP_SOLUTION_UNPAD=0")
+    parser.add_argument("--variant", action="append", default=[], metavar="LABEL:K=V,K=V",
+                        help="--mode variants: one solution-only run per variant and round (repeatable)")
     parser.add_argument("--repeats", type=int, default=1,
-                        help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base)")
+                        help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base); "
+                             "with --mode variants, the number of rounds")
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--no-wait", action="store_true")
     parser.add_argument("--attach", action="store_true",
@@ -259,6 +360,9 @@ def main():
     if not args.repo:
         sys.exit("--repo is required")
     secrets_dataset = None if args.no_secrets_dataset else f"{args.user}/soup-secrets"
+    variants = [parse_variant(v) for v in args.variant]
+    if (args.mode == "variants") != bool(variants):
+        sys.exit("--mode variants needs --variant, and --variant needs --mode variants")
     if args.commit == "HEAD":
         args.commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
                                      text=True, check=True).stdout.strip()
@@ -269,7 +373,7 @@ def main():
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
         json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
-                                  [tuple(e.split("=", 1)) for e in args.env]),
+                                  [tuple(e.split("=", 1)) for e in args.env], variants),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
