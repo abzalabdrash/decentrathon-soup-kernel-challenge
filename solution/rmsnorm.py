@@ -24,14 +24,16 @@ of squares differs (rounding-level differences in fp32).
 import torch
 import triton
 import triton.language as tl
+from torch.autograd.function import once_differentiable
 
 MAX_COLS = 8192  # a row is one register tile; longer rows take the original path
 DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
-# rows per program and warps per program for the forward and the backward (picked with
-# bench_rmsnorm.py on rows of 1536)
-FWD_ROWS, FWD_WARPS = 1, 8
-BWD_ROWS, BWD_WARPS = 1, 8
+# rows per program and warps per program for the forward and the backward. bench_rmsnorm.py
+# --sweep on rows of 1536 (RTX 3050 Ti): 1-8 rows and 2-16 warps all run at the memory bandwidth
+# within noise; one row per program and 4 warps is never slower
+FWD_ROWS, FWD_WARPS = 1, 4
+BWD_ROWS, BWD_WARPS = 1, 4
 DW_PROGRAMS_PER_SM = 4  # programs of the dweight path; each keeps a partial sum of its rows
 
 
@@ -198,6 +200,7 @@ class RMSNormFunction(torch.autograd.Function):
         return y.view(x.shape)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, dy):
         x2, weight, rstd = ctx.saved_tensors
         dx, _, dw = _backward(_rows(dy), x2, weight, rstd, None, x2.dtype, None,
@@ -224,6 +227,7 @@ class AddRMSNormFunction(torch.autograd.Function):
         return s.view(residual.shape), y.view(residual.shape)
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, ds, dy):
         s, weight, rstd = ctx.saved_tensors
         residual_dtype, branch_dtype = ctx.dtypes
