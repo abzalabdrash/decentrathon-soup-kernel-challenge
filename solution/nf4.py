@@ -101,11 +101,13 @@ def _fast_path(weight, quant_state, dtype):
             and state2.code.dtype == torch.float32 and state2.code.numel() == 256)
 
 
-def _launch(weight, quant_state, dtype):
-    """Runs the kernel; the caller has checked `_fast_path`."""
+def _launch(weight, quant_state, dtype, out=None):
+    """Runs the kernel into `out` (contiguous, (N, K)) or a new tensor; the caller has checked
+    `_fast_path`."""
     n_rows, n_cols = (int(s) for s in quant_state.shape)
     n_blocks = quant_state.absmax.numel()
-    out = torch.empty((n_rows, n_cols), dtype=dtype, device=weight.device)
+    if out is None:
+        out = torch.empty((n_rows, n_cols), dtype=dtype, device=weight.device)
     state2 = quant_state.state2
     nf4_dequant_kernel[(triton.cdiv(n_blocks, BLOCKS_PER_PROGRAM),)](
         weight, quant_state.absmax, state2.code, state2.absmax, quant_state.offset,
@@ -116,10 +118,20 @@ def _launch(weight, quant_state, dtype):
     return out
 
 
-def dequantize_nf4(weight, quant_state, dtype=None):
+def dequantize_nf4(weight, quant_state, dtype=None, out=None):
     """The (N, K) weight of a bitsandbytes 4-bit tensor, like `bitsandbytes.functional.dequantize_4bit`
     (same values, same dtype `quant_state.dtype` unless `dtype` is given). NF4 with double quant to
-    fp16 runs the Triton kernel; anything else is bitsandbytes' own dequantization."""
+    fp16 runs the Triton kernel; anything else is bitsandbytes' own dequantization.
+
+    `out`: an (N, K) tensor to write into, e.g. a slice of rows of a bigger buffer, so that several
+    weights end up side by side for one GEMM; its dtype is the output dtype. A contiguous `out` is
+    written by the kernel directly; anything else gets a copy."""
+    if out is not None:
+        shape = tuple(int(s) for s in getattr(quant_state, "shape", None) or ())
+        if not torch.is_tensor(out) or tuple(out.shape) != shape or (dtype is not None and dtype != out.dtype):
+            raise ValueError(f"out must be a tensor of shape {shape}"
+                             + ("" if dtype is None else f" and dtype {dtype}"))
+        dtype = out.dtype
     dtype = getattr(quant_state, "dtype", None) if dtype is None else dtype
     # a Params4bit answers every attribute through __torch_function__: check and launch on the plain
     # tensor (about 20 us less per call)
@@ -127,13 +139,19 @@ def dequantize_nf4(weight, quant_state, dtype=None):
     if not _fast_path(plain, quant_state, dtype):
         import bitsandbytes.functional as bnb_functional
 
-        out = bnb_functional.dequantize_4bit(weight, quant_state)
-        return out if dtype is None or out.dtype == dtype else out.to(dtype)
-    out = _launch(plain, quant_state, dtype)
+        result = bnb_functional.dequantize_4bit(weight, quant_state)
+        if out is not None:
+            return out.copy_(result)
+        return result if dtype is None or result.dtype == dtype else result.to(dtype)
+    if out is not None:
+        if out.is_contiguous() and out.device == plain.device:
+            return _launch(plain, quant_state, dtype, out)
+        return out.copy_(_launch(plain, quant_state, dtype))
+    result = _launch(plain, quant_state, dtype)
     # bitsandbytes' shim for a packed weight passed in the transposed [1, n / 2] form
     if weight.dim() == 2 and weight.shape[0] == 1 and weight.numel() > 1:
-        return out.t()
-    return out
+        return result.t()
+    return result
 
 
 def _bnb_fused_gemm(A, quant_state):
