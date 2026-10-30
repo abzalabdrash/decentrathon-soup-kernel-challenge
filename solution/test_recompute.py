@@ -244,24 +244,33 @@ def _layer_forward(layer, rotary, lengths, seed=5):
 
 @pytest.mark.parametrize("lengths", [[212, 187, 310, 117], [500, 480, 447]])
 def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths):
+    """One layer between an input and the next layer's input norm (which consumes the layer's two
+    outputs, as in training, so that what stays allocated is what the layer keeps for its
+    backward): outputs and gradients against the kept path, and the bytes per token kept."""
+    from solution.rmsnorm import add_rmsnorm
+
     layer, rotary = decoder_1p5b
     n = sum(lengths)
+    next_norm = torch.ones(1536, device="cuda")
 
     def run(mode, split):
         _set(modes, recompute=mode, split=split, check=mode is not None)
         for p in layer.parameters():
             p.grad = None
         torch.cuda.synchronize()
-        before = torch.cuda.memory_allocated()
         torch.manual_seed(7)
         (mlp_out, residual), (hidden, branch_in) = _layer_forward(layer, rotary, lengths)
+        s_next, y_next = add_rmsnorm(residual, mlp_out, next_norm, 1e-6)  # the next input norm
+        out = (mlp_out.detach(), residual.detach())
+        del mlp_out, residual
         torch.cuda.synchronize()
-        held = torch.cuda.memory_allocated() - before  # inputs, outputs and what the backward keeps
+        held = torch.cuda.memory_allocated()
         g = torch.Generator("cuda").manual_seed(8)
-        grads = [torch.randn(mlp_out.shape, device="cuda", generator=g).to(mlp_out.dtype),
-                 torch.randn(residual.shape, device="cuda", generator=g)]
-        torch.autograd.backward([mlp_out, residual], grads)
-        return {"held": held, "out": (mlp_out.detach(), residual.detach()),
+        grads = [torch.randn(s_next.shape, device="cuda", generator=g),
+                 torch.randn(y_next.shape, device="cuda", generator=g)]
+        torch.autograd.backward([s_next, y_next], grads)
+        del s_next, y_next
+        return {"held": held, "out": out,
                 "grads": [hidden.grad, branch_in.grad] + [p.grad.clone() for p in _lora_params(layer)]}
 
     run(None, False)  # first call: buffers, caches, the allocator's pool
@@ -280,7 +289,7 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
           f"(-{saved_recompute * n / 2 ** 20:.1f} MiB per layer)")
     # the split sum keeps the half branch instead of the fp32 sum: 2 bytes x 1536 per token less
     assert saved_split > 0.8 * 2 * 1536
-    # the recompute keeps neither the branch nor q, k, v, the output and lse: > 10 KB per token less
+    # the recompute keeps neither the sum nor q, k, v, the output and lse: > 10 KB per token less
     assert saved_recompute > 10_000
 
 

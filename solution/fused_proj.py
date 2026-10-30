@@ -837,7 +837,17 @@ class _AttnRecompute:
                        branch=self.branch_out)
             for name, value in got.items():
                 want = self.check.get(name)
-                if value is not None and want is not None and not torch.equal(value, want.view_as(value)):
+                if value is None or want is None:
+                    continue
+                if name == "lse" and value.dim() == 3 and value.shape[0] == len(plan.bounds) - 1:
+                    # (sequences, heads, aligned length): the entries past a sequence are unwritten
+                    same = all(torch.equal(value[i, :, :end - start], want[i, :, :end - start])
+                               for i, (start, end) in enumerate(zip(plan.bounds[:-1], plan.bounds[1:])))
+                elif name == "lse" and value.dim() == 3:  # one row of all tokens, aligned
+                    same = torch.equal(value[..., :plan.n_tokens], want[..., :plan.n_tokens])
+                else:
+                    same = torch.equal(value, want.view_as(value))
+                if not same:
                     _RECOMPUTE["mismatches"].append(name)
 
     def branch(self):
