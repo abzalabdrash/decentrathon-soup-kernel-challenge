@@ -408,8 +408,13 @@ def _shutdown():
     Without it, a process that ends soon after apply() (Soup's tests end 0.6 s after it) could
     finalize while the thread compiles, and the compiler's C++ thread pool, destroyed under it,
     aborts the process ("terminate called without an active exception", exit code 134; T13 saw it
-    in 3 of 6 runs of the tests). In a training run the warm-up is long done at exit: nothing to
-    wait for."""
+    in 3 of 6 runs of the tests). Waiting for the current registration only keeps the tests' exit
+    short (about a second at most), where waiting for the whole warm-up would add its 5 s. The
+    killed helper leaves no half-written entry in triton's cache: every file is written in a temp
+    directory and moved into place with os.replace, and a kernel's index file (`__grp__*.json`)
+    last (triton/runtime/cache.py, FileCacheManager.put / put_group); a kernel cut short has no
+    index and is compiled again by whoever needs it. In a training run the warm-up is long done at
+    exit: nothing to wait for."""
     _STOP.set()
     helper = _STATE["helper"]
     if helper is not None and helper["proc"].poll() is None:
