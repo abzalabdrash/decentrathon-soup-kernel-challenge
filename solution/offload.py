@@ -25,9 +25,9 @@ SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
   trained model), i.e. gate and up, is copied to pinned host memory on a side
   stream while the forward goes on. It may have no grad_fn: fused_proj's MLP saves (gate|up) made
   inside its autograd.Function, where grad mode is off. Our reference to the GPU tensor is dropped
-  once its copy is done; beyond `max_inflight` copies in flight the forward waits for the oldest,
-  so the CPU cannot run many layers ahead of the GPU with every copied tensor still counted as
-  allocated. The backward gets each tensor back with an H2D copy, and asking for one starts the
+  once its copy is done; beyond `max_inflight` copies in flight the oldest is dropped behind a wait
+  of its stream for its copy (on the GPU, the CPU goes on), so the copied tensors do not pile up as
+  allocated while the CPU runs layers ahead of the GPU. The backward gets each tensor back with an H2D copy, and asking for one starts the
   copies of the `prefetch` tensors saved just before it on the side stream (the backward walks the
   layers in reverse), so the next layer's gate/up arrive during this layer's backward. Both
   windows default to one layer: the tensors one MLP saves (saved_per_layer). The pinned memory is a stack of slabs: a step pushes in forward order, the backward
@@ -36,15 +36,23 @@ SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
   With the fused MLP it saves (gate|up) for the hooks to take (set_mlp_recompute(False)).
 - none: nothing (the fused MLP saves (gate|up) and it stays on the GPU).
 
-Stream rules of the offload (current = the stream the forward or backward runs on, side = ours):
+Stream rules of the offload (current = the stream the forward or backward runs on, side = ours,
+home = the stream a GPU tensor was allocated on: the caching allocator reuses its block only for
+later allocations on home). No record_stream and no CPU wait on the training path (one stream for
+the forward and the backward): every hazard is closed by making home wait for an event, so the CPU
+keeps running ahead of the GPU and the allocator never has stream uses to track:
 - D2H: side waits for an event recorded on current after the tensor was produced; the GPU tensor
-  stays referenced (inflight) until the copy's event has completed, or gets record_stream(side)
-  when the backward takes it before that;
+  stays referenced (inflight) until its copy's event has completed, or, past `max_inflight` copies
+  in flight, home waits for that event and the reference is dropped (later work on home, including
+  any reuse of the block, comes after the copy); the backward taking the tensor before that makes
+  home wait for the copy the same way;
 - a pinned slot is rewritten only after every earlier H2D read of it: reads on side are ordered by
   the stream, reads on current leave an event that side waits for before its next D2H;
-- prefetch: the GPU tensor is allocated on current, side waits for current before writing it (the
-  block may still be in use by earlier work of current), current waits for the copy's event before
-  using it, and record_stream(side) covers a prefetched tensor that is dropped unused.
+- prefetch: the GPU tensor is allocated on current (home), side waits for current before writing it
+  (the block may still be in use by earlier work of current), current waits for the copy's event
+  before using it; a prefetched tensor dropped unused makes home wait for its copy first.
+A tensor used on another stream than its home (two backward streams: not this training) falls back
+to record_stream.
 
 Knobs for experiments (environment): SOUP_SOLUTION_OFFLOAD_MIN_NUMEL, SOUP_SOLUTION_OFFLOAD_INFLIGHT,
 SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). bench_offload.py
@@ -173,12 +181,17 @@ class _Saved:
     in flight (the original) or after a prefetch (with `ready`, the H2D's event)."""
 
     __slots__ = ("shape", "dtype", "device", "index", "slot", "host", "copied", "gpu", "ready",
-                 "__weakref__")
+                 "home", "__weakref__")
 
     def __del__(self):
         slot = getattr(self, "slot", None)
         if slot is not None:
             slot.released = True
+        if getattr(self, "gpu", None) is not None and getattr(self, "ready", None) is not None:
+            try:  # a prefetched tensor never unpacked: its block is not reused before the copy
+                self.home.wait_event(self.ready)
+            except Exception:  # noqa: BLE001 - interpreter shutdown
+                pass
 
 
 class Offloader:
@@ -228,7 +241,8 @@ class Offloader:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
-        side.wait_event(torch.cuda.current_stream(tensor.device).record_event())
+        home = torch.cuda.current_stream(tensor.device)
+        side.wait_event(home.record_event())
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
@@ -238,14 +252,14 @@ class Offloader:
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
         saved.slot, saved.host, saved.copied = slot, host, side.record_event()
-        saved.gpu, saved.ready = tensor, None
+        saved.gpu, saved.ready, saved.home = tensor, None, home
         saved.index = self.count
         self.count += 1
         self.by_index[saved.index] = saved
         inflight.append(saved)
         while len(inflight) > self.max_inflight:
             oldest = inflight.popleft()
-            oldest.copied.synchronize()
+            oldest.home.wait_event(oldest.copied)  # on the GPU: the CPU goes on
             oldest.gpu = None
             self.stats["waited"] += 1
         self.stats["offloaded"] += 1
@@ -266,12 +280,14 @@ class Offloader:
                 self.stats["fetched"] += 1
             elif saved.ready is not None:
                 current.wait_event(saved.ready)
-                tensor.record_stream(current)  # allocated on the stream of an earlier unpack
+                if saved.home != current:
+                    tensor.record_stream(current)
                 saved.gpu = saved.ready = None
                 self.stats["prefetch_hits"] += 1
             else:
-                tensor.record_stream(self.stream)  # the D2H may still be reading it
-                tensor.record_stream(current)  # allocated on the forward's stream
+                saved.home.wait_event(saved.copied)  # the D2H may still be reading it
+                if saved.home != current:
+                    tensor.record_stream(current)
                 saved.gpu = None
                 try:
                     self.inflight.remove(saved)
@@ -294,8 +310,7 @@ class Offloader:
                 waited = True
             with torch.cuda.stream(side):
                 tensor.copy_(saved.host, non_blocking=True)
-            tensor.record_stream(side)
-            saved.gpu, saved.ready = tensor, side.record_event()
+            saved.gpu, saved.ready, saved.home = tensor, side.record_event(), current
             self.stats["prefetched"] += 1
 
     def close(self):
@@ -311,7 +326,7 @@ class Offloader:
         return (f"{s['offloaded']} tensors, {s['bytes'] / 2**30:.2f} GiB to host (windows: "
                 f"{self.max_inflight} in flight, {self.prefetch} prefetched); back: "
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
-                f"{s['still_on_gpu']} still on GPU; forward waited {s['waited']} times; "
+                f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
                 f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}")
 
