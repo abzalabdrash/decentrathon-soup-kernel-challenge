@@ -252,6 +252,8 @@ def test_helper_process_compiles_for_this_one(tmp_path):
     assert int(res["helper_results"]) >= 7
     assert int(res["misses"]) >= 7 and res["cache_hits"] == res["misses"], res
     assert res["built"] == "-", res
+    # triton's own hash came from the helper: this process never hashed libtriton.so
+    assert res["key_from_helper"] == "True" and res["key_hashed_here"] == "False", res
 
 
 @pytest.mark.parametrize("mode", ["helper", "thread"])

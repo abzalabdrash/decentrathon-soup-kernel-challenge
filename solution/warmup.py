@@ -405,6 +405,26 @@ def _triton_key():
         pass
 
 
+def _reuse_triton_key(value):
+    """Every on-disk cache key starts with `triton_key()`, a sha256 of triton's own files (415 MB
+    of libtriton.so: 1.5 s of a core on Kaggle, next to the model load, which it slowed). The helper
+    computed it over the same installation seconds before; this process takes its value
+    (triton/runtime/cache.py:get_cache_key looks the function up at call time). A wrong value could
+    only make the cache miss: the kernels would then compile here."""
+    from triton.runtime import cache
+
+    original = cache.triton_key
+    if getattr(original, "_soup_from_helper", False) or not isinstance(value, str) or not value:
+        return
+
+    def triton_key():
+        return value
+
+    triton_key._soup_from_helper = True
+    triton_key.__wrapped__ = original
+    cache.triton_key = triton_key
+
+
 def _prepare_triton():
     """What the first compile of the process does once, done before the workers start so that they
     do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
@@ -652,6 +672,15 @@ def _offline_driver(arch):
     return offline
 
 
+def _helper_triton_key():
+    try:
+        from triton.runtime.cache import triton_key
+
+        return triton_key()
+    except Exception:  # noqa: BLE001 - the training process computes its own then
+        return None
+
+
 def helper_main(argv):
     """The helper process: `python -m solution.warmup --helper <arch> <half dtype> <names...>`.
     Prints one JSON line: seconds and errors per registration."""
@@ -674,8 +703,10 @@ def helper_main(argv):
     jobs = [(name, fn) for name, fn in WARMUPS if name in names and name not in NEEDS_GPU]
     results, errors = {}, {}
 
+    workers = int(os.environ.get("SOUP_SOLUTION_WARMUP_WORKERS", "0") or 0) or WORKERS
+
     def run(batch):
-        done, failed = _run_jobs(batch, WORKERS)
+        done, failed = _run_jobs(batch, workers)
         results.update(done)
         errors.update(failed)
 
@@ -688,7 +719,8 @@ def helper_main(argv):
     print(json.dumps({"import_s": round(import_s, 3),
                       "compile_s": round(time.perf_counter() - begin - import_s, 3),
                       "results": results, "errors": errors,
-                      "cuda_initialized": torch.cuda.is_initialized()}), flush=True)
+                      "cuda_initialized": torch.cuda.is_initialized(),
+                      "triton_key": _helper_triton_key()}), flush=True)
     return 0
 
 
@@ -703,11 +735,13 @@ def _run(jobs, device, log):
         _STATE["idents"].add(threading.get_ident())
         torch.cuda.set_device(device)
         stream = torch.cuda.Stream(device)
-        # while the helper compiles: triton's own hash (mostly outside the GIL), then the wait
-        _triton_key()
+        # the helper's triton_key when it has one (see _reuse_triton_key), else our own
         helper = _wait_for_helper(log)
+        if helper is not None:
+            _reuse_triton_key(helper.get("triton_key"))
         if _STOP.is_set():  # the process is exiting (see _shutdown)
             return
+        _triton_key()
         # The rest takes the GIL often (the compiles the helper did not do, and for the others the
         # cache reads, the launcher import and the cubin load); while the main thread runs Python,
         # every retake waits for the switch interval (5 ms by default). RTX 3050 Ti, one worker,

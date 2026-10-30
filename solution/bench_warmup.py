@@ -373,6 +373,7 @@ def child_helper(late="0"):
     `late` = 1, two warm-ups are registered after the helper started, as patch functions do
     (rmsnorm.warm_rebuild; head_stream's kernels, a functools.partial): sent to it by name."""
     import triton.runtime.build as build
+    from triton.runtime import cache
 
     _prelude()
     warmup = _setup_warmup()
@@ -409,6 +410,9 @@ def child_helper(late="0"):
         "wall": round(time.perf_counter() - start, 3), "misses": len(compiles),
         "cache_hits": sum(1 for c in compiles if c["cache_hit"]),
         "built": ",".join(built) or "-", "errors": ",".join(report["errors"]) or "-",
+        "key_from_helper": getattr(cache.triton_key, "_soup_from_helper", False),
+        "key_hashed_here": getattr(cache.triton_key, "__wrapped__", cache.triton_key)
+        .cache_info().currsize > 0,
     }
     print("\n".join(f"{key}={value}" for key, value in values.items()))
 
