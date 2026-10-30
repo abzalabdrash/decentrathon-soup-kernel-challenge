@@ -73,3 +73,33 @@ def test_builds_a_module(clean_hook, monkeypatch):
     if shutil.which("nice"):
         assert commands[0][:3] == ["nice", "-n", "5"]
     assert os.path.basename(commands[0][commands[0].index("-o") + 1]).startswith("__soup_test_launcher")
+
+
+def test_warmup_order_longest(monkeypatch):
+    """SOUP_SOLUTION_WARMUP_ORDER=longest queues the registrations by COSTS, longest first; the
+    default keeps the registration order."""
+    import queue as queue_module
+
+    names = ["cublas", "fused_proj_masked_pair_sum", "head_stream_kernels", "unknown_kernel",
+             "rms_norm_rows_fwd"]
+
+    def queued(order):
+        monkeypatch.setattr(warmup, "WARMUPS", [(name, lambda: None) for name in names])
+        state = warmup._new_state()
+        state["thread"] = object()  # pretend the thread runs: nothing is started
+        monkeypatch.setattr(warmup, "_STATE", state)
+        if order:
+            monkeypatch.setenv("SOUP_SOLUTION_WARMUP_ORDER", order)
+        else:
+            monkeypatch.delenv("SOUP_SOLUTION_WARMUP_ORDER", raising=False)
+        warmup.start_background_warmup(log=False, final=True)
+        out = []
+        while True:
+            try:
+                out.append(state["queue"].get_nowait()[0])
+            except queue_module.Empty:
+                return out
+
+    assert queued(None) == names
+    assert queued("longest") == ["rms_norm_rows_fwd", "head_stream_kernels", "unknown_kernel", "cublas",
+                                 "fused_proj_masked_pair_sum"]

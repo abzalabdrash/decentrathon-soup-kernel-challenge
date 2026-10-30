@@ -84,7 +84,8 @@ exit, `_shutdown` stops the warm-up between two registrations. `watch_compiles()
 begin shows whether the warm-up fits.
 
 Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default),
-SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name.
+SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
+SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
 
 The launchers (SOUP_SOLUTION_LAUNCHER_OPT, SOUP_SOLUTION_LAUNCHER_NICE; off by default)
 ------------------------------------------------------------------------------------
@@ -128,6 +129,16 @@ INTERMEDIATE = 8960  # Qwen2.5-1.5B's MLP width: 16 * 560
 TOKENS = 826  # a typical packed batch; only its class matters (tokens * 8960 is always "D")
 
 WARMUPS = []  # [(name, fn)]: run in this order by the background thread
+# Seconds of each registration on the T4 with -O0 launchers (night-trinit session 2, lo0 runs; the
+# -O3 order is the same), for SOUP_SOLUTION_WARMUP_ORDER=longest: the workers take the longest
+# first, which shortens the warm-up when its tail is on the way to the first step (registration
+# order ends with head_stream_kernels and fused_proj_nf4_dequant3: 4.84 s against 4.57 s in a
+# two-worker simulation of these costs). Unknown names count as 0.5 s.
+COSTS = {"rms_norm_rows_fwd": 1.45, "head_stream_kernels": 1.35, "rope_qk_kernel": 1.12,
+         "nf4_dequant_kernel": 0.75, "fused_proj_nf4_dequant3": 0.70, "rms_norm_rows_bwd": 0.64,
+         "fused_ce_rows_kernel": 0.60, "rms_norm_rows_bwd_split": 0.53, "step_ops": 0.49,
+         "example_swiglu_fwd_kernel": 0.50, "example_swiglu_bwd_kernel": 0.40,
+         "fused_proj_x16_rebuild": 0.41, "cublas": 0.27, "fused_proj_masked_pair_sum": 0.13}
 COMPILES = []  # every compile seen by `watch_compiles`, as dicts (see there)
 
 _LOCK = threading.Lock()
@@ -628,10 +639,13 @@ def start_background_warmup(log=True, final=True):
                 _DONE.set()
                 return None
         skip = set(filter(None, re.split(r"[,:.]", os.environ.get("SOUP_SOLUTION_WARMUP_SKIP", ""))))
-        for name, fn in list(WARMUPS):
-            if name not in _STATE["queued"] and name not in skip:
-                _STATE["queued"].add(name)
-                _STATE["queue"].put((name, fn))
+        batch = [(name, fn) for name, fn in list(WARMUPS)
+                 if name not in _STATE["queued"] and name not in skip]
+        if os.environ.get("SOUP_SOLUTION_WARMUP_ORDER", "") == "longest":
+            batch.sort(key=lambda item: -COSTS.get(item[0], 0.5))  # stable: ties keep their order
+        for name, fn in batch:
+            _STATE["queued"].add(name)
+            _STATE["queue"].put((name, fn))
         if final:
             _STATE["closed"] = True
         if _STATE["thread"] is None:
