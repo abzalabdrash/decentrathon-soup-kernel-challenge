@@ -281,6 +281,40 @@ def test_attention_single_row(layer_1p5b):
         assert _rel(a, b) < 2e-2
 
 
+def test_attention_1p5b_with_alignment_tail(layer_1p5b):
+    """Spans that end before the tokens (unpad.varlen_model_forward's alignment tail): the fused
+    path takes them, matches the unfused path, the tail rows stay finite and, with no loss on them,
+    get an input gradient of exactly zero."""
+    from solution import fused_proj
+    from solution.unpad import varlen
+
+    _, attn, _, rotary = layer_1p5b
+    tail = 10
+    x, pe, grad = _attention_inputs(rotary, seed=11, lengths=LENGTHS + [tail])  # tail at 0..9
+    grad[:, -tail:] = 0
+
+    def step(fused):
+        _fused(fused)
+        xg = x.detach().requires_grad_(True)
+        for p in attn.parameters():
+            p.grad = None
+        with torch.autocast("cuda", dtype=torch.float16), varlen(_spans(LENGTHS)):
+            plan = fused_proj._attention_plan(attn, xg, pe, None, None)
+            assert (plan is not None and plan.bounds[-2:] == (826, 836)) if fused else plan is None
+            out, _ = attn(xg, pe, None)
+        out.backward(grad)
+        return out.detach(), xg.grad, [p.grad.clone() for p in _lora_params(attn)]
+
+    ref_out, ref_dx, ref_grads = step(False)
+    out, dx, grads = step(True)
+    assert torch.isfinite(out).all() and torch.isfinite(dx).all()
+    assert torch.all(dx[:, -tail:] == 0) and torch.all(ref_dx[:, -tail:] == 0)
+    assert _rel(out, ref_out) < 1e-2
+    assert _rel(dx, ref_dx) < 2e-2
+    for g, ref in zip(grads, ref_grads):
+        assert _rel(g, ref) < 2e-2
+
+
 def _mlp_step(mlp, x, grad):
     x = x.detach().requires_grad_(True)
     with torch.autocast("cuda", dtype=torch.float16):
@@ -490,7 +524,7 @@ def test_guards_take_the_previous_path(layer_1p5b):
     assert plan(dtype=torch.bfloat16) is None  # autocast dtype is not the compute dtype
     assert plan(mask=torch.ones(1, device="cuda")) is None
     assert plan(x=x.cpu()) is None
-    assert plan(x=x[:, :100]) is None  # spans do not tile the tokens
+    assert plan(x=x[:, :100]) is None  # spans past the tokens (a tail after them is fine)
     attn.q_proj._disable_adapters = True
     assert plan() is None
     attn.q_proj._disable_adapters = False
