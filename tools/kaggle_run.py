@@ -80,7 +80,7 @@ def inject_token_fallback(cell):
     return False
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None):
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -91,7 +91,8 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None):
     for cell in code_cells:
         text = "".join(cell["source"])
         if "harness/run_task.py" in text:
-            cell["source"] = RUN_CELLS[mode]
+            cell["source"] = [line.replace("run_task.py", f"run_task.py --repeats {repeats}")
+                              if repeats > 1 else line for line in RUN_CELLS[mode]]
         elif "harness/check_rules.py" in text:
             cell["source"] = CHECK_CELLS[mode]
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
@@ -153,10 +154,10 @@ def summarize(out_dir, mode):
               f"eval loss vs base {ratios.get('quality_delta_pct')} %")
     for run in result.get("runs", {}).get("solution", []):
         m = run.get("metrics", {})
-        own = m.get("own_kernel_ms", {})
+        own = {k: v for k, v in m.get("own_kernel_ms", {}).items() if not k.startswith("example_")}
         loop = m.get("timed_loop_s") or 0
         share = sum(own.values()) / (1000 * loop) if loop else 0
-        print(f"{run['run']}: own kernels {100 * share:.1f}% of timed steps; "
+        print(f"{run['run']}: own kernels (example excluded) {100 * share:.1f}% of timed steps; "
               f"median step {m.get('median_step_s')} s; apply {m.get('apply_s')} s; "
               f"torch peak reserved {m.get('torch_max_reserved_mib')} MiB")
         if own:
@@ -210,6 +211,8 @@ def main():
     parser.add_argument("--public", action="store_true", help="make the kernel public (for the submission)")
     parser.add_argument("--accelerator", default="NvidiaTeslaT4")
     parser.add_argument("--timeout", type=int, default=5400, help="max run time in seconds")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base)")
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--no-wait", action="store_true")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle"))
@@ -233,7 +236,7 @@ def main():
     push_dir.mkdir(parents=True, exist_ok=True)
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
-        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset),
+        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,

@@ -13,10 +13,14 @@ Modules:
 - unpad.py: the layers run on the packed real tokens of the batch, attention per row;
 - mlp16.py: the MLP's gate/up/SwiGLU in half storage (uses the kit's example SwiGLU kernel, which
   does not count as ours);
-- embed16.py: the tied embedding / lm_head weight back in fp16 after Soup's setup.
+- embed16.py: the tied embedding / lm_head weight back in fp16 after Soup's setup;
+- rmsnorm.py: RMSNorm and residual-add + RMSNorm in one Triton kernel each way (own kernels);
+- nf4.py: NF4 dequantization in one Triton kernel, used by bitsandbytes' MatMul4Bit (own kernel);
+- rope.py: rotary embedding of q and k in one Triton kernel each way (own kernel).
 
 Switches (environment, for experiments): SOUP_SOLUTION_CE_CHUNK (rows of logits per chunk, default
-1024), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0.
+512), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0, SOUP_SOLUTION_RMSNORM=0,
+SOUP_SOLUTION_NF4=0, SOUP_SOLUTION_ROPE=0.
 """
 
 import os
@@ -27,13 +31,16 @@ def _on(name):
 
 
 def apply():
+    from .phases import mark, patch_soup_phases
+
+    mark("apply begin")
     from .embed16 import patch_soup_setup
     from .fused_ce import patch_qwen2_causal_lm
     from .mlp16 import patch_qwen2_mlp_half
     from .trainer_patch import patch_sft_trainer
     from .unpad import patch_qwen2_attention
 
-    chunk = int(os.environ.get("SOUP_SOLUTION_CE_CHUNK", "1024"))
+    chunk = int(os.environ.get("SOUP_SOLUTION_CE_CHUNK", "512"))
     patch_qwen2_causal_lm(chunk=chunk, unpad_enabled=_on("SOUP_SOLUTION_UNPAD"))
     patch_qwen2_attention()
     patch_sft_trainer()
@@ -45,3 +52,18 @@ def apply():
         patch_qwen2_mlp()
     if _on("SOUP_SOLUTION_EMBED16"):
         patch_soup_setup()
+    if _on("SOUP_SOLUTION_RMSNORM"):
+        from .rmsnorm import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
+
+        patch_qwen2_rmsnorm()
+        patch_qwen2_decoder_layer()
+    if _on("SOUP_SOLUTION_NF4"):
+        from .nf4 import patch_bnb_matmul4bit
+
+        patch_bnb_matmul4bit()
+    if _on("SOUP_SOLUTION_ROPE"):
+        from .rope import patch_qwen2_rope
+
+        patch_qwen2_rope()
+    patch_soup_phases()
+    mark("apply end")
