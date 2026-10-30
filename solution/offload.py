@@ -508,6 +508,33 @@ def _real_cuda_trainer(trainer):
     return param is not None and param.is_cuda
 
 
+# SOUP_SOLUTION_GC_PAUSE: Python's garbage collector during the training (Soup's train, the loop
+# included): "freeze" moves every object made before (the model, the libraries: millions) to the
+# permanent generation, so the collections in the loop only walk what the loop makes; "off" also
+# disables the automatic collections until the training returns; "0" leaves the collector alone.
+# Afterwards the collector is enabled again (if it was) and the frozen objects unfrozen.
+GC_PAUSE = os.environ.get("SOUP_SOLUTION_GC_PAUSE", "0").strip().lower()
+
+
+@contextlib.contextmanager
+def _gc_paused():
+    import gc
+
+    if GC_PAUSE not in ("freeze", "off"):
+        yield
+        return
+    enabled = gc.isenabled()
+    gc.freeze()
+    if GC_PAUSE == "off":
+        gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        gc.unfreeze()
+
+
 def patch_soup_train_offload():
     """SFTTrainerWrapper.train runs inside offload_saved_tensors when its trainer is real and on
     CUDA; anything else (Soup's regression tests with fake trainers, CPU) runs the original."""
@@ -528,7 +555,8 @@ def patch_soup_train_offload():
             # longer used; the training threads make theirs again at their next GEMM
             torch.cuda.synchronize()
             torch._C._cuda_clearCublasWorkspaces()
-        with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader:
+        with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
+                _gc_paused():
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
         return result
