@@ -101,17 +101,29 @@ RESIDUAL_MIN_NUMEL = 256 * 1024  # an armed fp32 residual below this (170 tokens
 # the save_for_backward call; a mark nobody takes (no graph) only means one fp32 tensor at that
 # address may later go to host too, which is still correct
 _RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "0").strip().lower()
-             not in ("0", "false", "no", ""), "marked": set()}
+             not in ("0", "false", "no", ""), "marked": {}}
+# SOUP_SOLUTION_OFFLOAD_ATTN=1 (night task N1c): instead of fused_proj's attention recompute, the
+# attention's saved q, compact k and v, output and log-sum-exp (unpad.py) and the post-attention
+# norm's half branch (rmsnorm.py, split sum) are marked and go to host memory with the rest
+ATTN = os.environ.get("SOUP_SOLUTION_OFFLOAD_ATTN", "0").strip().lower() not in ("0", "false", "no", "")
+MARKED_MIN_BYTES = 64 << 10  # a marked tensor below this stays on the GPU
+
+
+def mark_offload(tensor, keep=False):
+    """An active Offloader takes `tensor` (about to be saved for the backward by a custom Function)
+    to host memory whatever its dtype and size; `keep`: it stays on the GPU after its first unpack
+    (several readers in the backward)."""
+    marked = _RESIDUAL["marked"]
+    if len(marked) > 256:  # marks never taken (no graph): forget them
+        marked.clear()
+    marked[tensor.data_ptr()] = keep
 
 
 def mark_residual(tensor):
-    """An active Offloader takes `tensor` (an fp32 layer input about to be saved for the backward)
-    to host memory like the MLP's activations (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1)."""
+    """mark_offload for an fp32 layer input (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1), kept after its first
+    unpack for its readers in the layer's backward."""
     if _RESIDUAL["on"]:
-        marked = _RESIDUAL["marked"]
-        if len(marked) > 64:  # marks never taken (no graph): forget them
-            marked.clear()
-        marked.add(tensor.data_ptr())
+        mark_offload(tensor, keep=True)
 
 # Slabs pinned ahead of time by prepin(), taken by the stack before it pins one itself; while a
 # prepin thread is still working the stack waits for its next slab instead of pinning one more.
@@ -250,7 +262,7 @@ class Offloader:
         self.stream = torch.cuda.Stream(self.device)
         self.min_numel = _env_int("SOUP_SOLUTION_OFFLOAD_MIN_NUMEL", MIN_NUMEL) \
             if min_numel is None else min_numel
-        layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0)
+        layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0) + (6 if ATTN else 0)
         self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", layer) \
             if max_inflight is None else max_inflight
         self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", layer) \
@@ -266,8 +278,10 @@ class Offloader:
         self.stats = collections.Counter()
 
     def pack(self, tensor):
-        if tensor.dtype == torch.float32:
-            return self._pack_residual(tensor)
+        if _RESIDUAL["marked"]:
+            saved = self._pack_marked(tensor)
+            if saved is not None:
+                return saved
         if (tensor.dtype not in HALF_DTYPES or not self.min_numel <= tensor.numel() <= MAX_NUMEL
                 or not tensor.is_cuda or not tensor.is_contiguous()):
             return tensor
@@ -278,23 +292,25 @@ class Offloader:
         with self.lock:
             return self._offload(tensor)
 
-    def _pack_residual(self, tensor):
-        marked = _RESIDUAL["marked"]
-        if not marked or tensor.data_ptr() not in marked:
-            return tensor
-        marked.discard(tensor.data_ptr())
+    def _pack_marked(self, tensor):
+        """The handle of a marked tensor (mark_offload), the tensor itself when it cannot go, or
+        None when it is not marked (the size rule of the MLP's activations decides)."""
+        keep = _RESIDUAL["marked"].pop(tensor.data_ptr(), None)
+        if keep is None:
+            return None
+        nbytes = tensor.numel() * tensor.element_size()
         if (not tensor.is_cuda or not tensor.is_contiguous()
-                or not RESIDUAL_MIN_NUMEL <= tensor.numel() <= MAX_NUMEL // 2):
+                or not MARKED_MIN_BYTES <= nbytes <= SLAB_BYTES):
             return tensor
         storage = tensor.untyped_storage()
-        if (storage.nbytes() != tensor.numel() * tensor.element_size()
-                or storage.data_ptr() in self.weight_storages or _is_weight(tensor)):
+        if (storage.nbytes() != nbytes or storage.data_ptr() in self.weight_storages
+                or _is_weight(tensor)):
             return tensor
         with self.lock:
             saved = self._offload(tensor)
             if type(saved) is _Saved:
-                saved.keep = True
-                self.stats["residuals"] += 1
+                saved.keep = keep
+                self.stats["residuals" if keep else "marked"] += 1
             return saved
 
     def _offload(self, tensor):
@@ -402,7 +418,7 @@ class Offloader:
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
                 f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
-                f"of them layer inputs {s['residuals']}")
+                f"of them layer inputs {s['residuals']}, other marked {s['marked']}")
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any

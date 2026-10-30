@@ -229,7 +229,13 @@ class _VarlenAttention(torch.autograd.Function):
         out, lse, seed, offset = varlen_forward(q, k, v, cu, max_len, scale)
         ctx.recompute = recompute
         if recompute is None:
-            ctx.save_for_backward(_compact(q), _compact(k), _compact(v), out, lse, cu)
+            kept = (_compact(q), _compact(k), _compact(v), out, lse)
+            from .offload import ATTN, mark_offload
+
+            if ATTN:  # SOUP_SOLUTION_OFFLOAD_ATTN: to host memory instead of recomputed
+                for t in kept:
+                    mark_offload(t)
+            ctx.save_for_backward(*kept, cu)
         else:
             recompute.attention_taken(cu, max_len, scale, q, k, v, out, lse)
             ctx.save_for_backward(cu)
