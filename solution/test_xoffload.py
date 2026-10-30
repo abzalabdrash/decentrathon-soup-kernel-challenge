@@ -102,13 +102,15 @@ def test_attention_tensors_offloaded_instead_of_recomputed(modes, decoder_1p5b, 
 
 def test_mlp_activation_copy_starts_early(modes, decoder_1p5b, residual_switch, monkeypatch):
     """SOUP_SOLUTION_OFFLOAD_EARLY: the copy of the MLP's (gate|up) starts right after the gate|up
-    GEMM and the pack after the forward takes that handle (one copy, not two); outputs and gradients
-    bit for bit the same."""
+    GEMM and the pack after the forward takes that handle (one copy, not two); outputs bit for bit
+    the same, gradients as close as two runs of the same path (the attention backward adds dQ with
+    atomics: ~3e-6 relative from run to run, diag_recompute_test.py)."""
     from solution import offload
 
     layer, rotary = decoder_1p5b
     lengths = [212, 187, 310, 117]
     _set(modes, recompute="all", split=True)
+    monkeypatch.setattr(offload, "EARLY", False)
     _step(layer, rotary, lengths, True, residual_switch)
     ref = _step(layer, rotary, lengths, True, residual_switch)
     monkeypatch.setattr(offload, "EARLY", True)
@@ -117,4 +119,4 @@ def test_mlp_activation_copy_starts_early(modes, decoder_1p5b, residual_switch, 
     assert got["stats"]["offloaded"] == ref["stats"]["offloaded"]
     assert torch.equal(got["out"][0], ref["out"][0]) and torch.equal(got["out"][1], ref["out"][1])
     for a, b in zip(got["grads"], ref["grads"]):
-        assert torch.equal(a, b)
+        assert _rel(a, b) < 1e-4

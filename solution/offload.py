@@ -265,7 +265,9 @@ class Offloader:
         layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0) + (6 if ATTN else 0)
         self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", layer) \
             if max_inflight is None else max_inflight
-        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", layer) \
+        # with EARLY one tensor ahead: the unpack of a layer's (gate|up) brings back its input, the
+        # input's unpack (post-attention norm) the previous layer's (gate|up), never two at once
+        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", 1 if EARLY else layer) \
             if prefetch is None else prefetch
         # storages of the model's parameters and buffers: never offloaded, whatever aliases them
         self.weight_storages = {t.untyped_storage().data_ptr() for t in weights}
@@ -444,7 +446,10 @@ DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().low
 # (drain_inflight, a wait on the GPU): the previous layer's (gate|up), copied while SwiGLU, the down
 # GEMM and the next attention block ran, is given back before this layer allocates its own, instead
 # of both being alive at the MLP (the forward's peak: 2 x 49 MiB at 1,440 tokens)
-EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "0").strip().lower() not in (
+# T4 (soup-night-early, ABBA): peak 539 -> 499 MiB; with the backward's prefetch window of one
+# tensor (the default with EARLY: the previous layer's (gate|up) starts coming back when this layer's
+# MLP backward is done, under its attention backward) 479 MiB; +0.2..0.3 s
+EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "1").strip().lower() not in (
     "0", "false", "no", "")
 
 
