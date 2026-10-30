@@ -97,8 +97,14 @@ def head_chunk_kernel(
     mask = offs < vc
     base = logits_ptr + row.to(tl.int64) * stride_l
     x = tl.load(base + offs, mask=mask, other=-float("inf")).to(tl.float32)
-    c_max = tl.max(x, axis=0)
-    c_idx = tl.min(tl.where(x == c_max, offs, BLOCK), axis=0)  # first occurrence inside the chunk
+    target = tl.load(targets_ptr + row)
+    t_local = target - c0
+    hit = (target != IGNORE) & (t_local >= 0) & (t_local < vc)
+    # the target's logit, read before the reductions below: their barriers order this load before
+    # any warp's in-place store of P (a reduction over the block for it cost 20% of the kernel)
+    x_hit = tl.load(base + tl.where(hit, t_local, 0), mask=hit, other=0.0).to(tl.float32)
+    # one reduction for the max and its first occurrence inside the chunk (torch.argmax's tie rule)
+    c_max, c_idx = tl.max(x, axis=0, return_indices=True, return_indices_tie_break_left=True)
     if FIRST:
         m_old = -float("inf")
         s = 0.0
@@ -120,10 +126,7 @@ def head_chunk_kernel(
     e = e * alpha + tl.sum(p * tl.where(mask, x, 0.0), axis=0)
     best_idx = tl.where(c_max > best, c0 + c_idx, best_idx)  # strictly greater: earlier chunks win ties
     best = tl.maximum(best, c_max)
-    target = tl.load(targets_ptr + row)
-    t_local = target - c0
-    hit = (target != IGNORE) & (t_local >= 0) & (t_local < vc)
-    x_t = tl.where(hit, tl.sum(tl.where(offs == t_local, x, 0.0), axis=0), x_t)
+    x_t = tl.where(hit, x_hit, x_t)
     tl.store(m_ptr + row, m_new)
     tl.store(s_ptr + row, s)
     tl.store(e_ptr + row, e)
