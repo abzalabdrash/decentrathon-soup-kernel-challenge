@@ -313,6 +313,22 @@ def test_step_ops_draw_no_random_numbers():
     assert "step_ops" in warmup.NEEDS_GPU
 
 
+def test_without_helper_the_thread_does_it_all(fresh, monkeypatch):
+    """SOUP_SOLUTION_WARMUP_HELPER=0: no helper process; the thread compiles every registration
+    in this process, as before the helper existed."""
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP_HELPER", "0")
+    _builtin_warmups(fresh, monkeypatch)
+    compiles = fresh.watch_compiles(log=False)
+    _forget_compiled()
+    assert fresh.start_compile_helper(log=False) is None
+    assert fresh.warmup_report()["helper"] is None and fresh._STATE["helper"] is None
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(300)
+    report = fresh.warmup_report()
+    assert not report["errors"], report["errors"]
+    assert report["compiles_in_warmup"] == len(compiles) >= 10
+
+
 def test_cublas_never_goes_to_the_helper(fresh):
     @fresh.register(name="kernel")
     def kernel():

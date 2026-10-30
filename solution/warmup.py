@@ -510,7 +510,15 @@ def start_compile_helper(log=True):
     The helper sees no GPU (CUDA_VISIBLE_DEVICES is empty): it cannot create a CUDA context, which
     would hold GPU memory that nvidia-smi counts. Triton compiles for a target, not a device, so
     the helper gets the target of this process's device (see helper_main). Its output goes to a
-    pipe that the warm-up thread reads; it is killed at exit if still running (see _shutdown)."""
+    pipe that the warm-up thread reads; it is killed at exit if still running (see _shutdown).
+
+    SOUP_SOLUTION_WARMUP_HELPER=0: no helper; the warm-up thread compiles everything in this
+    process, as before the helper existed. Then only triton's own hash starts here, in a thread
+    of its own, so that it runs next to apply()'s imports rather than next to the model load (the
+    hash reads and digests 415 MB; on Kaggle it slowed the load's copies to the GPU)."""
+    if os.environ.get("SOUP_SOLUTION_WARMUP_HELPER", "1") in ("0", "false", "no"):
+        threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
+        return None
     with _LOCK:
         if _STATE["helper"] is not None:
             return None
