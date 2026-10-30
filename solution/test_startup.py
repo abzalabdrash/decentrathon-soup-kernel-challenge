@@ -42,6 +42,8 @@ detection = importlib.import_module("transformers.loss.loss_for_object_detection
 image_utils = importlib.import_module("transformers.image_utils")
 print("detection_answers=" + str(detection.is_scipy_available is _not_installed
                                   and image_utils.is_torchvision_available is _not_installed))
+processors = importlib.import_module("transformers.image_processing_utils")
+print("processors_answer=" + str(processors.is_torchvision_available is _not_installed))
 print("bnb_plain=" + str(type(ops._dequantize_4bit_compute).__name__ == "function"
                          and not hasattr(ops._dequantize_4bit_compute, "_torchdynamo_orig_callable")))
 print("heavy=" + ",".join(m for m in ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx")
@@ -63,6 +65,7 @@ def test_prepare_imports_in_a_fresh_process():
     assert res["sklearn_answer"] == "False"  # what the module saw at its import
     assert res["wandb_answer_kept"] == "True"  # trl's base trainer got the replacement
     assert res["detection_answers"] == "True"  # the loss modules and image_utils kept the answer
+    assert res["processors_answer"] == "True"  # imported under trl's trainer: kept it too
     assert res["heavy"] == ""
 
 

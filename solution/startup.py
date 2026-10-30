@@ -37,7 +37,10 @@ apply(), commits d9f60bb and ba8c1b3; SOUP_SOLUTION_IMPORT_DIET=0 switches all f
   False; the modules imported in that window keep that answer (as without scipy and torchvision:
   the DETR-type losses would refuse to run, and transformers' image helpers would decode images
   with Pillow). Besides those, only accelerate is imported in that window, and it has its own
-  checks.
+  checks. torchvision has a second way in, the image-processing modules (image_processing_utils.py:
+  47-48, image_processing_backends.py:73-74) that trl's SFTTrainer reaches through
+  `ProcessorMixin`: `is_torchvision_available` also answers False while trl's trainer is imported
+  (image processors in this process would take their Pillow backend; the run has none).
 - 0.76 s and more: bitsandbytes wraps four functions of its default (CPU fallback) backend in
   `torch.compile` when imported (bitsandbytes/backends/default/ops.py:12-31, 199, 262, 368, 429:
   the compute of dequantize_blockwise, dequantize_4bit and the 32-bit optimizer update), and
@@ -202,8 +205,11 @@ def prepare_imports(log=True):
             _import("bitsandbytes", seconds)
         with distributions_from_transformers():
             _import("trl", seconds)
-            # transformers' top-level lazy attribute, which trl's base trainer imports by name
-            with _replaced(transformers, "is_wandb_available", _not_installed):
+            # is_wandb_available: transformers' top-level lazy attribute, which trl's base trainer
+            # imports by name; is_torchvision_available: transformers' image-processing modules,
+            # which trl's SFTTrainer reaches through ProcessorMixin
+            with (_replaced(transformers, "is_wandb_available", _not_installed),
+                  _replaced(transformers.utils, "is_torchvision_available", _not_installed)):
                 _import("trl.trainer.sft_trainer", seconds)
     except Exception as exc:  # noqa: BLE001 - the patches import what they need themselves
         if log:
