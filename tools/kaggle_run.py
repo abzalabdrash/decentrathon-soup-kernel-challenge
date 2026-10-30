@@ -33,6 +33,11 @@ Modes:
             runs_var/<label>_<round>; ends with a table per variant: wall, median step, steps 3+,
             step 0, peaks, own-kernel share, check 9. Sessions differ by up to 10% in speed, so
             compare variants within one session. ~1.5 min per run after the ~3 min setup.
+  jury      the jury's protocol on other rows: tools/jury_data.py writes train/eval files from other
+            rows of the dataset (--jury-data, e.g. "--select longest"), then run_task.py --repeats 2
+            --seed <--jury-seed> (base, solution, solution, base), check_rules.py with Soup's tests and
+            score.py; prints every check line in full, each run's numbers and the batch token counts.
+            Pass --jury-data=<args> with "=" (its value starts with "--"). ~15 min.
 """
 
 import argparse
@@ -59,6 +64,7 @@ RUN_CELLS = {
     "diag": ["!cd /kaggle/working/repo && mkdir -p runs_diag && SOUP_SOLUTION_WARMUP=0 python -X importtime -c \"import torch; torch.empty(1, device='cuda'); import transformers; import sys; sys.path.insert(0, '.'); import solution; solution.apply(); import soup_cli.cli\" 2> runs_diag/importtime.log; wc -l runs_diag/importtime.log\n",
              "!cd /kaggle/working/repo && SOUP_SOLUTION_DIAG=1 python harness/run_task.py --only solution --out runs_diag\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    "jury": [],  # tools/jury_data.py, then run_task.py --repeats 2 --seed: built by build_notebook
 }
 CHECK_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
@@ -69,6 +75,8 @@ CHECK_CELLS = {
     "diag": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_diag/result.json --skip-tests\n",
              "!cd /kaggle/working/repo && ls -la runs_diag/solution_1/ && head -c 300 runs_diag/importtime.log\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    "jury": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_jury/result.json\n",
+             "!cd /kaggle/working/repo && python harness/score.py runs_jury/result.json\n"],
 }
 
 
@@ -115,7 +123,8 @@ def parse_variant(text):
     return label, env
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=()):
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=(),
+                   jury=("--train-rows 10000:10256 --eval-rows 50000:50256", 7)):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -133,6 +142,12 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
                     + "".join(f"{k}={v} " for k, v in run_env.items())
                     + f"python harness/run_task.py --only solution --out runs_var/{name}\n"
                     for name, run_env in runs]
+            elif mode == "jury":
+                cell["source"] = [
+                    f"!cd /kaggle/working/repo && python tools/jury_data.py --out runs_jury/data {jury[0]}\n",
+                    f"!cd /kaggle/working/repo && python harness/run_task.py --repeats {max(repeats, 2)} "
+                    f"--seed {jury[1]} --train-file runs_jury/data/train.jsonl "
+                    f"--eval-file runs_jury/data/eval.jsonl --out runs_jury\n"]
             else:
                 cell["source"] = [line.replace("run_task.py", f"run_task.py --repeats {repeats}")
                                   if repeats > 1 else line for line in RUN_CELLS[mode]]
@@ -239,9 +254,60 @@ def summarize_variants(out_dir):
             f"{sum(v) / len(v):9.3f}" if v else f"{'-':>9s}" for v in means.values()))
 
 
+def summarize_jury(out_dir):
+    """Every check line in full, each run's numbers, and what the rows did to the packed path:
+    batch token counts (the longest against the public data's 1,427), the shortest rows."""
+    path = next((p for p in out_dir.rglob("result.json") if "runs_jury" in p.parts), None)
+    if path is None:
+        print("no runs_jury/result.json in the output; see the log")
+        return
+    data_log = path.parent / "data" / "jury_data.log"
+    if data_log.exists():
+        print(data_log.read_text(encoding="utf-8").strip())
+    result = json.loads(path.read_text(encoding="utf-8"))
+    print(f"\n{'run':12s} {'ok':>3s} {'wall':>7s} {'peak':>6s} {'reserv':>7s} {'alloc':>7s} "
+          f"{'median':>7s} {'step0':>6s} {'loss0':>8s} {'own%':>5s}")
+    for side in ("base", "solution"):
+        for run in result.get("runs", {}).get(side, []):
+            m = run.get("metrics", {})
+            steps = m.get("step_s") or []
+            metrics = path.parent / run.get("run", "") / "metrics.json"
+            if not steps and metrics.exists():
+                steps = json.loads(metrics.read_text(encoding="utf-8")).get("step_s") or []
+            own = sum(v for k, v in m.get("own_kernel_ms", {}).items() if not k.startswith("example_"))
+            loop = m.get("timed_loop_s") or 0
+            loss = (run.get("log") or {}).get("loss") or [None]
+            print(f"{run.get('run', '?'):12s} {str(run.get('exit_code') == 0):>3.3s} "
+                  f"{run.get('wall_s')!s:>7s} {run.get('gpu_peak_mib')!s:>6s} "
+                  f"{m.get('torch_max_reserved_mib')!s:>7s} {m.get('torch_max_allocated_mib')!s:>7s} "
+                  f"{m.get('median_step_s')!s:>7s} {steps[0] if steps else '-'!s:>6s} {loss[0]!s:>8.6s} "
+                  f"{100 * own / (1000 * loop) if loop else 0:5.1f}")
+    print(f"evals: {json.dumps(result.get('evals'))[:300]}")
+    print(f"summary: {json.dumps(result.get('summary', {}).get('ratios'))}")
+    base = (result.get("runs", {}).get("base") or [{}])[0]
+    rewind = base.get("rewind") or []
+    if rewind:
+        batches = [sum(b[1] or []) for b in rewind]
+        rows = [t for b in rewind for t in (b[1] or [])]
+        print(f"rewind ({base.get('run')}): {len(batches)} batches; tokens per batch max {max(batches)} "
+              f"(public data: 1,427), {sum(t > 1427 for t in batches)} batches above 1,427, "
+              f"{sum(t % 16 != 0 for t in batches)} not a multiple of 16; tokens per row min {min(rows)}, "
+              f"max {max(rows)}, {sum(t <= 2 for t in rows)} rows of 1-2 tokens")
+    checks_path = path.parent / "checks.json"
+    if checks_path.exists():
+        checks = json.loads(checks_path.read_text(encoding="utf-8"))
+        for c in checks.get("checks", []):
+            print(f"{'PASS' if c['ok'] else 'FAIL'}  {c['check']}  {c['detail']}")
+        for note in checks.get("notes", []):
+            print(f"NOTE  {note}")
+
+
 def summarize(out_dir, mode):
     if mode == "variants":
         summarize_variants(out_dir)
+        return
+    if mode == "jury":
+        summarize_jury(out_dir)
         return
     sub = {"solution": "runs_try", "diag": "runs_diag"}.get(mode, "runs")
     result = None
@@ -325,6 +391,9 @@ def main():
     parser.add_argument("--timeout", type=int, default=5400, help="max run time in seconds")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                         help="environment variable for the measured runs (repeatable), e.g. SOUP_SOLUTION_UNPAD=0")
+    parser.add_argument("--jury-data", default="--train-rows 10000:10256 --eval-rows 50000:50256",
+                        help="--mode jury: arguments of tools/jury_data.py (which rows train and eval)")
+    parser.add_argument("--jury-seed", type=int, default=7, help="--mode jury: run_task.py --seed")
     parser.add_argument("--variant", action="append", default=[], metavar="LABEL:K=V,K=V",
                         help="--mode variants: one solution-only run per variant and round (repeatable)")
     parser.add_argument("--repeats", type=int, default=1,
@@ -373,7 +442,8 @@ def main():
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
         json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
-                                  [tuple(e.split("=", 1)) for e in args.env], variants),
+                                  [tuple(e.split("=", 1)) for e in args.env], variants,
+                                  (args.jury_data, args.jury_seed)),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
