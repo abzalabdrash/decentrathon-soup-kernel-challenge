@@ -27,12 +27,15 @@ def fresh(monkeypatch):
 
     monkeypatch.setattr(warmup, "BUILTIN", list(warmup.WARMUPS), raising=False)
     monkeypatch.setattr(warmup, "WARMUPS", [])
+    monkeypatch.setattr(warmup, "NEEDS_GPU", set(warmup.NEEDS_GPU))
     monkeypatch.setattr(warmup, "COMPILES", [])
     monkeypatch.setattr(warmup, "_STATE", warmup._new_state())
     monkeypatch.setattr(warmup, "_DONE", threading.Event())
+    monkeypatch.setattr(warmup, "_STOP", threading.Event())
     monkeypatch.setattr(warmup, "_HOOKS", {"installed": False})
     monkeypatch.setattr(knobs.runtime, "jit_cache_hook", None)
     monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", None)
+    monkeypatch.setattr(knobs.compilation, "listener", None)
     return warmup
 
 
@@ -159,7 +162,9 @@ def test_training_launches_compile_nothing_after_warmup(fresh, monkeypatch):
 
 def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
     """apply() and the training step of one decoder layer with the run's shapes, 4-bit weights and
-    LoRA (bench_warmup.one_layer_model): every kernel the step compiles, the warm-up has compiled."""
+    LoRA (bench_warmup.one_layer_model): every kernel the step compiles, the warm-up has compiled.
+    apply() runs with its own warm-up off (it would start the thread once for the process, before
+    the kernels are forgotten below); the test starts it."""
     import solution
     from solution.bench_warmup import STEP_LENGTHS, model_step, one_layer_model
 
@@ -167,6 +172,7 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
     for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE",
                    "SOUP_SOLUTION_UNPAD", "SOUP_SOLUTION_MLP16"):
         monkeypatch.delenv(switch, raising=False)
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP", "0")
     solution.apply()
     model = one_layer_model()
     compiles = fresh.watch_compiles(log=False)
@@ -190,6 +196,68 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
     for lengths in STEP_LENGTHS:
         model_step(model, lengths)
     assert compiles == []
+
+
+def test_helper_process_compiles_for_this_one(tmp_path):
+    """bench_warmup.py helper in a fresh process with an empty triton cache: the helper (no GPU,
+    no CUDA context) compiles, and every kernel the in-process warm-up then meets is read from the
+    on-disk cache, launcher and cuda_utils modules included (no C build in the training process)."""
+    from solution.bench_warmup import _child
+
+    res = _child(["child-helper"], str(tmp_path))
+    assert res["helper_started"] == "True"
+    assert res["helper_errors"] == "-" and res["errors"] == "-", res
+    assert res["helper_cuda"] == "False"  # CUDA_VISIBLE_DEVICES is empty there
+    assert int(res["helper_results"]) >= 7
+    assert int(res["misses"]) >= 7 and res["cache_hits"] == res["misses"], res
+    assert res["built"] == "-", res
+
+
+@pytest.mark.parametrize("mode", ["helper", "thread"])
+def test_exit_while_compiling_is_clean(tmp_path, mode):
+    """A process that ends right after starting the warm-up (Soup's tests end 0.6 s after apply())
+    exits with 0: the helper is killed and the exit waits for the thread's current registration,
+    instead of tearing the compiler down under it (exit code 134 before warmup._shutdown)."""
+    from solution.bench_warmup import _child_env
+
+    for _ in range(3):
+        out = subprocess.run([sys.executable, "-m", "solution.bench_warmup", "child-exit", mode],
+                             cwd=REPO, env=_child_env(str(tmp_path)), capture_output=True,
+                             text=True, timeout=300)
+        assert out.returncode == 0, out.stderr[-3000:]
+        assert "done_at_exit=False" in out.stdout  # it did exit in the middle of the warm-up
+
+
+def test_cublas_never_goes_to_the_helper(fresh):
+    @fresh.register(name="kernel")
+    def kernel():
+        pass
+
+    @fresh.register(name="gpu-work", gpu=True)
+    def gpu_work():
+        pass
+
+    for name, fn in fresh.BUILTIN:
+        fresh.register(fn, name=name)
+    assert "gpu-work" in fresh.NEEDS_GPU and "cublas" in fresh.NEEDS_GPU
+    assert "kernel" not in fresh.NEEDS_GPU and "nf4_dequant_kernel" not in fresh.NEEDS_GPU
+
+
+def test_helper_failure_falls_back_to_compiling_here(fresh, monkeypatch):
+    """A helper that dies leaves the warm-up to this process: every registration still runs."""
+    seen = []
+
+    @fresh.register(name="a")
+    def a():
+        seen.append("a")
+
+    monkeypatch.setattr(fresh, "__name__", "solution_no_such_module_xyz")
+    assert fresh.start_compile_helper(log=False) is not None
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(120)
+    report = fresh.warmup_report()
+    assert seen == ["a"] and "a" in report["results"]
+    assert "(helper)" in report["errors"] and report["helper"] is None
 
 
 def test_switched_off_patches_warm_nothing(fresh, monkeypatch):

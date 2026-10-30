@@ -20,7 +20,10 @@ Modules:
 - fused_proj.py: q+k+v in one GEMM with LoRA by addmm, attention in half, gate+up in one GEMM;
 - offload.py: the MLP's saved gate/up to pinned host memory (or recomputed) during the backward;
 - weight_stream.py: the layers' 4-bit weights in pinned host memory, a ring of K layers on the GPU;
-- warmup.py: the kernels compiled by a background thread while Soup loads the model;
+- warmup.py: the kernels compiled by a helper process during apply(), loaded by a background
+  thread while Soup loads the model;
+- startup.py: apply()'s imports without work the run does not use (trl's second metadata scan,
+  scikit-learn, wandb); a first-step phase mark; a profile of the trainer build (diagnostics);
 - phases.py: wall-clock marks of the run's phases in the log;
 - diag.py: diagnostics of a run (SOUP_SOLUTION_DIAG=1 only): memory at the marks, a PCIe probe,
   an allocation snapshot of one step, a chrome trace of two steps.
@@ -28,7 +31,8 @@ Modules:
 Switches (environment, for experiments): SOUP_SOLUTION_CE_CHUNK (rows of logits per chunk, default
 512), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0, SOUP_SOLUTION_RMSNORM=0,
 SOUP_SOLUTION_NF4=0, SOUP_SOLUTION_ROPE=0, SOUP_SOLUTION_FUSED_PROJ=0, SOUP_SOLUTION_MLP_MEMORY=
-offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0.
+offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0,
+SOUP_SOLUTION_IMPORT_DIET=0; diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
 import os
@@ -42,6 +46,14 @@ def apply():
     from .phases import mark, patch_soup_phases
 
     mark("apply begin")
+    if _on("SOUP_SOLUTION_WARMUP"):
+        from .warmup import start_compile_helper
+
+        start_compile_helper()  # Triton compiles in a helper process while apply() imports
+    if _on("SOUP_SOLUTION_IMPORT_DIET"):
+        from .startup import prepare_imports
+
+        prepare_imports()  # trl without a second metadata scan, without sklearn and wandb
     from .embed16 import patch_soup_setup
     from .fused_ce import patch_qwen2_causal_lm
     from .mlp16 import patch_qwen2_mlp_half
@@ -99,8 +111,9 @@ def apply():
 
         patch_soup_diag()  # off by default: memory marks, PCIe probe, one step's allocation history, a trace
     if _on("SOUP_SOLUTION_WARMUP"):
-        from .warmup import patch_soup_warmup, start_background_warmup
+        from .warmup import patch_soup_warmup, start_background_warmup, watch_compiles
 
+        watch_compiles()  # logs any kernel compiled or loaded outside the warm-up
         patch_soup_warmup(start_in_setup=False)
-        start_background_warmup()
+        start_background_warmup()  # waits for the helper, then loads its kernels from the cache
     mark("apply end")

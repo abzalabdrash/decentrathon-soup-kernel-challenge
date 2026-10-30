@@ -85,13 +85,19 @@ trl and datasets imported next to the model load end at 3.38 s, imported first t
 2.69 s. The log line "waited N s for the warmup" at `train` begin shows whether the warm-up fits.
 """
 
+import atexit
 import importlib
+import json
 import os
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
+HELPER_TIMEOUT = 120.0  # seconds the warm-up thread waits for the helper process before compiling itself
+EXIT_TIMEOUT = 60.0  # seconds the interpreter's exit waits for the warm-up thread (see _shutdown)
 # threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
 # 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
@@ -102,27 +108,37 @@ INTERMEDIATE = 8960  # Qwen2.5-1.5B's MLP width: 16 * 560
 TOKENS = 826  # a typical packed batch; only its class matters (tokens * 8960 is always "D")
 
 WARMUPS = []  # [(name, fn)]: run in this order by the background thread
+NEEDS_GPU = set()  # names of registrations that launch on the GPU: never run in the helper process
 COMPILES = []  # every compile seen by `watch_compiles`, as dicts (see there)
 
 _LOCK = threading.Lock()
+# set in the helper process only (see helper_main): the half dtype of the training process, and
+# that compile_kernel has no GPU to load the cubin on
+_HELPER = {"half": None, "offline": False}
 
 
 def _new_state():
     return {"thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
-            "errors": {}}
+            "errors": {}, "helper": None}
 
 
 _STATE = _new_state()
 _DONE = threading.Event()
+_STOP = threading.Event()  # set at exit: the warm-up takes no new registration (see _shutdown)
+_EXIT = {"registered": False}
 _HOOKS = {"installed": False}
 
 
-def register(fn=None, *, name=None):
+def register(fn=None, *, name=None, gpu=False):
     """Adds `fn` (no arguments) to WARMUPS; usable as `@register` or `@register(name=...)`. A second
-    registration under the same name replaces the first (a reloaded module)."""
+    registration under the same name replaces the first (a reloaded module). `gpu=True` marks a
+    warm-up that launches work on the GPU (it runs only in the training process, never in the
+    helper)."""
 
     def add(f):
         key = name or f"{f.__module__}.{f.__qualname__}"
+        if gpu:
+            NEEDS_GPU.add(key)
         for i, (existing, _) in enumerate(WARMUPS):
             if existing == key:
                 WARMUPS[i] = (key, f)
@@ -136,9 +152,11 @@ def register(fn=None, *, name=None):
 def training_half_dtype():
     """The half dtype the run computes in: Soup's `bf16_fp16_flags` gives bf16 where the card has it
     and fp16 elsewhere (soup_cli/trainer/sft.py:1511-1512, soup_cli/utils/gpu.py:564), so fp16 on
-    the T4."""
+    the T4. In the helper process (no GPU), the training process's answer."""
     import torch
 
+    if _HELPER["half"] is not None:
+        return _HELPER["half"]
     try:
         bf16 = torch.cuda.is_bf16_supported(including_emulation=False)
     except TypeError:  # an older torch without the keyword
@@ -150,10 +168,21 @@ def compile_kernel(kernel, *args, **kwargs):
     """Compiles `kernel` (a @triton.jit function) for these arguments without launching it, then
     builds its launcher and loads the cubin on the current device. Pass a torch dtype for each
     tensor, and the ints, floats, constexprs and num_warps / num_stages as the training launch
-    passes them (or values of the same class). Returns triton's CompiledKernel."""
+    passes them (or values of the same class). Returns triton's CompiledKernel.
+
+    In the helper process there is no GPU: the launcher is built (and cached on disk) but no cubin
+    is loaded."""
     compiled = kernel.warmup(*args, grid=(1,), **kwargs)
     if compiled is not None and hasattr(compiled, "result"):  # triton's async compile mode
         compiled = compiled.result()
+    if _HELPER["offline"]:
+        if compiled is not None:
+            from triton.runtime.driver import driver
+
+            # what _init_handles does first (triton/compiler/compiler.py:452): the launcher's C
+            # build, cached under the hash of its source (triton/runtime/build.py:compile_module_from_src)
+            driver.active.launcher_cls(compiled.src, compiled.metadata)
+        return compiled
     init = getattr(compiled, "_init_handles", None)
     if callable(init):
         init()
@@ -178,7 +207,7 @@ def _switched_on(name):
     return _on(name)
 
 
-@register(name="cublas")
+@register(name="cublas", gpu=True)
 def warm_cublas():
     # not Triton: the first half matmul of the process loads and sets up cuBLAS / cuBLASLt
     # (0.27 s on the RTX 3050 Ti, then 0.012 s for the main thread's first matmul: the library
@@ -317,14 +346,9 @@ def warm_rmsnorm_bwd():
                        num_warps=BWD_WARPS)
 
 
-def _prepare_triton():
-    """What the first compile of the process does once, done before the workers start so that they
-    do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
-    the C compiler, triton/backends/nvidia/driver.py:61-64) and the hash of triton's own files
-    (`triton_key`, triton/runtime/cache.py:272)."""
-    from triton.runtime.driver import driver
-
-    driver.active.get_current_device()
+def _triton_key():
+    """The hash of triton's own files (`triton_key`, triton/runtime/cache.py:272-298), part of every
+    on-disk cache key: computed once per process, mostly outside the GIL (file reads, sha256)."""
     try:
         from triton.runtime.cache import triton_key
 
@@ -333,74 +357,257 @@ def _prepare_triton():
         pass
 
 
-def _run(jobs, device, log):
-    begin = time.perf_counter()
-    # The compile drops and retakes the GIL many times; while the main thread runs Python, every
-    # retake waits for the switch interval (5 ms by default). RTX 3050 Ti, one worker, medians of 3
-    # (bench_warmup.py gil, before rmsnorm / nf4 / rope): 3.1 s with the main thread waiting; with
-    # it spinning a Python counter, 15.3 s at 5 ms (counter at 100% of its rate alone), 5.5 s at
-    # 1 ms (89%), 4.0 s at 0.2 ms (79%). 1 ms keeps the warm-up short and costs the main thread at
-    # most about 11% while it runs.
-    previous = sys.getswitchinterval()
-    sys.setswitchinterval(min(previous, SWITCH_INTERVAL))
-    ours = sys.getswitchinterval()  # read back: CPython stores it in microseconds
-    pending = list(jobs)
+def _prepare_triton():
+    """What the first compile of the process does once, done before the workers start so that they
+    do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
+    the C compiler, triton/backends/nvidia/driver.py:61-64, or loaded from the on-disk cache) and
+    `triton_key`."""
+    from triton.runtime.driver import driver
+
+    driver.active.get_current_device()
+    _triton_key()
+
+
+def _run_jobs(pending, workers, on_start=None, stop=None):
+    """Runs the registrations in `pending` ([(name, fn)]) on `workers` threads (the caller's one
+    included) and returns ({name: seconds or SKIPPED}, {name: error}). One registration per kernel,
+    so two workers never fill the same kernel's cache. Once `stop` is set, no worker takes another
+    registration."""
+    pending = list(pending)
+    results, errors = {}, {}
     take = threading.Lock()
 
     def worker():
-        # about two thirds of a registration is the launcher's C build and the cubin load, outside
-        # the GIL: several workers overlap them. Triton compiles from several threads by design
-        # (its AsyncCompileMode takes any Executor, triton/runtime/_async_compile.py). One
-        # registration per kernel, so that two workers never fill the same kernel's cache.
-        import torch
-
-        _STATE["idents"].add(threading.get_ident())
-        torch.cuda.set_device(device)
+        if on_start is not None:
+            on_start()
         while True:
             with take:
-                if not pending:
+                if not pending or (stop is not None and stop.is_set()):
                     return
                 name, fn = pending.pop(0)
             start = time.perf_counter()
             try:
-                # a registration that does launch something stays off the main thread's stream
-                with torch.cuda.stream(stream):
-                    skipped = fn() == SKIPPED
-                _STATE["results"][name] = (SKIPPED if skipped
-                                           else round(time.perf_counter() - start, 3))
+                skipped = fn() == SKIPPED
+                results[name] = SKIPPED if skipped else round(time.perf_counter() - start, 3)
             except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
-                _STATE["errors"][name] = repr(exc)
-                if log:
-                    print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
+                errors[name] = repr(exc)
 
+    helpers = [threading.Thread(target=worker, name=f"solution-warmup-{i}", daemon=True)
+               for i in range(1, min(workers, len(pending)))]
+    for helper in helpers:
+        helper.start()
+    worker()
+    for helper in helpers:
+        helper.join()
+    return results, errors
+
+
+def _shutdown():
+    """At the interpreter's exit: the warm-up takes no new registration, the helper is killed, and
+    the exit waits for the thread to finish the registration it is in (at most EXIT_TIMEOUT s).
+    Without it, a process that ends soon after apply() (Soup's tests end 0.6 s after it) could
+    finalize while the thread compiles, and the compiler's C++ thread pool, destroyed under it,
+    aborts the process ("terminate called without an active exception", exit code 134; T13 saw it
+    in 3 of 6 runs of the tests). In a training run the warm-up is long done at exit: nothing to
+    wait for."""
+    _STOP.set()
+    helper = _STATE["helper"]
+    if helper is not None and helper["proc"].poll() is None:
+        helper["proc"].kill()
+    thread = _STATE["thread"]
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(EXIT_TIMEOUT)
+
+
+def _register_shutdown():
+    if not _EXIT["registered"]:
+        _EXIT["registered"] = True
+        atexit.register(_shutdown)
+
+
+# ---------------------------------------------------------------- the helper process
+
+def start_compile_helper(log=True):
+    """Starts the helper process that compiles every registration not marked `gpu` (those
+    registered so far: the ones in this file) into triton's on-disk cache, and returns it (None
+    without CUDA, or when it is already started). The warm-up thread waits for it, then runs every
+    registration in this process, where the kernels the helper compiled are loaded from the cache.
+
+    The helper sees no GPU (CUDA_VISIBLE_DEVICES is empty): it cannot create a CUDA context, which
+    would hold GPU memory that nvidia-smi counts. Triton compiles for a target, not a device, so
+    the helper gets the target of this process's device (see helper_main). Its output goes to a
+    pipe that the warm-up thread reads; it is killed at exit if still running (see _shutdown)."""
+    with _LOCK:
+        if _STATE["helper"] is not None:
+            return None
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return None
+            major, minor = torch.cuda.get_device_capability()
+            half = str(training_half_dtype()).replace("torch.", "")
+            names = [name for name, _ in WARMUPS if name not in NEEDS_GPU]
+            package_root = str(Path(__file__).resolve().parents[1])
+            env = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+                       PYTHONPATH=os.pathsep.join(
+                           p for p in (package_root, os.environ.get("PYTHONPATH")) if p))
+            proc = subprocess.Popen(
+                [sys.executable, "-m", __name__, "--helper", str(major * 10 + minor), half, *names],
+                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True)
+        except Exception as exc:  # noqa: BLE001 - the in-process warm-up compiles everything then
+            _STATE["errors"]["(helper start)"] = repr(exc)
+            if log:
+                print(f"[solution] warmup helper not started: {exc!r}", flush=True)
+            return None
+        _STATE["helper"] = {"proc": proc, "begin": time.perf_counter(), "names": names,
+                            "report": None}
+        _register_shutdown()
+        return proc
+
+
+def _wait_for_helper(log):
+    """Waits for the helper (at most HELPER_TIMEOUT s) and returns its report, or None."""
+    helper = _STATE["helper"]
+    if helper is None:
+        return None
+    proc = helper["proc"]
+    try:
+        out, err = proc.communicate(timeout=HELPER_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - a hung helper: kill it, compile here
+        proc.kill()
+        proc.communicate()
+        _STATE["errors"]["(helper)"] = repr(exc)
+        if log:
+            print(f"[solution] warmup helper stopped: {exc!r}", flush=True)
+        return None
+    report = None
+    for line in reversed((out or "").splitlines()):
+        if line.startswith("{"):
+            try:
+                report = json.loads(line)
+            except ValueError:
+                pass
+            break
+    if report is None or proc.returncode != 0:
+        _STATE["errors"]["(helper)"] = f"exit {proc.returncode}: {(err or '').strip()[-500:]}"
+        if log and not _STOP.is_set():
+            print(f"[solution] warmup helper failed (exit {proc.returncode}): "
+                  f"{(err or '').strip()[-500:]}", flush=True)
+        return None
+    report["wall"] = round(time.perf_counter() - helper["begin"], 3)
+    helper["report"] = report
+    if log:
+        done = ", ".join(f"{name} {s}" if s == SKIPPED else f"{name} {s:.2f} s"
+                         for name, s in report["results"].items())
+        print(f"[solution] warmup helper (pid {proc.pid}, no GPU) done {report['wall']:.2f} s "
+              f"after its start: imports {report['import_s']:.2f} s, compiles "
+              f"{report['compile_s']:.2f} s: {done or 'nothing'}"
+              + (f"; failed: {', '.join(report['errors'])}" if report["errors"] else ""),
+              flush=True)
+    return report
+
+
+def _offline_driver(arch):
+    """Triton's CUDA driver answering for a device this process does not open: device 0, stream 0
+    and the training device's compute capability. Compiling needs nothing else from the device:
+    the cache key and the code are those of the target (JITFunction.create_binder,
+    triton/runtime/jit.py:658-669; CudaDriver.get_current_target, nvidia/driver.py:724-729)."""
+    from triton.backends.nvidia.driver import CudaDriver
+    from triton.runtime.driver import driver
+
+    offline = CudaDriver()  # builds or loads cuda_utils; touches no device
+    offline.get_current_device = lambda: 0
+    offline.get_current_stream = lambda device=None: 0
+    offline.get_device_capability = lambda device=None: divmod(arch, 10)
+    driver.set_active(offline)
+    return offline
+
+
+def helper_main(argv):
+    """The helper process: `python -m solution.warmup --helper <arch> <half dtype> <names...>`.
+    Prints one JSON line: seconds and errors per registration."""
+    begin = time.perf_counter()
+    arch, half, names = int(argv[1]), argv[2], set(argv[3:])
+    import torch
+
+    _HELPER["half"] = getattr(torch, half)
+    _HELPER["offline"] = True
+    _offline_driver(arch)
+    _triton_key()
+    import_s = time.perf_counter() - begin
+    jobs = [(name, fn) for name, fn in WARMUPS if name in names and name not in NEEDS_GPU]
+    results, errors = _run_jobs(jobs, WORKERS)
+    print(json.dumps({"import_s": round(import_s, 3),
+                      "compile_s": round(time.perf_counter() - begin - import_s, 3),
+                      "results": results, "errors": errors,
+                      "cuda_initialized": torch.cuda.is_initialized()}), flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------- the warm-up thread
+
+def _run(jobs, device, log):
+    begin = time.perf_counter()
+    previous = ours = None
     try:
         import torch
 
         _STATE["idents"].add(threading.get_ident())
         torch.cuda.set_device(device)
         stream = torch.cuda.Stream(device)
+        # while the helper compiles: triton's own hash (mostly outside the GIL), then the wait
+        _triton_key()
+        helper = _wait_for_helper(log)
+        if _STOP.is_set():  # the process is exiting (see _shutdown)
+            return
+        # The rest takes the GIL often (the compiles the helper did not do, and for the others the
+        # cache reads, the launcher import and the cubin load); while the main thread runs Python,
+        # every retake waits for the switch interval (5 ms by default). RTX 3050 Ti, one worker,
+        # compiling, medians of 3 (bench_warmup.py gil, before rmsnorm / nf4 / rope): 3.1 s with
+        # the main thread waiting; with it spinning a Python counter, 15.3 s at 5 ms (counter at
+        # 100% of its rate alone), 5.5 s at 1 ms (89%), 4.0 s at 0.2 ms (79%). 1 ms keeps the
+        # warm-up short and costs the main thread at most about 11% while it runs.
+        previous = sys.getswitchinterval()
+        sys.setswitchinterval(min(previous, SWITCH_INTERVAL))
+        ours = sys.getswitchinterval()  # read back: CPython stores it in microseconds
         _prepare_triton()
-        helpers = [threading.Thread(target=worker, name=f"solution-warmup-{i}", daemon=True)
-                   for i in range(1, min(WORKERS, len(pending)))]
-        for helper in helpers:
-            helper.start()
-        worker()
-        for helper in helpers:
-            helper.join()
+
+        def on_start():
+            # several workers overlap the parts outside the GIL (a compile's ptxas and C compiler
+            # runs, the cubin loads); triton compiles from several threads by design (its
+            # AsyncCompileMode takes any Executor, triton/runtime/_async_compile.py)
+            _STATE["idents"].add(threading.get_ident())
+            torch.cuda.set_device(device)
+            torch.cuda.set_stream(stream)  # a registration that launches stays off the main stream
+
+        # with the helper's kernels in the cache, loading them needs no extra workers
+        results, errors = _run_jobs(jobs, 1 if helper is not None else WORKERS, on_start, _STOP)
+        _STATE["results"].update(results)
+        _STATE["errors"].update(errors)
+        if log:
+            for name, error in errors.items():
+                print(f"[solution] warmup {name} failed: {error}", flush=True)
         stream.synchronize()
     except Exception as exc:  # noqa: BLE001
         _STATE["errors"]["(thread)"] = repr(exc)
         if log:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
-        if sys.getswitchinterval() == ours:  # unless someone changed it meanwhile
+        if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
             sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
         _DONE.set()
-        if log:
+        if log and not _STOP.is_set():
             done = ", ".join(f"{name} {s}" if s == SKIPPED else f"{name} {s:.2f} s"
                              for name, s in _STATE["results"].items())
-            print(f"[solution] warmup done in {_STATE['seconds']:.2f} s: {done or 'nothing'}"
+            compiled = [c for c in COMPILES if c["thread"] in _STATE["idents"]]
+            loaded = sum(1 for c in compiled if c.get("cache_hit"))
+            print(f"[solution] warmup done in {_STATE['seconds']:.2f} s"
+                  + (f" ({loaded} kernels loaded from the on-disk cache, {len(compiled) - loaded} "
+                     f"compiled here)" if _HOOKS["installed"] else "")
+                  + f": {done or 'nothing'}"
                   + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else ""),
                   flush=True)
 
@@ -428,6 +635,7 @@ def start_background_warmup(log=True):
         thread = threading.Thread(target=_run, args=(list(WARMUPS), device, log),
                                   name="solution-warmup", daemon=True)
         _STATE["thread"] = thread
+        _register_shutdown()
         thread.start()
         return thread
 
@@ -452,6 +660,7 @@ def warmup_report():
         "errors": dict(_STATE["errors"]),
         "compiles_in_warmup": sum(1 for c in COMPILES if c["thread"] in idents),
         "compiles_outside": [c for c in COMPILES if c["thread"] not in idents],
+        "helper": (_STATE["helper"] or {}).get("report"),
     }
 
 
@@ -472,10 +681,13 @@ def watch_compiles(log=True):
     """Records every Triton compile in COMPILES through triton's JIT hooks
     (`knobs.runtime.jit_cache_hook` before and `jit_post_compile_hook` after, triton/knobs.py:474-477;
     `JITFunction._do_compile` calls them only on an in-memory cache miss, jit.py:826-851, so a
-    cached launch costs nothing extra). Each record: kernel, thread id, seconds (the compile to
-    cubin; the launcher build comes on the first launch), the key's specialization, num_warps,
-    num_stages. With `log`, a compile outside the warm-up thread is printed: after a complete
-    warm-up the training steps should print none. Hooks already set are kept and called first."""
+    cached launch costs nothing extra) and its compilation listener (`knobs.compilation.listener`,
+    called by `triton.compile` with `cache_hit`, compiler.py:268-276, 359-361: whether the miss was
+    served by the on-disk cache, as for the kernels the helper process compiled). Each record:
+    kernel, thread id, seconds (the compile to cubin or the cache read; the launcher comes on the
+    first launch), cache_hit, the key's specialization, num_warps, num_stages. With `log`, a miss
+    outside the warm-up threads is printed: after a complete warm-up the training steps should
+    print none. Hooks already set are kept and called first."""
     from triton import knobs
 
     with _LOCK:
@@ -483,10 +695,12 @@ def watch_compiles(log=True):
             return COMPILES
         before_prev = knobs.runtime.jit_cache_hook
         after_prev = knobs.runtime.jit_post_compile_hook
+        listener_prev = knobs.compilation.listener
         local = threading.local()
 
         def before(**kwargs):
             local.start = time.perf_counter()
+            local.cache_hit = None
             # a true return skips the compile (jit.py:829): only the previous hook may decide that
             return before_prev(**kwargs) if before_prev is not None else None
 
@@ -503,18 +717,26 @@ def watch_compiles(log=True):
                     "num_warps": info.get("num_warps"),
                     "num_stages": info.get("num_stages"),
                     "is_warmup": bool(kwargs.get("is_manual_warmup")),
+                    "cache_hit": getattr(local, "cache_hit", None),
                 }
                 COMPILES.append(record)
                 if log and record["thread"] not in _STATE["idents"]:
-                    print(f"[solution] triton compile outside warmup: {record['kernel']} "
+                    what = ("kernel loaded from the on-disk cache" if record["cache_hit"]
+                            else "compile")
+                    print(f"[solution] triton {what} outside warmup: {record['kernel']} "
                           f"{record['seconds']:.2f} s ({record['spec']}; num_warps="
                           f"{record['num_warps']})", flush=True)
             except Exception:  # noqa: BLE001 - diagnostics only
                 pass
             return after_prev(**kwargs) if after_prev is not None else None
 
+        def listener(**kwargs):
+            local.cache_hit = bool(kwargs.get("cache_hit"))
+            return listener_prev(**kwargs) if listener_prev is not None else None
+
         knobs.runtime.jit_cache_hook = before
         knobs.runtime.jit_post_compile_hook = after
+        knobs.compilation.listener = listener
         _HOOKS["installed"] = True
     return COMPILES
 
@@ -581,3 +803,12 @@ def patch_soup_warmup(start_in_setup=False):
     cls._setup_transformers = _setup_transformers
     cls.train = train
     cls._soup_warmup = True
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] != ["--helper"]:
+        sys.exit("usage: python -m solution.warmup --helper <arch> <half dtype> <warm-up names...>")
+    # the importable module, not this __main__ copy: its registry is the one the warm-ups fill
+    from solution.warmup import helper_main
+
+    sys.exit(helper_main(sys.argv[1:]))

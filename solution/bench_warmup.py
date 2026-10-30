@@ -9,6 +9,8 @@
     python -m solution.bench_warmup apply       # warm-up started before / after apply()
     python -m solution.bench_warmup load        # the real model load next to the warm-up / imports
     python -m solution.bench_warmup workers     # the warm-up with 1 to 4 worker threads
+    python -m solution.bench_warmup helper      # compiled in the helper process, loaded here
+    python -m solution.bench_warmup child-exit helper|thread  # exit right after starting the warm-up
     python -m solution.bench_warmup all
 
 Kernels are compiled for fp16, the T4's dtype, on any card.
@@ -365,6 +367,41 @@ MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 LOAD_IMPORTS = ("trl", "datasets")  # what Soup imports later and loading the model does not need
 
 
+def child_helper():
+    """The helper process compiles, this process loads: every kernel the in-process warm-up meets
+    must come from the on-disk cache, and no C module (launcher, cuda_utils) is built here."""
+    import triton.runtime.build as build
+
+    _prelude()
+    warmup = _setup_warmup()
+    built = []
+    original = build._build
+
+    def counting(name, *args, **kwargs):
+        built.append(name)
+        return original(name, *args, **kwargs)
+
+    build._build = counting
+    compiles = warmup.watch_compiles(log=False)
+    start = time.perf_counter()
+    proc = warmup.start_compile_helper(log=False)
+    warmup.start_background_warmup(log=False)
+    assert warmup.wait_for_warmup(600)
+    report = warmup.warmup_report()
+    helper = report["helper"] or {}
+    values = {
+        "helper_started": proc is not None, "helper_wall": helper.get("wall"),
+        "helper_import": helper.get("import_s"), "helper_compile": helper.get("compile_s"),
+        "helper_cuda": helper.get("cuda_initialized"),
+        "helper_errors": ",".join(helper.get("errors", {})) or "-",
+        "helper_results": len(helper.get("results", {})), "thread_s": report["seconds"],
+        "wall": round(time.perf_counter() - start, 3), "misses": len(compiles),
+        "cache_hits": sum(1 for c in compiles if c["cache_hit"]),
+        "built": ",".join(built) or "-", "errors": ",".join(report["errors"]) or "-",
+    }
+    print("\n".join(f"{key}={value}" for key, value in values.items()))
+
+
 def _load_model():
     """The model as Soup's `_setup_transformers` builds it: 4-bit NF4 with double quant and fp16
     compute, `prepare_model_for_kbit_training`, LoRA r=16 on q_proj / v_proj."""
@@ -553,18 +590,41 @@ def report_workers(cache_root, repeats=2):
               f"{statistics.median(spin):.2f} (rate {statistics.median(rate):.2f})")
 
 
+def child_exit(mode):
+    """Starts the warm-up as apply() does (`helper`: the helper process and the thread; `thread`:
+    the thread alone, which then compiles here) and returns at once: the process must exit with 0
+    while the warm-up is still compiling (see warmup._shutdown)."""
+    _prelude()
+    warmup = _setup_warmup()
+    if mode == "helper":
+        warmup.start_compile_helper(log=False)
+    warmup.start_background_warmup(log=False)
+    time.sleep(1.0)  # into the compiles (without warmup._shutdown: exit code 134 in 1 of 2 runs)
+    print(f"done_at_exit={warmup.wait_for_warmup(0)}")
+
+
+def report_helper(cache_root):
+    res = _child(["child-helper"], cache_root)
+    print(f"helper: done {res['helper_wall']} s after its start (imports {res['helper_import']} s, "
+          f"compiles {res['helper_compile']} s, CUDA initialized: {res['helper_cuda']}); "
+          f"warm-up thread here {res['thread_s']} s, {res['cache_hits']} of {res['misses']} "
+          f"in-memory misses served by the on-disk cache, C builds here: {res['built']}")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     children = {"child-import": child_import, "child-prelude": child_prelude,
                 "child-compile": child_compile, "child-gil": child_gil,
                 "child-first-call": child_first_call, "child-first-step": child_first_step,
-                "child-apply": child_apply, "child-load": child_load}
+                "child-apply": child_apply, "child-load": child_load,
+                "child-helper": child_helper, "child-exit": child_exit}
     if cmd in children:
         children[cmd](*sys.argv[2:])
         return
     reports = {"imports": report_imports, "compile": report_compile, "gil": report_gil,
                "first-call": report_first_call, "first-step": report_first_step,
-               "apply": report_apply, "load": report_load, "workers": report_workers}
+               "apply": report_apply, "load": report_load, "workers": report_workers,
+               "helper": report_helper}
     root = os.environ.get("TRITON_CACHE_DIR") or tempfile.mkdtemp(prefix="bench-warmup-")
     os.makedirs(root, exist_ok=True)
     for name in ([r for r in reports if r != "load"] if cmd == "all" else [cmd]):
