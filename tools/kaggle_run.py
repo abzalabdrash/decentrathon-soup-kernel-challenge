@@ -92,8 +92,8 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None):
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
             sys.exit("the clone cell of the template changed: cannot inject the token fallback")
     for cell in cells:
-        cell["outputs"] = [] if cell["cell_type"] == "code" else cell.get("outputs", [])
-        if cell["cell_type"] == "code":
+        if cell["cell_type"] == "code":  # markdown cells must not carry outputs (nbformat rejects it)
+            cell["outputs"] = []
             cell["execution_count"] = None
     return nb
 
@@ -254,9 +254,18 @@ def main():
     print(f"\n=== {status}: outputs in {out_dir} ===")
     summarize(out_dir, args.mode)
     for log in out_dir.glob("*.log"):
-        text = log.read_text(encoding="utf-8", errors="replace")
-        tail = text[-3000:]
-        print(f"\n--- tail of {log.name} ---\n{tail}")
+        print(f"\n--- tail of {log.name} ---\n{log_tail(log)}")
+
+
+def log_tail(path, lines=60):
+    """Kaggle writes the notebook log as a JSON list of {stream_name, time, data}; show the text."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        entries = json.loads(text)
+        out = "".join(str(e.get("data", "")) for e in entries if isinstance(e, dict))
+    except ValueError:
+        out = text
+    return "\n".join(out.splitlines()[-lines:])
 
 
 if __name__ == "__main__":
