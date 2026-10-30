@@ -59,10 +59,15 @@ CHECK_CELLS = {
 
 SECRET_MARKER = '    print("No GITHUB_TOKEN secret, cloning without it:", type(exc).__name__)\n'
 SECRET_FALLBACK = [
-    'if not token and os.path.exists("/kaggle/input/soup-secrets/github_token.txt"):\n',
-    '    # private dataset of this Kaggle account (secrets are not attached to API-pushed notebooks)\n',
-    '    token = open("/kaggle/input/soup-secrets/github_token.txt", encoding="utf-8").read().strip()\n',
-    '    print("GitHub token read from the private dataset soup-secrets")\n',
+    'if not token:\n',
+    '    import glob\n',
+    '    # private dataset soup-secrets of this account (secrets are not attached to API-pushed notebooks)\n',
+    '    found = glob.glob("/kaggle/input/**/github_token.txt", recursive=True)\n',
+    '    if found:\n',
+    '        token = open(found[0], encoding="utf-8").read().strip()\n',
+    '        print("GitHub token read from", found[0])\n',
+    '    else:\n',
+    '        print("no github_token.txt under /kaggle/input:", sorted(glob.glob("/kaggle/input/*") + glob.glob("/kaggle/input/*/*")))\n',
 ]
 
 
