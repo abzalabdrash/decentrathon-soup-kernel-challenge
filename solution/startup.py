@@ -4,9 +4,9 @@ Imports (`prepare_imports`, first thing in apply())
 ---------------------------------------------------
 apply() imports what the patches need: transformers' model and generation modules, trl's
 SFTTrainer (and through it peft, bitsandbytes, datasets). Soup imports the same modules later in a
-run without our package, so their cost moves, it does not add. Three parts of it are work that
+run without our package, so their cost moves, it does not add. Four parts of it are work that
 this run does not use, and `prepare_imports` skips them (Kaggle T4, `python -X importtime` of
-apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all three off):
+apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all four off):
 
 - 2.38 s: trl computes `importlib.metadata.packages_distributions()` when imported
   (trl/import_utils.py:25), a read of the metadata of every installed distribution, about a
@@ -26,6 +26,17 @@ apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all three off):
   `--wandb` flag (soup_cli/commands/train.py:1257), which the run does not use; `report_to` is
   "none". While trl's trainer is imported, `transformers.is_wandb_available` answers False; the
   base trainer keeps that answer (no W&B URL in a model card, as without wandb installed).
+- 0.76 s and more: bitsandbytes wraps four functions of its default (CPU fallback) backend in
+  `torch.compile` when imported (bitsandbytes/backends/default/ops.py:12-31, 199, 262, 368, 429:
+  the compute of dequantize_blockwise, dequantize_4bit and the 32-bit optimizer update), and
+  building those wrappers imports Inductor (torch._inductor.compile_fx 0.76 s on Kaggle) and,
+  through torch._dynamo's debug backends, functorch and networkx (0.6 s in all on the RTX 3050 Ti
+  box after torch._dynamo itself is loaded, 0.03 s without). The run never calls them: every one
+  of these ops has a CUDA kernel (bitsandbytes/backends/cuda/ops.py:335, 423, 1212), and the
+  optimizer is torch's AdamW. While bitsandbytes is imported, TORCHDYNAMO_DISABLE=1, torch's own
+  switch that makes `torch.compile(fn)` return `fn` (torch/_dynamo/eval_frame.py, `_optimize`);
+  bitsandbytes keeps the plain functions, as it does when compiling fails. The variable is put
+  back right after (removed, or its earlier value).
 
 Each replacement lives only for the import it serves and is undone right after (the original
 function is put back), and only modules imported in that window keep the answer. If a module is
@@ -97,6 +108,20 @@ def _not_installed():
     return False
 
 
+@contextlib.contextmanager
+def _dynamo_disabled():
+    """TORCHDYNAMO_DISABLE=1 for the duration of the block, then its earlier state back."""
+    previous = os.environ.get("TORCHDYNAMO_DISABLE")
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TORCHDYNAMO_DISABLE", None)
+        else:
+            os.environ["TORCHDYNAMO_DISABLE"] = previous
+
+
 def _import(name, seconds):
     if name in sys.modules:
         return
@@ -115,6 +140,8 @@ def prepare_imports(log=True):
 
         with _replaced(transformers.utils, "is_sklearn_available", _not_installed):
             _import("transformers.generation.candidate_generator", seconds)
+        with _dynamo_disabled():
+            _import("bitsandbytes", seconds)
         with distributions_from_transformers():
             _import("trl", seconds)
             # transformers' top-level lazy attribute, which trl's base trainer imports by name
@@ -134,7 +161,8 @@ def prepare_imports(log=True):
 def _top_packages(names):
     counts = {}
     for name in names:
-        top = name.split(".")[0]
+        parts = name.split(".")
+        top = ".".join(parts[:2]) if parts[0] in ("torch", "transformers", "trl") else parts[0]
         counts[top] = counts.get(top, 0) + 1
     return ", ".join(f"{top} {n}" for top, n in sorted(counts.items(), key=lambda kv: -kv[1])[:25])
 
