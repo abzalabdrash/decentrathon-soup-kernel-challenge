@@ -331,9 +331,16 @@ def restore_classes():
 
     targets = ((sft.SFTTrainerWrapper, ("train", "_soup_mlp_offload", "_soup_offload_previous_train")),
                (modeling_qwen2.Qwen2MLP, ("forward", "_soup_mlp_recompute", "_soup_original_forward",
-                                          "_soup_recompute_previous")))
+                                          "_soup_recompute_previous", "_soup_fused_proj",
+                                          "_soup_fused_proj_previous")))
     saved = [(cls, name, name in cls.__dict__, cls.__dict__.get(name))
              for cls, names in targets for name in names]
+    # solution.apply() may have run in this process (other test files): drop our flags so that
+    # the patches go on again, on top of whatever wraps train/forward by now (phases, warm-up)
+    for cls, flag in ((sft.SFTTrainerWrapper, "_soup_mlp_offload"),
+                      (modeling_qwen2.Qwen2MLP, "_soup_mlp_recompute")):
+        if flag in cls.__dict__:
+            delattr(cls, flag)
     yield
     for cls, name, present, value in saved:
         if present:
@@ -439,6 +446,92 @@ def test_recompute_and_offload_on_frozen_nf4_layers():
     assert offloader.stats["offloaded"] == 2
 
 
+def test_offload_of_fused_proj_mlp(restore_classes):
+    """fused_proj.py's MLP (Qwen2MLP of the task's shapes on NF4 layers, its class patch) saves one
+    (gate|up) tensor made inside its autograd.Function, with no grad_fn: it is offloaded, the
+    windows are one tensor (one layer), each backward step prefetches exactly the layer below,
+    and the results are bit for bit those without the offload."""
+    bnb = pytest.importorskip("bitsandbytes")
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+
+    from solution.fused_proj import patch_qwen2_mlp_fused
+    from solution.offload import Offloader
+
+    patch_qwen2_mlp_fused()
+    torch.manual_seed(0)
+    hidden, inter, rows, layers = 1536, 8960, TOKENS, 4
+    config = Qwen2Config(hidden_size=hidden, intermediate_size=inter)
+
+    def nf4(n_in, n_out):
+        layer = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
+                                  compress_statistics=True, quant_type="nf4")
+        layer.weight.requires_grad_(False)
+        return layer
+
+    mlps = []
+    for _ in range(layers):
+        with torch.device("meta"):
+            mlp = Qwen2MLP(config)
+        mlp.gate_proj, mlp.up_proj, mlp.down_proj = nf4(hidden, inter), nf4(hidden, inter), \
+            nf4(inter, hidden)
+        mlps.append(mlp.cuda())
+    x0 = torch.randn(1, rows, hidden, device="cuda")
+    grad = torch.randn_like(x0)
+    shapes = []
+
+    def go(off):
+        x = x0.clone().requires_grad_(True)
+
+        def pack(t):
+            packed = off.pack(t)
+            if packed is not t:
+                shapes.append((tuple(t.shape), t.grad_fn is None))
+            return packed
+
+        hooks = (torch.autograd.graph.saved_tensors_hooks(pack, off.unpack) if off
+                 else contextlib.nullcontext())
+        with hooks, torch.autocast("cuda", dtype=torch.float16):
+            h = x
+            for mlp in mlps:
+                h = h + mlp(h)
+        h.backward(grad)
+        torch.cuda.synchronize()
+        return h.detach(), x.grad
+
+    ref_out, ref_gx = go(None)
+    off = Offloader(weights=[p for m in mlps for p in m.parameters()])
+    assert off.max_inflight == 1 and off.prefetch == 1  # one tensor per layer with the fused MLP
+    out, gx = go(off)
+    assert torch.equal(out, ref_out) and torch.equal(gx, ref_gx)
+    assert shapes == [((2 * inter, 832), True)] * layers, shapes
+    s = off.stats
+    # the last layer's tensor is still on the GPU, each later one was prefetched one step ahead
+    assert s["still_on_gpu"] == 1 and s["prefetched"] == s["prefetch_hits"] == layers - 1
+    assert s["fetched"] == 0 and off.host.live() == 0
+    print(f"\nfused MLP: {off.summary()}")
+
+
+def test_tensors_sharing_a_weight_storage_stay():
+    """A saved alias of a weight (no grad_fn, owns the whole storage, not a view or Parameter) is
+    offloaded unless the weight is passed to the Offloader."""
+    from solution.offload import Offloader
+
+    n = 1 << 20
+    weight = torch.nn.Parameter(torch.randn(n, device="cuda").half(), requires_grad=False)
+    alias = weight.data
+    assert alias._base is None and not isinstance(alias, torch.nn.Parameter)
+    for weights, expected in (((), 1), ((weight,), 0)):
+        off = Offloader(min_numel=1000, weights=weights)
+        x = leaf(n)
+        with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
+            y = Keep.apply(x, alias)
+        y.backward(torch.ones_like(y))
+        torch.cuda.synchronize()
+        assert off.stats["offloaded"] == expected
+        assert torch.equal(x.grad, weight.detach())
+
+
 # ----------------------------------------------------------------------------------------------
 # the patches
 
@@ -465,7 +558,6 @@ def test_train_wrapper_offloads_only_for_a_real_cuda_trainer(restore_classes, mo
     monkeypatch.setattr(offload, "Offloader", Recording)
     monkeypatch.setattr(sft.SFTTrainerWrapper, "train", fake_train)
     offload.patch_soup_train_offload()
-    assert sft.SFTTrainerWrapper.train is not fake_train
 
     assert sft.SFTTrainerWrapper.train(types.SimpleNamespace(trainer=object())) == "trained"
     assert created == []
@@ -489,15 +581,15 @@ def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
 
     from solution.offload import patch_mlp_memory
 
-    train, forward = sft.SFTTrainerWrapper.train, modeling_qwen2.Qwen2MLP.forward
+    def applied():
+        return (bool(vars(sft.SFTTrainerWrapper).get("_soup_mlp_offload")),
+                bool(vars(modeling_qwen2.Qwen2MLP).get("_soup_mlp_recompute")))
+
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "none")
-    assert patch_mlp_memory() == "none"
-    assert sft.SFTTrainerWrapper.train is train and modeling_qwen2.Qwen2MLP.forward is forward
+    assert patch_mlp_memory() == "none" and applied() == (False, False)
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "swap")
     with pytest.raises(ValueError):
         patch_mlp_memory()
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "Recompute")
-    assert patch_mlp_memory() == "recompute"
-    assert modeling_qwen2.Qwen2MLP.forward is not forward and sft.SFTTrainerWrapper.train is train
-    assert patch_mlp_memory("offload") == "offload"
-    assert sft.SFTTrainerWrapper.train is not train
+    assert patch_mlp_memory() == "recompute" and applied() == (False, True)
+    assert patch_mlp_memory("offload") == "offload" and applied() == (True, True)
