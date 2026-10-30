@@ -85,6 +85,22 @@ begin shows whether the warm-up fits.
 
 Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name.
+
+The launchers (SOUP_SOLUTION_LAUNCHER_OPT, SOUP_SOLUTION_LAUNCHER_NICE; off by default)
+------------------------------------------------------------------------------------
+Each kernel's launcher is a small C module that triton generates for the kernel's signature and builds
+with the system C compiler, `cc <src> -O3 -shared -fPIC ...` (triton/runtime/build.py `_build`), on
+an empty cache once per launcher, plus once for its cuda_utils module. On the T4 (startup_profile.py,
+night-trinit session 1) the warm-up threads spent 5.3 of their 11.5 thread-seconds during Soup's model
+load waiting for these compiler processes, about 0.3 s of CPU each, on a 4-vCPU machine where the
+main thread's model load then got 24% less CPU work done per second. Optimization barely matters for
+a launcher (it parses the arguments with the Python C API and calls cuLaunchKernelEx), and gcc spends
+most of -O3's time optimizing: on the RTX 3050 Ti box a launcher takes 0.30 s at -O3, 0.21 s at -O1,
+0.13 s at -O0 (preprocessing alone 0.06 s). SOUP_SOLUTION_LAUNCHER_OPT=<0|1|2|s> builds them with
+that level through triton's own hook for it (`triton.knobs.build.impl`), with the same compiler,
+sources, flags and libraries otherwise; SOUP_SOLUTION_LAUNCHER_NICE=<n> runs the compiler under
+`nice -n <n>`, so the main thread gets a CPU first when the machine is full. The kernels themselves
+(the cubins from ptxas) do not change.
 """
 
 import atexit
@@ -513,11 +529,76 @@ def _run(device, log, workers, switch):
                   flush=True)
 
 
+def _launcher_build(level, nice):
+    """triton/runtime/build.py `_build` (triton 3.6) with `-O<level>` instead of -O3 and the
+    compiler under `nice -n <nice>` (see the module docstring)."""
+    import shutil
+    import subprocess
+    import sysconfig
+
+    from triton import knobs
+    from triton.runtime.build import _library_flag
+
+    nice_cmd = ["nice", "-n", str(nice)] if nice and shutil.which("nice") else []
+
+    def build(name, src, srcdir, library_dirs, include_dirs, libraries):
+        suffix = sysconfig.get_config_var("EXT_SUFFIX")
+        so = os.path.join(srcdir, "{name}{suffix}".format(name=name, suffix=suffix))
+        cc = os.environ.get("CC")
+        if cc is None:
+            clang = shutil.which("clang")
+            gcc = shutil.which("gcc")
+            cc = gcc if gcc is not None else clang
+            if cc is None:
+                raise RuntimeError("Failed to find C compiler. Please specify via CC environment variable "
+                                   "or set triton.knobs.build.impl.")
+        scheme = sysconfig.get_default_scheme()
+        if scheme == "posix_local":
+            scheme = "posix_prefix"
+        py_include_dir = sysconfig.get_paths(scheme=scheme)["include"]
+        dirs = include_dirs + [srcdir, py_include_dir, *knobs.build.backend_dirs]
+        cc_cmd = nice_cmd + [cc, src, f"-O{level}", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
+        cc_cmd += [_library_flag(lib) for lib in libraries]
+        cc_cmd += [f"-L{d}" for d in library_dirs]
+        cc_cmd += [f"-I{d}" for d in dirs if d is not None]
+        subprocess.check_call(cc_cmd, stdout=subprocess.DEVNULL)
+        return so
+
+    build._soup_launcher_build = (level, nice)
+    return build
+
+
+def install_launcher_build():
+    """SOUP_SOLUTION_LAUNCHER_OPT / SOUP_SOLUTION_LAUNCHER_NICE (see the module docstring): installs
+    the build through `triton.knobs.build.impl` unless someone set that hook already. Returns
+    whether it is installed."""
+    level = os.environ.get("SOUP_SOLUTION_LAUNCHER_OPT", "").strip()
+    try:
+        nice = int(os.environ.get("SOUP_SOLUTION_LAUNCHER_NICE", "0") or 0)
+    except ValueError:
+        nice = 0
+    if level not in ("0", "1", "2", "3", "s"):
+        level = None
+    if level is None and nice <= 0:
+        return False
+    try:
+        from triton import knobs
+
+        current = knobs.build.impl
+        if current is not None:
+            return bool(getattr(current, "_soup_launcher_build", None))
+        knobs.build.impl = _launcher_build(level or "3", max(0, nice))
+        return True
+    except Exception:  # noqa: BLE001 - another triton: its own build then
+        return False
+
+
 def start_early(log=True):
     """apply()'s first warm-up call: triton's own hash in a thread of its own, now, next to the
     imports (see _triton_key). With SOUP_SOLUTION_WARMUP_START=apply_begin the warm-up thread
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
+    install_launcher_build()  # off by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
     threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)

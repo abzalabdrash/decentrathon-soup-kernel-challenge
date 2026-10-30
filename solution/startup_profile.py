@@ -39,7 +39,7 @@ WINDOWS = (
     ("train() up to the first step", "train begin", "first step begin"),
     ("first step", "first step begin", "first step end"),
 )
-TOP_INCLUSIVE, TOP_SELF, TOP_WARMUP, TOP_OTHER = 28, 18, 14, 5
+TOP_INCLUSIVE, TOP_SELF, TOP_WARMUP, TOP_OTHER = 40, 20, 16, 6
 
 _STATE = {"sampler": None, "marks": [], "reported": False, "installed": False, "t0": None}
 
@@ -77,16 +77,22 @@ class _Sampler(threading.Thread):
         self.halt = threading.Event()
         self.samples = []  # (t, kind, stack id, weight seconds)
         self.ticks = []  # (t, late seconds)
-        self.stacks = {}  # (codes, leaf line) -> id
+        self.stacks = {}  # (code ids, leaf line) -> id
         self.stack_list = []
+        self.codes = {}  # id -> code object
         self.warmup_seen = None
         self.warmup_gone = None
 
     def _stack_id(self, frame):
+        # keyed by the ids of the code objects: hashing a code object hashes its bytecode and
+        # constants every time, which made the first version of this sampler slow the main thread
+        # down by a third during the imports. The code objects are kept in `codes` (alive).
         codes = []
         line = frame.f_lineno
         while frame is not None and len(codes) < MAX_DEPTH:
-            codes.append(frame.f_code)
+            code = frame.f_code
+            self.codes.setdefault(id(code), code)
+            codes.append(id(code))
             frame = frame.f_back
         key = (tuple(codes), line)
         found = self.stacks.get(key)
@@ -234,6 +240,7 @@ def report():
         _log(f"warm-up threads seen from +{sampler.warmup_seen - t0:.2f} s, all ended {gone}")
     samples = list(sampler.samples)
     stacks = sampler.stack_list
+    codes = sampler.codes
     for label, begin, end in WINDOWS:
         if begin not in times or end not in times:
             continue
@@ -244,32 +251,45 @@ def report():
         for t, kind, sid, weight in chosen:
             kinds.setdefault(kind, []).append((sid, weight))
         main = kinds.pop("main", [])
-        _print_top(f"{label} | main", main, stacks, b - a, TOP_INCLUSIVE, TOP_SELF)
+        _print_top(f"{label} | main", main, stacks, codes, b - a, TOP_INCLUSIVE, TOP_SELF)
         warm = kinds.pop("warmup", [])
         if warm:
-            _print_top(f"{label} | warm-up threads", warm, stacks, b - a, TOP_WARMUP, 0)
+            _print_top(f"{label} | warm-up threads", warm, stacks, codes, b - a, TOP_WARMUP, 0)
         for kind, rows in sorted(kinds.items(), key=lambda kv: -sum(w for _, w in kv[1])):
             if sum(w for _, w in rows) >= 0.05:
-                _print_top(f"{label} | {kind[6:]}", rows, stacks, b - a, TOP_OTHER, 0)
+                _print_top(f"{label} | {kind[6:]}", rows, stacks, codes, b - a, TOP_OTHER, 0)
 
 
-def _print_top(label, rows, stacks, wall, top_inclusive, top_self):
+_PLUMBING = ("<frozen importlib._bootstrap", "threading.py", "typer/", "click/", "harness/_train.py",
+             "soup_cli/cli.py", "soup_cli/commands/train.py", "<string>", "runpy.py")
+
+
+def _print_top(label, rows, stacks, codes, wall, top_inclusive, top_self):
+    """Inclusive and self time per function; frames that every sample of the window shares and the
+    import / CLI plumbing are left out of the inclusive list (they say nothing)."""
     total = sum(w for _, w in rows)
     if not rows:
         return
     inclusive, own = {}, {}
     for sid, weight in rows:
-        codes, line = stacks[sid]
-        for code in set(codes):
-            inclusive[code] = inclusive.get(code, 0.0) + weight
-        key = (codes[0], line)
+        ids, line = stacks[sid]
+        for code_id in set(ids):
+            inclusive[code_id] = inclusive.get(code_id, 0.0) + weight
+        key = (ids[0], line)
         own[key] = own.get(key, 0.0) + weight
     _log(f"  {label}: {total:.2f} thread-s sampled")
-    for code, seconds in sorted(inclusive.items(), key=lambda kv: -kv[1])[:top_inclusive]:
-        _log(f"  {label} incl {seconds:6.3f} s {100 * seconds / wall if wall else 0:4.0f}%  {_name(code)}")
-    for (code, line), seconds in sorted(own.items(), key=lambda kv: -kv[1])[:top_self]:
+    shown = 0
+    for code_id, seconds in sorted(inclusive.items(), key=lambda kv: -kv[1]):
+        name = _name(codes[code_id])
+        if seconds >= 0.995 * total and total > 0.05 or any(p in name for p in _PLUMBING):
+            continue
+        _log(f"  {label} incl {seconds:6.3f} s {100 * seconds / wall if wall else 0:4.0f}%  {name}")
+        shown += 1
+        if shown >= top_inclusive:
+            break
+    for (code_id, line), seconds in sorted(own.items(), key=lambda kv: -kv[1])[:top_self]:
         _log(f"  {label} self {seconds:6.3f} s {100 * seconds / wall if wall else 0:4.0f}%  "
-             f"{_name(code)} line {line}")
+             f"{_name(codes[code_id])} line {line}")
 
 
 # ---------------------------------------------------------------- marks inside the trainer build
