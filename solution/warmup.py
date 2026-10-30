@@ -73,6 +73,16 @@ The first compile of the process hashes triton's own files, libtriton.so (415 MB
 subprocesses and the cubin load drop and retake the GIL many times. While the main thread runs
 Python, each retake waits up to the switch interval (5 ms by default), so the thread lowers it to
 1 ms while it runs and puts it back after (see `_run` for the numbers).
+
+Where to start it
+-----------------
+At the end of apply(), with `patch_soup_warmup()` (the wait at `train` begin) and
+`watch_compiles()`. RTX 3050 Ti, 3 workers, medians (bench_warmup.py load / apply): the real
+model load takes 2.77 s alone and 2.96 s with the warm-up next to it, which is done 3.27 s after
+the load starts; started before apply() instead, it makes apply() 1.28 s longer (3.05 -> 4.33 s),
+since apply() only imports and leaves the GIL no gaps. Background imports do not pay either:
+trl and datasets imported next to the model load end at 3.38 s, imported first then the load at
+2.69 s. The log line "waited N s for the warmup" at `train` begin shows whether the warm-up fits.
 """
 
 import importlib
