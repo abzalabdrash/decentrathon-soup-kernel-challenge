@@ -252,6 +252,43 @@ def _fast_tokenizer_reducer(original):
     return save
 
 
+_REDUCERS = []  # (dispatch, type, previous entry or None): installed by install_fast_tokenizer_reducer
+
+
+def install_fast_tokenizer_reducer(tokenizer):
+    """datasets' pickler hashes `type(tokenizer)` with `_fast_tokenizer_reducer` until
+    `uninstall_fast_tokenizer_reducers()`. Also called by trainer_build.py when it tokenizes the rows
+    early (during the model load). A no-op when already installed or not a transformers tokenizer."""
+    try:
+        from datasets.utils import _dill
+        from transformers import PreTrainedTokenizerBase
+
+        if not isinstance(tokenizer, PreTrainedTokenizerBase):
+            return
+        original = getattr(_dill, "_save_transformersPreTrainedTokenizerBase", None)
+        dispatch = _dill.Pickler.dispatch
+        kind = type(tokenizer)
+        previous = dispatch.get(kind)
+        if original is None or getattr(previous, "_soup_fast_tokenizer", False):
+            return
+        if previous is not None and previous is not original:
+            return  # someone else's reducer for this type: leave it
+        dispatch[kind] = _fast_tokenizer_reducer(original)
+        _REDUCERS.append((dispatch, kind, previous))
+    except Exception:  # noqa: BLE001 - datasets' own hashing then
+        pass
+
+
+def uninstall_fast_tokenizer_reducers():
+    while _REDUCERS:
+        dispatch, kind, previous = _REDUCERS.pop()
+        if getattr(dispatch.get(kind), "_soup_fast_tokenizer", False):
+            if previous is None:
+                dispatch.pop(kind, None)
+            else:
+                dispatch[kind] = previous
+
+
 def patch_soup_dataset_hashing():
     """SFTTrainerWrapper hooks: once `_setup_transformers` has loaded the tokenizer, datasets'
     pickler hashes its type with `_fast_tokenizer_reducer`; when `setup` returns (or raises), the
@@ -263,36 +300,8 @@ def patch_soup_dataset_hashing():
         return
     original_setup = cls.setup
     original_setup_transformers = cls._setup_transformers
-    installed = []  # (dispatch, type, previous entry or None)
-
-    def install(tokenizer):
-        try:
-            from datasets.utils import _dill
-            from transformers import PreTrainedTokenizerBase
-
-            if not isinstance(tokenizer, PreTrainedTokenizerBase):
-                return
-            original = getattr(_dill, "_save_transformersPreTrainedTokenizerBase", None)
-            dispatch = _dill.Pickler.dispatch
-            kind = type(tokenizer)
-            previous = dispatch.get(kind)
-            if original is None or getattr(previous, "_soup_fast_tokenizer", False):
-                return
-            if previous is not None and previous is not original:
-                return  # someone else's reducer for this type: leave it
-            dispatch[kind] = _fast_tokenizer_reducer(original)
-            installed.append((dispatch, kind, previous))
-        except Exception:  # noqa: BLE001 - datasets' own hashing then
-            pass
-
-    def uninstall():
-        while installed:
-            dispatch, kind, previous = installed.pop()
-            if getattr(dispatch.get(kind), "_soup_fast_tokenizer", False):
-                if previous is None:
-                    dispatch.pop(kind, None)
-                else:
-                    dispatch[kind] = previous
+    install = install_fast_tokenizer_reducer
+    uninstall = uninstall_fast_tokenizer_reducers
 
     def _setup_transformers(self, *args, **kwargs):
         result = original_setup_transformers(self, *args, **kwargs)
@@ -413,8 +422,12 @@ def patch_soup_first_step_mark():
     if getattr(cls, "_soup_first_step_mark", False):
         return
     from .startup_profile import install_marks
+    from .trainer_build import patch_soup_trainer_build
 
     install_marks()  # SOUP_SOLUTION_STARTUP_PROFILE=1 only: marks inside the trainer build
+    # apply() calls this function unconditionally, so the trainer-build switches hook in here
+    # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_FAST_FINGERPRINT, ...: all off by default)
+    patch_soup_trainer_build()
     original_train = cls.train
 
     class FirstStepMark(transformers.TrainerCallback):
