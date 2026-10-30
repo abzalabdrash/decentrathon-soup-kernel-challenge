@@ -26,8 +26,8 @@ Modules:
   the head computed in one streamed pass over the vocabulary (own kernels); switched on from
   fused_ce.patch_qwen2_causal_lm (SOUP_SOLUTION_HEAD_STREAM=0 turns it off);
 - weight_stream.py: the layers' 4-bit weights in pinned host memory, a ring of K layers on the GPU;
-- warmup.py: the kernels compiled by a helper process during apply(), loaded by a background
-  thread while Soup loads the model;
+- warmup.py: the kernels compiled by a background thread while Soup loads the model (triton's own
+  hash started with apply());
 - startup.py: apply()'s imports without work the run does not use (trl's second metadata scan,
   scikit-learn, wandb, bitsandbytes' Inductor), the imported objects frozen for the garbage
   collector, the tokenizer hashed fast by datasets in Soup's setup; a first-step phase mark; a
@@ -58,9 +58,9 @@ def apply():
 
     mark("apply begin")
     if _on("SOUP_SOLUTION_WARMUP"):
-        from .warmup import start_compile_helper
+        from .warmup import start_early
 
-        start_compile_helper()  # Triton compiles in a helper process while apply() imports
+        start_early()  # triton's own hash now, next to the imports, not next to the model load
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
         from .startup import prepare_imports
 
@@ -129,7 +129,7 @@ def apply():
 
         watch_compiles()  # logs any kernel compiled or loaded outside the warm-up
         patch_soup_warmup(start_in_setup=False)
-        start_background_warmup()  # waits for the helper, then loads its kernels from the cache
+        start_background_warmup()  # compiles every registered kernel in a background thread
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
         from .startup import freeze_imported_objects
 
