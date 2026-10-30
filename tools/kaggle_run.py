@@ -80,7 +80,7 @@ def inject_token_fallback(cell):
     return False
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None):
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -91,7 +91,8 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None):
     for cell in code_cells:
         text = "".join(cell["source"])
         if "harness/run_task.py" in text:
-            cell["source"] = RUN_CELLS[mode]
+            cell["source"] = [line.replace("run_task.py", f"run_task.py --repeats {repeats}")
+                              if repeats > 1 else line for line in RUN_CELLS[mode]]
         elif "harness/check_rules.py" in text:
             cell["source"] = CHECK_CELLS[mode]
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
@@ -210,6 +211,8 @@ def main():
     parser.add_argument("--public", action="store_true", help="make the kernel public (for the submission)")
     parser.add_argument("--accelerator", default="NvidiaTeslaT4")
     parser.add_argument("--timeout", type=int, default=5400, help="max run time in seconds")
+    parser.add_argument("--repeats", type=int, default=1,
+                        help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base)")
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--no-wait", action="store_true")
     parser.add_argument("--out", default=str(REPO / "runs_kaggle"))
@@ -233,7 +236,7 @@ def main():
     push_dir.mkdir(parents=True, exist_ok=True)
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
-        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset),
+        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
