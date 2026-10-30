@@ -35,7 +35,7 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-DEFAULT_CHUNK = 1024  # rows of logits alive at once: 1024 x 151936 x 2 bytes = 311 MB
+DEFAULT_CHUNK = 512  # rows of logits alive at once: 512 x 151936 x 2 bytes = 155 MB
 BLOCK_V = 4096
 
 # What the last labelled forward left for the trainer's metrics (set by the patched model forward,
