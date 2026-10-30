@@ -59,6 +59,9 @@ RUN_CELLS = {
     "diag": ["!cd /kaggle/working/repo && mkdir -p runs_diag && SOUP_SOLUTION_WARMUP=0 python -X importtime -c \"import torch; torch.empty(1, device='cuda'); import transformers; import sys; sys.path.insert(0, '.'); import solution; solution.apply(); import soup_cli.cli\" 2> runs_diag/importtime.log; wc -l runs_diag/importtime.log\n",
              "!cd /kaggle/working/repo && SOUP_SOLUTION_DIAG=1 python harness/run_task.py --only solution --out runs_diag\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    # bench: solution/bench_gemm.py (cuBLAS GEMMs on the training's shapes), no training run
+    "bench": ["!cd /kaggle/working/repo && mkdir -p runs_bench && python -m solution.bench_gemm "
+              "--out runs_bench/gemm.json 2>&1 | tee runs_bench/gemm.log\n"],
 }
 CHECK_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
@@ -69,6 +72,8 @@ CHECK_CELLS = {
     "diag": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_diag/result.json --skip-tests\n",
              "!cd /kaggle/working/repo && ls -la runs_diag/solution_1/ && head -c 300 runs_diag/importtime.log\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    "bench": ["!cd /kaggle/working/repo && nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,power.draw "
+              "--format=csv\n"],
 }
 
 
@@ -242,6 +247,11 @@ def summarize_variants(out_dir):
 def summarize(out_dir, mode):
     if mode == "variants":
         summarize_variants(out_dir)
+        return
+    if mode == "bench":
+        logs = [p for p in out_dir.rglob("gemm.log") if "runs_bench" in p.parts]
+        print(logs[0].read_text(encoding="utf-8", errors="replace") if logs else
+              "no runs_bench/gemm.log in the output; see the log")
         return
     sub = {"solution": "runs_try", "diag": "runs_diag"}.get(mode, "runs")
     result = None
