@@ -513,6 +513,12 @@ def _real_cuda_trainer(trainer):
     return param is not None and param.is_cuda
 
 
+# SOUP_SOLUTION_EMPTY_CACHE=step: torch.cuda.empty_cache() at the start of every training step (the
+# harness's step callback synchronizes right before), so the free blocks the caching allocator keeps
+# from the previous step (reserved - allocated: ~33 MiB at the peak) are unmapped before the step
+# maps its own; "0" (default) leaves the cache alone. The allocator's settings are not touched.
+EMPTY_CACHE = os.environ.get("SOUP_SOLUTION_EMPTY_CACHE", "0").strip().lower()
+
 # SOUP_SOLUTION_GC_PAUSE: Python's garbage collector during the training (Soup's train, the loop
 # included): "freeze" moves every object made before (the model, the libraries: millions) to the
 # permanent generation, so the collections in the loop only walk what the loop makes; "off" also
@@ -567,6 +573,16 @@ def patch_soup_train_offload():
         if changed is not None:
             print(f"[solution] CUDA stack limit {changed[0]} -> {changed[1]} bytes per thread",
                   flush=True)
+        if EMPTY_CACHE == "step":
+            from transformers import TrainerCallback
+
+            class _EmptyCache(TrainerCallback):
+                # after the harness's callback has synchronized at the step's start: the blocks
+                # the allocator keeps free go back, the step maps what it needs again
+                def on_step_begin(self, args, state, control, **kwargs):
+                    torch.cuda.empty_cache()
+
+            trainer.add_callback(_EmptyCache())
         from .adam_host import moments_on_host
 
         with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
