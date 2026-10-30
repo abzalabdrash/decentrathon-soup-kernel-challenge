@@ -174,13 +174,18 @@ def setup_secrets(user, token_file, out):
     folder = Path(out) / f"secrets-{user}"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "github_token.txt").write_text(token + "\n", encoding="utf-8")
-    (folder / "dataset-metadata.json").write_text(json.dumps({
-        "title": "soup-secrets", "id": f"{user}/soup-secrets",
-        "licenses": [{"name": "CC0-1.0"}]}, indent=2), encoding="utf-8")
-    out_text = kaggle("datasets", "create", "-p", str(folder), check=False)
-    if "already" in out_text.lower() or "exists" in out_text.lower() or "409" in out_text:
-        out_text = kaggle("datasets", "version", "-p", str(folder), "-m", "update", check=False)
+    meta = json.dumps({"title": "soup-secrets", "id": f"{user}/soup-secrets",
+                       "licenses": [{"name": "CC0-1.0"}]}, indent=2)
+    for name in ("dataset-metadata.json", "datasets-metadata.json"):  # the CLI's help names both
+        (folder / name).write_text(meta, encoding="utf-8")
+    out_text = kaggle("datasets", "create", "-p", str(folder), "-q", check=False)
+    low = out_text.lower()
+    if "already" in low or "exists" in low or "409" in low or "duplicate" in low:
+        out_text = kaggle("datasets", "version", "-p", str(folder), "-m", "update", "-q", check=False)
+        low = out_text.lower()
     print(out_text.strip())
+    if not any(word in low for word in ("success", "created", "updated", "uploaded", "complete")):
+        sys.exit(f"could not create or update {user}/soup-secrets, see the output above")
     print(f"private dataset {user}/soup-secrets ready (processing can take a minute)")
 
 
