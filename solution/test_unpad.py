@@ -264,8 +264,36 @@ def _fmha_launches(fn):
             sum("fmha" in name and "cutlassB" in name for name in names))
 
 
+def _attention_ops(fn):
+    """The aten attention ops `fn` dispatches (forward and backward ones), counted by name: what
+    the launches are, independent of the profiler and of kernel names."""
+    import collections
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class Count(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.ops = collections.Counter()
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            name = func.overloadpacket.__name__
+            if "attention" in name:
+                self.ops[name] += 1
+            return func(*args, **(kwargs or {}))
+
+    with Count() as count:
+        fn()
+    return dict(count.ops)
+
+
 @pytest.mark.parametrize("varlen", [True, False])
 def test_one_launch_each_way(varlen):
+    """One variable-length attention op each way for all the sequences, or one SDPA op per sequence
+    each way on the per-row path, counted at the dispatcher (deterministic everywhere). For the
+    varlen path the profiler also sees exactly one fmha kernel each way (as the T4's traces show,
+    28 + 28 per step); the per-row path is not counted by kernel names, which the T4's profiler did
+    not report for every row."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     unpad._STATE["varlen"] = varlen
@@ -281,10 +309,19 @@ def test_one_launch_each_way(varlen):
     for _ in range(2):  # warm up
         forward().sum().backward()
     holder = {}
-    fwd, _ = _fmha_launches(lambda: holder.update(out=forward()))
-    _, bwd = _fmha_launches(lambda: holder["out"].sum().backward())
+    fwd_ops = _attention_ops(lambda: holder.update(out=forward()))
+    bwd_ops = _attention_ops(lambda: holder.pop("out").sum().backward())
     rows = len(bounds) - 1
-    assert (fwd, bwd) == ((1, 1) if varlen else (rows, rows))
+    if varlen:
+        assert fwd_ops == {"_efficient_attention_forward": 1}
+        assert bwd_ops == {"_efficient_attention_backward": 1}
+        fwd, _ = _fmha_launches(lambda: holder.update(out=forward()))
+        _, bwd = _fmha_launches(lambda: holder["out"].sum().backward())
+        assert (fwd, bwd) == (1, 1)
+    else:
+        assert fwd_ops.get("_scaled_dot_product_efficient_attention") == rows
+        assert bwd_ops.get("_scaled_dot_product_efficient_attention_backward") == rows
+        assert "_efficient_attention_forward" not in fwd_ops
 
 
 # ------------------------------------------------------------------------------------------------
