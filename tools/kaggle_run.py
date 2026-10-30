@@ -33,6 +33,9 @@ Modes:
             runs_var/<label>_<round>; ends with a table per variant: wall, median step, steps 3+,
             step 0, peaks, own-kernel share, check 9. Sessions differ by up to 10% in speed, so
             compare variants within one session. ~1.5 min per run after the ~3 min setup.
+  bench     no training: `python -m <--bench module and args>` (e.g. solution.bench_int8), its log in
+            runs_bench/bench.log, printed at the end
+--skip-pytest drops the notebook's `pytest solution` line (about 4 min on Kaggle) for measurement runs.
 """
 
 import argparse
@@ -59,6 +62,7 @@ RUN_CELLS = {
     "diag": ["!cd /kaggle/working/repo && mkdir -p runs_diag && SOUP_SOLUTION_WARMUP=0 python -X importtime -c \"import torch; torch.empty(1, device='cuda'); import transformers; import sys; sys.path.insert(0, '.'); import solution; solution.apply(); import soup_cli.cli\" 2> runs_diag/importtime.log; wc -l runs_diag/importtime.log\n",
              "!cd /kaggle/working/repo && SOUP_SOLUTION_DIAG=1 python harness/run_task.py --only solution --out runs_diag\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    "bench": [],  # built from --bench by build_notebook
 }
 CHECK_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
@@ -69,6 +73,7 @@ CHECK_CELLS = {
     "diag": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_diag/result.json --skip-tests\n",
              "!cd /kaggle/working/repo && ls -la runs_diag/solution_1/ && head -c 300 runs_diag/importtime.log\n"],
     "variants": [],  # one line per run, built from --variant by build_notebook
+    "bench": ["!nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,power.draw,power.limit --format=csv\n"],
 }
 
 
@@ -115,7 +120,8 @@ def parse_variant(text):
     return label, env
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=()):
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=(),
+                   bench="", skip_pytest=False):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -127,7 +133,10 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
     for cell in code_cells:
         text = "".join(cell["source"])
         if "harness/run_task.py" in text:
-            if mode == "variants":
+            if mode == "bench":
+                cell["source"] = ["!cd /kaggle/working/repo && mkdir -p runs_bench && python -m "
+                                  f"{bench} 2>&1 | tee runs_bench/bench.log\n"]
+            elif mode == "variants":
                 cell["source"] = [
                     "!cd /kaggle/working/repo && "
                     + "".join(f"{k}={v} " for k, v in run_env.items())
@@ -145,6 +154,8 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
                     for name, _ in runs]
             else:
                 cell["source"] = CHECK_CELLS[mode]
+        elif skip_pytest and "pytest solution" in text:
+            cell["source"] = [line for line in cell["source"] if "pytest solution" not in line]
         elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
             sys.exit("the clone cell of the template changed: cannot inject the token fallback")
     if env:  # experiment switches for solution.apply(); the measured subprocesses inherit os.environ
@@ -243,6 +254,11 @@ def summarize(out_dir, mode):
     if mode == "variants":
         summarize_variants(out_dir)
         return
+    if mode == "bench":
+        logs = [p for p in out_dir.rglob("bench.log") if "runs_bench" in p.parts]
+        print(logs[0].read_text(encoding="utf-8", errors="replace") if logs else
+              "no runs_bench/bench.log in the output; see the log")
+        return
     sub = {"solution": "runs_try", "diag": "runs_diag"}.get(mode, "runs")
     result = None
     for path in out_dir.rglob("result.json"):
@@ -330,6 +346,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=1,
                         help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base); "
                              "with --mode variants, the number of rounds")
+    parser.add_argument("--bench", default="", metavar="MODULE [ARGS]",
+                        help="--mode bench: the module to run with python -m, and its arguments")
+    parser.add_argument("--skip-pytest", action="store_true",
+                        help="drop the notebook's pytest solution line (measurement runs)")
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--no-wait", action="store_true")
     parser.add_argument("--attach", action="store_true",
@@ -350,7 +370,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         status = wait_for(kernel, args.poll)
         print(kaggle("kernels", "output", kernel, "-p", str(out_dir), "-o", "-q",
-                     "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
+                     "--file-pattern", r"(result|checks|metrics|profile|bench)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
                      check=False).strip())
         print(f"\n=== {status}: outputs in {out_dir} ===")
         summarize(out_dir, args.mode)
@@ -363,6 +383,10 @@ def main():
     variants = [parse_variant(v) for v in args.variant]
     if (args.mode == "variants") != bool(variants):
         sys.exit("--mode variants needs --variant, and --variant needs --mode variants")
+    if (args.mode == "bench") != bool(args.bench):
+        sys.exit("--mode bench needs --bench, and --bench needs --mode bench")
+    if args.bench and not re.fullmatch(r"[A-Za-z0-9_. =:/-]+", args.bench):
+        sys.exit(f"--bench {args.bench!r}: a module name and plain arguments only")
     if args.commit == "HEAD":
         args.commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
                                      text=True, check=True).stdout.strip()
@@ -373,7 +397,8 @@ def main():
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
         json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
-                                  [tuple(e.split("=", 1)) for e in args.env], variants),
+                                  [tuple(e.split("=", 1)) for e in args.env], variants,
+                                  args.bench, args.skip_pytest),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
@@ -394,7 +419,7 @@ def main():
     out_dir = push_dir / "output"
     out_dir.mkdir(exist_ok=True)
     print(kaggle("kernels", "output", kernel, "-p", str(out_dir), "-o", "-q",
-                 "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
+                 "--file-pattern", r"(result|checks|metrics|profile|bench)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
                  check=False).strip())
     print(f"\n=== {status}: outputs in {out_dir} ===")
     summarize(out_dir, args.mode)
