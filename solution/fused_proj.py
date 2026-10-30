@@ -933,7 +933,7 @@ def set_mlp_recompute(on):
 
 
 class _MLPPlan:
-    __slots__ = ("gate", "up", "down", "half", "split", "recompute")
+    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early")
 
 
 def _mlp_plan(mlp, x):
@@ -967,6 +967,7 @@ def _mlp_plan(mlp, x):
     plan = _MLPPlan()
     plan.gate, plan.up, plan.down, plan.half, plan.split = gate, up, down, half, _gate_up_split()
     plan.recompute = _MLP_MEMORY["recompute"]
+    plan.early = False  # set by the patched forward (offload.EARLY)
     return plan
 
 
@@ -1044,6 +1045,10 @@ class _MLP(torch.autograd.Function):
         x16 = _padded_half(x.reshape(n, d), n, padded, half)
         gate_up = torch.empty((2 * inter, padded), dtype=half, device=x.device)
         _gate_up_matmul(plan, None, x16.t(), gate_up)
+        if plan.early:
+            from .offload import offload_early
+
+            offload_early(gate_up)  # its copy to the host runs under SwiGLU and the down GEMM
         hidden = torch.empty((inter, padded), dtype=half, device=x.device)
         count = inter * padded
         example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
@@ -1154,10 +1159,11 @@ def patch_qwen2_mlp_fused():
         plan = _mlp_plan(self, x)
         if plan is None:
             return previous(self, x)
-        if self is _CTX["last_mlp"]:
-            from .offload import DRAIN_LAST, drain_inflight
+        from .offload import DRAIN_LAST, EARLY, drain_inflight
 
-            if DRAIN_LAST and torch.is_grad_enabled():
+        if torch.is_grad_enabled():
+            plan.early = EARLY and not plan.recompute and x.requires_grad
+            if plan.early or (DRAIN_LAST and self is _CTX["last_mlp"]):
                 drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 

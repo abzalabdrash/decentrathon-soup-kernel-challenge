@@ -271,6 +271,7 @@ class Offloader:
         self.weight_storages = {t.untyped_storage().data_ptr() for t in weights}
         self.host = _HostStack(host_limit)
         self.inflight = collections.deque()
+        self.early = {}  # data_ptr -> handle of a tensor whose copy offload_early started
         self.reads = []  # events after H2D reads on a current stream, not yet waited for by side
         self.by_index = weakref.WeakValueDictionary()
         self.count = 0
@@ -278,6 +279,10 @@ class Offloader:
         self.stats = collections.Counter()
 
     def pack(self, tensor):
+        if self.early:
+            saved = self.early.pop(tensor.data_ptr(), None)
+            if saved is not None and saved.shape == tensor.shape and saved.dtype == tensor.dtype:
+                return saved
         if _RESIDUAL["marked"]:
             saved = self._pack_marked(tensor)
             if saved is not None:
@@ -418,7 +423,8 @@ class Offloader:
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
                 f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
-                f"of them layer inputs {s['residuals']}, other marked {s['marked']}")
+                f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
+                f"started early {s['early']}")
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
@@ -430,6 +436,32 @@ CLEAR_CUBLAS = os.environ.get("SOUP_SOLUTION_CLEAR_CUBLAS_WS", "1").strip().lowe
 # flight finish (drain_inflight), so the previous layer's (gate|up) is not alive next to its own
 DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().lower() not in (
     "0", "false", "no", "")
+
+
+# SOUP_SOLUTION_OFFLOAD_EARLY=1: the fused MLP starts the copy of its (gate|up) to the host right after
+# the gate|up GEMM (offload_early) instead of when autograd packs it after the MLP's forward (after
+# SwiGLU and the down GEMM), and every MLP forward first lets the copies in flight finish
+# (drain_inflight, a wait on the GPU): the previous layer's (gate|up), copied while SwiGLU, the down
+# GEMM and the next attention block ran, is given back before this layer allocates its own, instead
+# of both being alive at the MLP (the forward's peak: 2 x 49 MiB at 1,440 tokens)
+EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "0").strip().lower() not in (
+    "0", "false", "no", "")
+
+
+def offload_early(tensor):
+    """Starts the D2H copy of `tensor` now when the active Offloader would offload it on its pack
+    (the MLP's (gate|up), still in the custom Function's forward); the pack of the same tensor right
+    after the forward returns this handle."""
+    offloader = _ACTIVE["offloader"]
+    if offloader is None:
+        return
+    saved = offloader.pack(tensor)
+    if saved is not tensor:
+        with offloader.lock:
+            if len(offloader.early) > 8:  # never packed (no graph after all): forget them
+                offloader.early.clear()
+            offloader.early[tensor.data_ptr()] = saved
+            offloader.stats["early"] += 1
 
 
 def drain_inflight():
