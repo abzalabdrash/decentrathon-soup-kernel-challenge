@@ -83,11 +83,12 @@ _BUFFERS = {}  # (device, dtype) -> flat buffer that holds the dequantized weigh
 
 
 def _gate_up_split():
-    """SOUP_SOLUTION_FUSED_GU_SPLIT=1: gate and up as two GEMMs over one half-size weight buffer
-    (26 MiB less of persistent buffer, one more launch each way). T4, offload mode, two runs of the
-    same minute: peak 1991 -> 1971 MiB, steps 3+ 24.35 -> 23.58 s (noise: no dequantization more);
-    recompute mode: -40 MiB, ~+4.5 ms per step (up is rebuilt twice in the backward)."""
-    return os.environ.get("SOUP_SOLUTION_FUSED_GU_SPLIT", "0") not in ("0", "false", "no")
+    """Gate and up as two GEMMs over one half-size weight buffer (the default: 26 MiB less of
+    persistent buffer, one more launch each way); SOUP_SOLUTION_FUSED_GU_SPLIT=0: one GEMM over a
+    full-size buffer. T4, offload mode, two runs of the same minute: peak 1991 -> 1971 MiB, steps 3+
+    24.35 -> 23.58 s (noise: no dequantization more); recompute mode: -40 MiB, ~+4.5 ms per step
+    (up is rebuilt twice in the backward)."""
+    return os.environ.get("SOUP_SOLUTION_FUSED_GU_SPLIT", "1") not in ("0", "false", "no")
 
 
 # ---------------------------------------------------------------------------------------------

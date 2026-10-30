@@ -76,19 +76,21 @@ DEFAULT_MODE = "offload"
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
 SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
-# pinned ahead by patch_mlp_memory("offload"): the stack of the task's largest step (1427 tokens, 6
-# slabs); a larger step pins more on demand. On the T4 a slab takes 130 ms of cudaHostAlloc, which
-# holds the forward up when the stack grows during training (the "stalls in torch.empty" of the
-# d9f60bb trace): 6 of them per run.
+# pinned ahead (patch_soup_setup_prepin) once Soup has built a real CUDA model: the stack of the
+# task's largest step (1427 tokens, 6 slabs); a larger step pins more on demand. On the T4 a slab
+# takes 130 ms of cudaHostAlloc, which holds the forward up when the stack grows during training
+# (the "stalls in torch.empty" of the d9f60bb trace): 6 of them per run.
 PREPIN_MB = 1536
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
 HALF_DTYPES = (torch.float16, torch.bfloat16)
 
-# Slabs pinned ahead of time by prepin(), taken by the stack before it pins one itself.
+# Slabs pinned ahead of time by prepin(), taken by the stack before it pins one itself; while a
+# prepin thread is still working the stack waits for its next slab instead of pinning one more.
 _SPARE = []
-_SPARE_LOCK = threading.Lock()
+_SPARE_LOCK = threading.Condition()
+_PREPINNING = [0]  # prepin threads still running
 
 
 def _env_int(name, default):
@@ -121,11 +123,19 @@ def prepin(megabytes):
     count = -(-int(megabytes) // (SLAB_BYTES >> 20))
 
     def work():
-        for _ in range(count):
-            slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+        try:
+            for _ in range(count):
+                slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                with _SPARE_LOCK:
+                    _SPARE.append(slab)
+                    _SPARE_LOCK.notify_all()
+        finally:
             with _SPARE_LOCK:
-                _SPARE.append(slab)
+                _PREPINNING[0] -= 1
+                _SPARE_LOCK.notify_all()
 
+    with _SPARE_LOCK:
+        _PREPINNING[0] += 1
     thread = threading.Thread(target=work, name="soup-offload-prepin", daemon=True)
     thread.start()
     atexit.register(thread.join)
@@ -169,6 +179,8 @@ class _HostStack:
             if self.nbytes + SLAB_BYTES > self.limit:
                 return None, None
             with _SPARE_LOCK:
+                while not _SPARE and _PREPINNING[0]:
+                    _SPARE_LOCK.wait()  # the prepin thread pins this slab anyway: no second one
                 spare = _SPARE.pop() if _SPARE else None
             if spare is None:
                 spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
@@ -391,6 +403,35 @@ def patch_soup_train_offload():
     cls._soup_offload_previous_train = original
 
 
+def patch_soup_setup_prepin(megabytes):
+    """prepin(megabytes) as soon as SFTTrainerWrapper._setup_transformers has built a model with CUDA
+    parameters: the pinning (~0.8 s for 1.5 GB on the T4) runs during the trainer build and the start
+    of train(), CPU work, and is done before step 0. Soup's tests (fake models) and CPU runs pin
+    nothing: a pytest process that applies the solution must not hold 1.5 GB of page-locked memory
+    (four of them at once ran a 31 GB host out of memory)."""
+    from soup_cli.trainer import sft as soup_sft
+
+    cls = soup_sft.SFTTrainerWrapper
+    if getattr(cls, "_soup_offload_prepin", False):
+        return
+    original = cls._setup_transformers
+
+    def _setup_transformers(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        model = getattr(self, "model", None)
+        if isinstance(model, torch.nn.Module) and not cls._soup_offload_prepin_started:
+            param = next(model.parameters(), None)
+            if param is not None and param.is_cuda:
+                cls._soup_offload_prepin_started = True
+                prepin(megabytes)
+        return result
+
+    cls._setup_transformers = _setup_transformers
+    cls._soup_offload_prepin = True
+    cls._soup_offload_prepin_started = False
+    cls._soup_offload_prepin_previous = original
+
+
 # ----------------------------------------------------------------------------------------------
 # recompute
 
@@ -492,7 +533,7 @@ def patch_mlp_memory(mode=None):
     when given. Returns the mode applied. Call it after mlp16's and fused_proj's MLP patches: with
     the fused MLP in place it sets what that MLP saves (fused_proj.set_mlp_recompute); without it,
     recompute replaces Qwen2MLP.forward. With offload, prepin() of SOUP_SOLUTION_OFFLOAD_PREPIN_MB
-    (default PREPIN_MB, 0 = off) starts right away."""
+    (default PREPIN_MB, 0 = off) starts once Soup has built a real CUDA model."""
     if mode is None:
         mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "") or DEFAULT_MODE
     mode = mode.strip().lower()
@@ -504,8 +545,8 @@ def patch_mlp_memory(mode=None):
     if mode == "offload":
         patch_soup_train_offload()
         megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", PREPIN_MB)
-        if megabytes > 0 and torch.cuda.is_available():
-            prepin(megabytes)
+        if megabytes > 0:
+            patch_soup_setup_prepin(megabytes)
     elif mode == "recompute" and fused is None:
         patch_qwen2_mlp_recompute()
     return mode
