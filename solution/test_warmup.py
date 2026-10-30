@@ -176,7 +176,12 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
     # no streamed head for this one-layer model (that happens in Soup's setup): fused_ce's kernel
     monkeypatch.setenv("SOUP_SOLUTION_HEAD_STREAM", "0")
     solution.apply()
-    model = one_layer_model()
+    try:
+        model = one_layer_model()
+    except ImportError as exc:  # Kaggle's image ships torchao 0.10, which peft refuses here
+        if "torchao" not in str(exc):
+            raise
+        pytest.skip(f"peft refuses this environment's torchao: {exc}")
     compiles = fresh.watch_compiles(log=False)
 
     _forget_compiled()

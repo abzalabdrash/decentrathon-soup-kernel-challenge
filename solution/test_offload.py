@@ -310,7 +310,10 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     off.close()
     torch.cuda.synchronize()
     s = off.stats
-    assert s["offloaded"] == k and s["waited"] == k - 1 and s["prefetch_hits"] == k - 1, off.summary()
+    # how many copies are still queued at the next pack depends on the card's timing (the T4 shows
+    # 2-5 of 5): at least one stream wait, never a CPU one (calls above)
+    assert s["offloaded"] == k and 1 <= s["waited"] <= k - 1 and s["prefetch_hits"] == k - 1, \
+        off.summary()
     for x, v in zip(xs, values):
         assert torch.equal(x.grad, v)
 
@@ -558,13 +561,15 @@ def test_offload_of_fused_proj_mlp(restore_classes):
     # one tensor per layer with the fused MLP, plus the layer input with the residual offload
     # (SOUP_SOLUTION_OFFLOAD_RESIDUAL) and the attention's six with SOUP_SOLUTION_OFFLOAD_ATTN
     window = 1 + (1 if offload._RESIDUAL["on"] else 0) + (6 if offload.ATTN else 0)
-    assert off.max_inflight == window and off.prefetch == window
+    assert off.max_inflight == window and off.prefetch == (1 if offload.EARLY else window)
     out, gx = go(off)
     assert torch.equal(out, ref_out) and torch.equal(gx, ref_gx)
     assert shapes == [((2 * inter, 832), True)] * layers, shapes
     s = off.stats
-    # the last layer's tensor is still on the GPU, each later one was prefetched one step ahead
-    assert s["still_on_gpu"] == 1 and s["prefetched"] == s["prefetch_hits"] == layers - 1
+    # the last layers' tensors (up to the window, fewer when a copy ended before the next pack) are
+    # still on the GPU, each one before them was prefetched ahead
+    assert 1 <= s["still_on_gpu"] <= window
+    assert s["prefetched"] == s["prefetch_hits"] == layers - s["still_on_gpu"]
     assert s["fetched"] == 0 and off.host.live() == 0
     print(f"\nfused MLP: {off.summary()}")
 

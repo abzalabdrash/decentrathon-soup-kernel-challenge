@@ -265,12 +265,15 @@ class Offloader:
         layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0) + (6 if ATTN else 0)
         self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", layer) \
             if max_inflight is None else max_inflight
-        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", layer) \
+        # with EARLY one tensor ahead: the unpack of a layer's (gate|up) brings back its input, the
+        # input's unpack (post-attention norm) the previous layer's (gate|up), never two at once
+        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", 1 if EARLY else layer) \
             if prefetch is None else prefetch
         # storages of the model's parameters and buffers: never offloaded, whatever aliases them
         self.weight_storages = {t.untyped_storage().data_ptr() for t in weights}
         self.host = _HostStack(host_limit)
         self.inflight = collections.deque()
+        self.early = {}  # data_ptr -> handle of a tensor whose copy offload_early started
         self.reads = []  # events after H2D reads on a current stream, not yet waited for by side
         self.by_index = weakref.WeakValueDictionary()
         self.count = 0
@@ -278,6 +281,10 @@ class Offloader:
         self.stats = collections.Counter()
 
     def pack(self, tensor):
+        if self.early:
+            saved = self.early.pop(tensor.data_ptr(), None)
+            if saved is not None and saved.shape == tensor.shape and saved.dtype == tensor.dtype:
+                return saved
         if _RESIDUAL["marked"]:
             saved = self._pack_marked(tensor)
             if saved is not None:
@@ -418,7 +425,8 @@ class Offloader:
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
                 f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
-                f"of them layer inputs {s['residuals']}, other marked {s['marked']}")
+                f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
+                f"started early {s['early']}")
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
@@ -430,6 +438,35 @@ CLEAR_CUBLAS = os.environ.get("SOUP_SOLUTION_CLEAR_CUBLAS_WS", "1").strip().lowe
 # flight finish (drain_inflight), so the previous layer's (gate|up) is not alive next to its own
 DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().lower() not in (
     "0", "false", "no", "")
+
+
+# SOUP_SOLUTION_OFFLOAD_EARLY=1: the fused MLP starts the copy of its (gate|up) to the host right after
+# the gate|up GEMM (offload_early) instead of when autograd packs it after the MLP's forward (after
+# SwiGLU and the down GEMM), and every MLP forward first lets the copies in flight finish
+# (drain_inflight, a wait on the GPU): the previous layer's (gate|up), copied while SwiGLU, the down
+# GEMM and the next attention block ran, is given back before this layer allocates its own, instead
+# of both being alive at the MLP (the forward's peak: 2 x 49 MiB at 1,440 tokens)
+# T4 (soup-night-early, ABBA): peak 539 -> 499 MiB; with the backward's prefetch window of one
+# tensor (the default with EARLY: the previous layer's (gate|up) starts coming back when this layer's
+# MLP backward is done, under its attention backward) 479 MiB; +0.2..0.3 s
+EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "1").strip().lower() not in (
+    "0", "false", "no", "")
+
+
+def offload_early(tensor):
+    """Starts the D2H copy of `tensor` now when the active Offloader would offload it on its pack
+    (the MLP's (gate|up), still in the custom Function's forward); the pack of the same tensor right
+    after the forward returns this handle."""
+    offloader = _ACTIVE["offloader"]
+    if offloader is None:
+        return
+    saved = offloader.pack(tensor)
+    if saved is not tensor:
+        with offloader.lock:
+            if len(offloader.early) > 8:  # never packed (no graph after all): forget them
+                offloader.early.clear()
+            offloader.early[tensor.data_ptr()] = saved
+            offloader.stats["early"] += 1
 
 
 def drain_inflight():
@@ -476,6 +513,40 @@ def _real_cuda_trainer(trainer):
     return param is not None and param.is_cuda
 
 
+# SOUP_SOLUTION_EMPTY_CACHE=step: torch.cuda.empty_cache() at the start of every training step (the
+# harness's step callback synchronizes right before), so the free blocks the caching allocator keeps
+# from the previous step (reserved - allocated: ~33 MiB at the peak) are unmapped before the step
+# maps its own; "0" (default) leaves the cache alone. The allocator's settings are not touched.
+EMPTY_CACHE = os.environ.get("SOUP_SOLUTION_EMPTY_CACHE", "0").strip().lower()
+
+# SOUP_SOLUTION_GC_PAUSE: Python's garbage collector during the training (Soup's train, the loop
+# included): "freeze" moves every object made before (the model, the libraries: millions) to the
+# permanent generation, so the collections in the loop only walk what the loop makes; "off" also
+# disables the automatic collections until the training returns; "0" leaves the collector alone.
+# Afterwards the collector is enabled again (if it was); frozen objects stay frozen (startup.py
+# freezes the imports' objects at the end of apply() the same way, and a training's objects are
+# freed by reference counting).
+GC_PAUSE = os.environ.get("SOUP_SOLUTION_GC_PAUSE", "0").strip().lower()
+
+
+@contextlib.contextmanager
+def _gc_paused():
+    import gc
+
+    if GC_PAUSE not in ("freeze", "off"):
+        yield
+        return
+    enabled = gc.isenabled()
+    gc.freeze()
+    if GC_PAUSE == "off":
+        gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+
+
 def patch_soup_train_offload():
     """SFTTrainerWrapper.train runs inside offload_saved_tensors when its trainer is real and on
     CUDA; anything else (Soup's regression tests with fake trainers, CPU) runs the original."""
@@ -496,9 +567,31 @@ def patch_soup_train_offload():
             # longer used; the training threads make theirs again at their next GEMM
             torch.cuda.synchronize()
             torch._C._cuda_clearCublasWorkspaces()
-        with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader:
+        from .cuda_limits import lower_stack_limit
+
+        changed = lower_stack_limit()  # SOUP_SOLUTION_STACK_LIMIT (cuda_limits.py)
+        if changed is not None:
+            print(f"[solution] CUDA stack limit {changed[0]} -> {changed[1]} bytes per thread",
+                  flush=True)
+        if EMPTY_CACHE == "step":
+            from transformers import TrainerCallback
+
+            class _EmptyCache(TrainerCallback):
+                # after the harness's callback has synchronized at the step's start: the blocks
+                # the allocator keeps free go back, the step maps what it needs again
+                def on_step_begin(self, args, state, control, **kwargs):
+                    torch.cuda.empty_cache()
+
+            trainer.add_callback(_EmptyCache())
+        from .adam_host import moments_on_host
+
+        with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
+                _gc_paused(), moments_on_host() as moments:
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
+        if moments is not None:
+            print(f"[solution] AdamW moments on the host between {moments.steps} steps "
+                  f"({moments.moved / 2**20:.1f} MiB each way per step)", flush=True)
         return result
 
     cls.train = train

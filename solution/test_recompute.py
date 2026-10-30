@@ -253,8 +253,10 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
     n = sum(lengths)
     next_norm = torch.ones(1536, device="cuda")
 
-    def run(mode, split):
-        _set(modes, recompute=mode, split=split, check=mode is not None)
+    def run(mode, split, check=False):
+        # the check mode keeps clones of what the recompute rebuilds (to compare them): measured
+        # without it, checked in a run of its own
+        _set(modes, recompute=mode, split=split, check=check)
         for p in layer.parameters():
             p.grad = None
         torch.cuda.synchronize()
@@ -277,9 +279,12 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
                           + [p.grad for p in _lora_params(layer)]]}
 
     run(None, False)  # first call: buffers, caches, the allocator's pool
+    checked = run("all", True, check=True)
+    assert modes[0]["mismatches"] == []
     results = {name: run(mode, split) for name, mode, split in
                (("kept", None, False), ("split", None, True), ("recompute", "all", True))}
-    assert modes[0]["mismatches"] == []
+    for a, b in zip(checked["grads"], results["recompute"]["grads"]):
+        assert _rel(a, b) < 1e-4  # dQ of the attention backward is added with atomics
     for name in ("split", "recompute"):
         assert torch.equal(results[name]["out"][0], results["kept"]["out"][0])
         assert torch.equal(results[name]["out"][1], results["kept"]["out"][1])
