@@ -44,8 +44,10 @@ def patched():
     patch_qwen2_decoder_layer()
     fused_proj.patch_qwen2_attention_fused()
     fused_proj.patch_qwen2_mlp_fused()
+    recompute = fused_proj._MLP_MEMORY["recompute"]
     yield
     fused_proj._STATE["enabled"] = True
+    fused_proj.set_mlp_recompute(recompute)
     for owner, name, value in saved:
         if value is _MISSING:
             if name in vars(owner):
@@ -302,6 +304,97 @@ def test_mlp_1p5b_matches_unfused(layer_1p5b, monkeypatch, split):
     assert dx.dtype == torch.float32
     assert _rel(out, ref_out) < 1e-2
     assert _rel(dx, ref_dx) < 2e-2
+
+
+# ------------------------------------------------------------------------------------------------
+# MLP memory: x16 saved and (gate|up) recomputed against (gate|up) saved
+
+
+@pytest.fixture
+def mlp_recompute():
+    """fused_proj.set_mlp_recompute, put back as it was after the test."""
+    from solution import fused_proj
+
+    before = fused_proj._MLP_MEMORY["recompute"]
+    yield fused_proj.set_mlp_recompute
+    fused_proj.set_mlp_recompute(before)
+
+
+def _saved_mlp_step(mlp, x, grad):
+    """_mlp_step with the shapes and dtypes of every tensor the forward saves."""
+    saved = []
+
+    def pack(t):
+        saved.append((tuple(t.shape), t.dtype))
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out, dx = _mlp_step(mlp, x, grad)
+    return out, dx, saved
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("tokens,dtype", [(826, torch.float32), (1427, torch.float32),
+                                          (832, torch.float32), (1427, torch.float16)])
+def test_mlp_recompute_matches_saved_bit_for_bit(layer_1p5b, monkeypatch, mlp_recompute, split,
+                                                 tokens, dtype):
+    """The recompute mode gives the same output and input gradient, bit for bit, as the mode that
+    saves (gate|up) (offload / none), at the task's shapes, token counts that are and are not a
+    multiple of 8, an fp32 (the RMSNorm output in training) or half input, under fp16 autocast."""
+    monkeypatch.setenv("SOUP_SOLUTION_FUSED_GU_SPLIT", "1" if split else "0")
+    _, _, mlp, _ = layer_1p5b
+    g = torch.Generator("cuda").manual_seed(tokens)
+    x = torch.randn(1, tokens, 1536, device="cuda", generator=g).to(dtype)
+    grad = torch.randn(1, tokens, 1536, device="cuda", generator=g, dtype=torch.float16)
+    padded = -(-tokens // 8) * 8
+    _fused(True)
+    mlp_recompute(False)
+    ref_out, ref_dx, ref_saved = _saved_mlp_step(mlp, x, grad)
+    mlp_recompute(True)
+    out, dx, saved = _saved_mlp_step(mlp, x, grad)
+    assert ref_saved == [((2 * 8960, padded), torch.float16)]
+    assert saved == [((tokens, 1536), torch.float16)]
+    assert out.dtype == torch.float16 and dx.dtype == dtype
+    assert torch.equal(out, ref_out)
+    assert torch.equal(dx, ref_dx)
+
+
+def test_mlp_recompute_twice_with_retained_graph(layer_1p5b, mlp_recompute):
+    """The recompute backward writes the SwiGLU gradient over its own recomputed (gate|up), never
+    over anything saved: a second backward through a retained graph gives the same gradient."""
+    _, _, mlp, _ = layer_1p5b
+    g = torch.Generator("cuda").manual_seed(12)
+    x = torch.randn(1, 300, 1536, device="cuda", generator=g).requires_grad_(True)
+    grad = torch.randn(1, 300, 1536, device="cuda", generator=g, dtype=torch.float16)
+    _fused(True)
+    mlp_recompute(True)
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = mlp(x)
+    (first,) = torch.autograd.grad(out, x, grad, retain_graph=True)
+    (second,) = torch.autograd.grad(out, x, grad)
+    assert torch.equal(first, second)
+
+
+def test_tiny_peft_model_recompute_matches_saved(mlp_recompute):
+    """Through the packed model forward of a tiny 4-bit Qwen2 with peft: hidden states, loss and
+    the LoRA gradients are bit for bit the same with the MLP recomputed as with (gate|up) saved.
+    SDPA runs its math backend here: the mem-efficient backward accumulates dq with atomics, so its
+    rounding (and the LoRA gradients below it) differs from run to run in either mode."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    model = _tiny_peft_model()
+    lengths = [200, 151, 301, 177]  # 829 tokens, not a multiple of 8
+    ids = torch.randint(0, 512, (1, sum(lengths)), device="cuda",
+                        generator=torch.Generator("cuda").manual_seed(3))
+    _fused(True)
+    with sdpa_kernel(SDPBackend.MATH):
+        mlp_recompute(False)
+        ref_hidden, ref_loss, ref_grads = _tiny_step(model, ids, lengths)
+        mlp_recompute(True)
+        hidden, loss, grads = _tiny_step(model, ids, lengths)
+    assert torch.equal(hidden, ref_hidden) and torch.equal(loss, ref_loss)
+    assert len(grads) == len(ref_grads) == 8
+    assert all(torch.equal(a, b) for a, b in zip(grads, ref_grads))
 
 
 # ------------------------------------------------------------------------------------------------

@@ -31,8 +31,10 @@ one addcmul into fp32), and adds the three projections' share to it with one in-
 MLP: x16 once, gate and up rebuilt into one (17920, 1536) buffer and one GEMM computes (gate|up)
 transposed, (17920, N) with the token axis padded to a multiple of 8, so that gate and up are two
 contiguous row blocks for the kit's example SwiGLU kernel (it needs contiguous inputs) without any
-copy; down_proj reads the transposed product directly. Only (gate|up) in half is kept for the
-backward, as in mlp16.py. The MLP returns half: the base's MLP output is the fp16 GEMM result cast
+copy; down_proj reads the transposed product directly. By default only x16 is kept for the backward,
+which recomputes (gate|up) by the same GEMM with the weights it rebuilds for the input gradient
+anyway (set_mlp_recompute; offload.py's SOUP_SOLUTION_MLP_MEMORY=offload|none keep (gate|up) in half
+instead, as mlp16.py does). The MLP returns half: the base's MLP output is the fp16 GEMM result cast
 to fp32, and the residual add promotes half to fp32 with the same values.
 
 Numerics: the GEMMs, their fp32 accumulation and the half outputs are the base's. What changes is the
@@ -503,8 +505,19 @@ def _fused_attention(attn, x, position_embeddings, plan):
 # MLP
 
 
+_MLP_MEMORY = {"recompute": True}
+
+
+def set_mlp_recompute(on):
+    """What the fused MLP keeps for its backward: its half input x16 (N x hidden), with (gate|up)
+    recomputed by the same GEMM in the backward (True, the default: no activation crosses PCIe), or
+    (gate|up) itself (False: offload.py's saved-tensor hooks move it to host memory, or it stays on
+    the GPU). offload.patch_mlp_memory sets it from SOUP_SOLUTION_MLP_MEMORY."""
+    _MLP_MEMORY["recompute"] = bool(on)
+
+
 class _MLPPlan:
-    __slots__ = ("gate", "up", "down", "half", "split")
+    __slots__ = ("gate", "up", "down", "half", "split", "recompute")
 
 
 def _mlp_plan(mlp, x):
@@ -537,6 +550,7 @@ def _mlp_plan(mlp, x):
         return None
     plan = _MLPPlan()
     plan.gate, plan.up, plan.down, plan.half, plan.split = gate, up, down, half, _gate_up_split()
+    plan.recompute = _MLP_MEMORY["recompute"]
     return plan
 
 
@@ -559,6 +573,38 @@ def _gate_up_matmul(plan, left, right_t, out):
     return torch.addmm(result, left[:, inter:], w, out_dtype=torch.float32)
 
 
+def _swiglu_bwd(grad_hidden, gate_up, grad_gate_up, inter, padded):
+    """d(gate|up) of silu(gate) * up into grad_gate_up, which may be gate_up itself: every element is
+    loaded before the values computed from it are stored, and no two programs share an element."""
+    count = inter * padded
+    example_swiglu_bwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
+        grad_hidden, gate_up[:inter], gate_up[inter:], grad_gate_up[:inter], grad_gate_up[inter:],
+        count, BLOCK=SWIGLU_BLOCK)
+
+
+def _recompute_backward(plan, x16, grad_hidden, n, padded):
+    """grad_x in fp32 from the saved x16: (gate|up) recomputed by the forward's GEMMs on the same
+    operands (the same values), the SwiGLU's gradient written over it in place, and its product with
+    the gate|up weights. One rebuild of the weights serves both GEMMs: up is recomputed first with
+    split, so that gate's weights are still in the buffer for the first gradient GEMM."""
+    half, inter = plan.half, plan.gate.out_features
+    gate_up = torch.empty((2 * inter, padded), dtype=half, device=x16.device)
+    x_t = x16.t()
+    if not plan.split:
+        w = _weights((plan.gate, plan.up), half, x16.device)
+        torch.mm(w, x_t, out=gate_up[:, :n])
+        _swiglu_bwd(grad_hidden, gate_up, gate_up, inter, padded)
+        return torch.mm(gate_up[:, :n].t(), w, out_dtype=torch.float32)
+    w = _weights((plan.up,), half, x16.device)
+    torch.mm(w, x_t, out=gate_up[inter:, :n])
+    w = _weights((plan.gate,), half, x16.device)
+    torch.mm(w, x_t, out=gate_up[:inter, :n])
+    _swiglu_bwd(grad_hidden, gate_up, gate_up, inter, padded)
+    result = torch.mm(gate_up[:inter, :n].t(), w, out_dtype=torch.float32)
+    w = _weights((plan.up,), half, x16.device)
+    return torch.addmm(result, gate_up[inter:, :n].t(), w, out_dtype=torch.float32)
+
+
 class _MLP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, plan):
@@ -577,29 +623,31 @@ class _MLP(torch.autograd.Function):
             gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
         w = _weights((plan.down,), half, x.device)
         out = torch.mm(hidden[:, :n].t(), w.t())  # (N, D)
-        ctx.save_for_backward(gate_up)
-        ctx.plan, ctx.x_shape, ctx.x_dtype, ctx.n = plan, x.shape, x.dtype, n
+        # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less
+        ctx.save_for_backward(x16 if plan.recompute else gate_up)
+        ctx.plan, ctx.x_shape, ctx.x_dtype, ctx.n, ctx.padded = plan, x.shape, x.dtype, n, padded
         return out.view(*x.shape[:-1], d)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        (gate_up,) = ctx.saved_tensors
-        plan, n = ctx.plan, ctx.n
+        (saved,) = ctx.saved_tensors
+        plan, n, padded = ctx.plan, ctx.n, ctx.padded
         half = plan.half
-        inter, padded = plan.gate.out_features, gate_up.shape[1]
+        inter = plan.gate.out_features
         grad16 = grad.reshape(n, grad.shape[-1])
         grad16 = grad16 if grad16.dtype == half else grad16.to(half)
         w = _weights((plan.down,), half, grad.device)
         grad_hidden = torch.empty((inter, padded), dtype=half, device=grad.device)
         torch.mm(w.t(), grad16.t(), out=grad_hidden[:, :n])
-        grad_gate_up = torch.empty_like(gate_up)
-        count = inter * padded
-        example_swiglu_bwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
-            grad_hidden, gate_up[:inter], gate_up[inter:], grad_gate_up[:inter], grad_gate_up[inter:],
-            count, BLOCK=SWIGLU_BLOCK)
-        del grad_hidden
-        grad_x = _gate_up_matmul(plan, grad_gate_up[:, :n].t(), None, grad_gate_up)
+        if plan.recompute:
+            grad_x = _recompute_backward(plan, saved, grad_hidden, n, padded)
+        else:
+            gate_up = saved
+            grad_gate_up = torch.empty_like(gate_up)
+            _swiglu_bwd(grad_hidden, gate_up, grad_gate_up, inter, padded)
+            del grad_hidden
+            grad_x = _gate_up_matmul(plan, grad_gate_up[:, :n].t(), None, grad_gate_up)
         if ctx.x_dtype != torch.float32:
             grad_x = grad_x.to(ctx.x_dtype)
         return grad_x.view(ctx.x_shape), None

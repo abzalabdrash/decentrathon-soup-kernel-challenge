@@ -10,6 +10,15 @@ forward, where the fused head adds its chunk of logits: the step's peak.
 
 SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
 
+- recompute (default): with fused_proj.py's MLP, its autograd function saves only its half input
+  x16 (N x 1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the
+  (gate|up) GEMM again on the same operands, with the weights it rebuilds for the input gradient
+  anyway (one GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses
+  PCIe and no tensor gets record_stream, so the caching allocator never waits for side-stream
+  events (the offload's events stalled the forward 119 ms per step in torch.empty on the T4, and
+  its copies took 176 ms of copy-engine time per step from the weight streaming). Without the fused
+  MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate and up (two 4-bit GEMMs) in
+  the backward, same ops in the same order as mlp16.py, so the same numbers.
 - offload: saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
   tensor of MIN_NUMEL to MAX_NUMEL elements that owns its storage and is not a weight (a parameter,
   a trainable leaf, a view of one, or anything sharing the storage of a parameter or buffer of the
@@ -24,9 +33,8 @@ SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
   windows default to one layer: the tensors one MLP saves (saved_per_layer). The pinned memory is a stack of slabs: a step pushes in forward order, the backward
   releases in reverse, so the stack grows to the largest step once and is reused after that
   (pinning costs about 1 s per GB here, so it must not be paid per step or per size class).
-- recompute: Qwen2MLP.forward saves only its fp16 input (N x 1536) and recomputes gate and up (two
-  4-bit GEMMs) in the backward. Same ops in the same order as mlp16.py, so the same numbers.
-- none: nothing.
+  With the fused MLP it saves (gate|up) for the hooks to take (set_mlp_recompute(False)).
+- none: nothing (the fused MLP saves (gate|up) and it stays on the GPU).
 
 Stream rules of the offload (current = the stream the forward or backward runs on, side = ours):
 - D2H: side waits for an event recorded on current after the tensor was produced; the GPU tensor
@@ -54,7 +62,7 @@ import torch
 from .swiglu import swiglu
 
 MODES = ("offload", "recompute", "none")
-DEFAULT_MODE = "offload"
+DEFAULT_MODE = "recompute"
 
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
@@ -443,21 +451,38 @@ def patch_qwen2_mlp_recompute():
 # ----------------------------------------------------------------------------------------------
 
 
+def _fused_mlp():
+    """fused_proj when its Qwen2MLP patch is in place, else None."""
+    try:
+        from transformers.models.qwen2 import modeling_qwen2
+    except Exception:  # noqa: BLE001
+        return None
+    if not getattr(modeling_qwen2.Qwen2MLP, "_soup_fused_proj", False):
+        return None
+    from . import fused_proj
+
+    return fused_proj
+
+
 def patch_mlp_memory(mode=None):
-    """Apply SOUP_SOLUTION_MLP_MEMORY=offload|recompute|none (default DEFAULT_MODE), or `mode`
-    when given. Returns the mode applied. recompute replaces Qwen2MLP.forward: call it after
-    mlp16's patch, not before. With offload, SOUP_SOLUTION_OFFLOAD_PREPIN_MB > 0 starts prepin()
-    right away (off by default)."""
+    """Apply SOUP_SOLUTION_MLP_MEMORY=recompute|offload|none (default DEFAULT_MODE), or `mode`
+    when given. Returns the mode applied. Call it after mlp16's and fused_proj's MLP patches: with
+    the fused MLP in place it sets what that MLP saves (fused_proj.set_mlp_recompute); without it,
+    recompute replaces Qwen2MLP.forward. With offload, SOUP_SOLUTION_OFFLOAD_PREPIN_MB > 0 starts
+    prepin() right away (off by default)."""
     if mode is None:
         mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "") or DEFAULT_MODE
     mode = mode.strip().lower()
     if mode not in MODES:
         raise ValueError(f"SOUP_SOLUTION_MLP_MEMORY must be one of {MODES}, got {mode!r}")
+    fused = _fused_mlp()
+    if fused is not None:
+        fused.set_mlp_recompute(mode == "recompute")
     if mode == "offload":
         patch_soup_train_offload()
         megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", 0)
         if megabytes > 0 and torch.cuda.is_available():
             prepin(megabytes)
-    elif mode == "recompute":
+    elif mode == "recompute" and fused is None:
         patch_qwen2_mlp_recompute()
     return mode
