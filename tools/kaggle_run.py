@@ -153,10 +153,10 @@ def summarize(out_dir, mode):
               f"eval loss vs base {ratios.get('quality_delta_pct')} %")
     for run in result.get("runs", {}).get("solution", []):
         m = run.get("metrics", {})
-        own = m.get("own_kernel_ms", {})
+        own = {k: v for k, v in m.get("own_kernel_ms", {}).items() if not k.startswith("example_")}
         loop = m.get("timed_loop_s") or 0
         share = sum(own.values()) / (1000 * loop) if loop else 0
-        print(f"{run['run']}: own kernels {100 * share:.1f}% of timed steps; "
+        print(f"{run['run']}: own kernels (example excluded) {100 * share:.1f}% of timed steps; "
               f"median step {m.get('median_step_s')} s; apply {m.get('apply_s')} s; "
               f"torch peak reserved {m.get('torch_max_reserved_mib')} MiB")
         if own:
