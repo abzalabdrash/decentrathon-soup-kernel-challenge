@@ -353,7 +353,7 @@ def test_mlp_recompute_matches_saved_bit_for_bit(layer_1p5b, monkeypatch, mlp_re
     mlp_recompute(True)
     out, dx, saved = _saved_mlp_step(mlp, x, grad)
     assert ref_saved == [((2 * 8960, padded), torch.float16)]
-    assert saved == [((tokens, 1536), torch.float16)]
+    assert saved == [((padded, 1536), torch.float16)]  # x16 with its zero padding rows
     assert out.dtype == torch.float16 and dx.dtype == dtype
     assert torch.equal(out, ref_out)
     assert torch.equal(dx, ref_dx)
