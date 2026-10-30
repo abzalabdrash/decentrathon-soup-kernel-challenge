@@ -619,6 +619,7 @@ def patch_qwen2_attention_fused():
     from transformers.models.qwen2 import modeling_qwen2 as mq
 
     cls = mq.Qwen2Attention
+    _register_rebuild_warmup()
     if getattr(cls, "_soup_fused_proj", False):
         return
     previous = cls.forward
@@ -637,6 +638,16 @@ def patch_qwen2_attention_fused():
     cls._soup_fused_proj_previous = previous
     cls.forward = forward
     cls._soup_fused_proj = True
+
+
+def _register_rebuild_warmup():
+    """The x16 rebuild's kernel (rmsnorm.rms_norm_rows_rebuild) into warmup.py's registry; by name,
+    so registering again replaces the entry."""
+    if _ATTN["rebuild_x16"]:
+        from .rmsnorm import warm_rebuild
+        from .warmup import register
+
+        register(warm_rebuild, name="fused_proj_x16_rebuild")
 
 
 def patch_qwen2_mlp_fused():

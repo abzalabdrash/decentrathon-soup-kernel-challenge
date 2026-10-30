@@ -305,3 +305,24 @@ def test_rebuild_matches_the_forward_bit_for_bit(fused, source_dtype):
         assert torch.equal(rebuilt, y.detach().reshape(838, 1536).to(dtype))
     assert rn.norm_source(y * 1.0) is None and rn.norm_source(x) is None
     assert rn.norm_source(y.detach()) is None
+
+
+def test_rebuild_kernel_is_warmed_up():
+    """warm_rebuild (registered with warmup.py by fused_proj's attention patch) compiles the class
+    that rebuild launches in training: fp32 rows of 1536, out in the run's half dtype."""
+    from solution import rmsnorm as rn
+    from solution import warmup
+
+    compiles = warmup.watch_compiles(log=False)
+    rn.rms_norm_rows_rebuild.device_caches.clear()
+    compiles.clear()
+    assert rn.warm_rebuild() is None
+    assert [c["kernel"] for c in compiles] == ["rms_norm_rows_rebuild"]
+    compiles.clear()
+    norm = _norm_module(1536, train_weight=False)
+    for n in (838, 1427):
+        x = torch.randn(1, n, 1536, device="cuda", requires_grad=True)
+        branch = torch.randn(1, n, 1536, device="cuda").half()
+        _, y = rn.add_rmsnorm(x, branch, norm.weight, EPS)
+        rn.rebuild(rn.norm_source(y), warmup.training_half_dtype())
+    assert [c["kernel"] for c in compiles if c["kernel"] == "rms_norm_rows_rebuild"] == []

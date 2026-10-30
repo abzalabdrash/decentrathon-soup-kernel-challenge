@@ -135,6 +135,32 @@ def rms_norm_rows_bwd(
         tl.store(dw_ptr + pid * n_cols + cols, dw_acc, mask=col_ok)
 
 
+@triton.jit(do_not_specialize=["n_rows"])
+def rms_norm_rows_rebuild(
+    x_ptr, stride_x,  # the rows the forward normed: the norm input, or the fused add's sum
+    rstd_ptr,  # fp32 (n_rows,): what the forward stored
+    w_ptr,  # fp32 (n_cols,)
+    y_ptr, stride_y,  # the forward's output rows again, rounded to y's dtype
+    n_rows, n_cols,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK)
+    row_ok = rows < n_rows
+    col_ok = cols < n_cols
+    tile_ok = row_ok[:, None] & col_ok[None, :]
+    rows64 = rows.to(tl.int64)[:, None]
+    v = tl.load(x_ptr + rows64 * stride_x + cols[None, :], mask=tile_ok, other=0.0).to(tl.float32)
+    rstd = tl.load(rstd_ptr + rows, mask=row_ok, other=0.0)
+    # rms_norm_rows_fwd after its reduction, the same operations in the same order: two products
+    # with no sum between them, so nothing for the compiler to contract
+    normed = (v * rstd[:, None]).to(x_ptr.dtype.element_ty).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)
+    out = normed * w[None, :]
+    tl.store(y_ptr + rows64 * stride_y + cols[None, :], out.to(y_ptr.dtype.element_ty), mask=tile_ok)
+
+
 def _rows(t):
     """(…, C) -> (rows, C) with a unit column stride, a view whenever possible."""
     t2 = t.reshape(-1, t.shape[-1])
@@ -269,16 +295,31 @@ def norm_source(y):
 def rebuild(node, dtype):
     """The output of the norm `node` (from `norm_source`) rounded to `dtype`, (rows, C), bit for bit
     what `y.to(dtype)` gave in the forward: the saved input (or sum) times the saved rstd, rounded to
-    the input dtype, times the weight, the fp32 product rounded to `dtype`. Two elementwise launches,
-    no reduction, so no dependence on the order of the sum of squares."""
+    the input dtype, times the weight, the fp32 product rounded to `dtype`. One launch that reads
+    the rows once and writes them in `dtype`; no reduction, so no dependence on the order of the
+    sum of squares."""
     source, weight, rstd = node.saved_tensors
-    with torch.no_grad():
-        normed = torch.mul(source, rstd[:, None], out=torch.empty(
-            source.shape, dtype=torch.float32, device=source.device))
-        if source.dtype != torch.float32:
-            normed = normed.to(source.dtype).to(torch.float32)
-        return torch.mul(normed, weight, out=torch.empty(source.shape, dtype=dtype,
-                                                         device=source.device))
+    n_rows, n_cols = source.shape
+    out = torch.empty((n_rows, n_cols), dtype=dtype, device=source.device)
+    rms_norm_rows_rebuild[(triton.cdiv(n_rows, FWD_ROWS),)](
+        source, source.stride(0), rstd, weight, out, out.stride(0), n_rows, n_cols,
+        ROWS=FWD_ROWS, BLOCK=triton.next_power_of_2(n_cols), num_warps=FWD_WARPS)
+    return out
+
+
+def warm_rebuild():
+    """warmup.py registration for the rebuild kernel (registered by fused_proj.py's attention patch,
+    its one user): the class training launches, fp32 rows of the residual width in the run's half
+    dtype."""
+    from . import _on
+    from .warmup import HIDDEN, SKIPPED, TOKENS, compile_kernel, training_half_dtype
+
+    if not _on("SOUP_SOLUTION_RMSNORM"):
+        return SKIPPED
+    compile_kernel(rms_norm_rows_rebuild, torch.float32, HIDDEN, torch.float32, torch.float32,
+                   training_half_dtype(), HIDDEN, TOKENS, HIDDEN,
+                   ROWS=FWD_ROWS, BLOCK=triton.next_power_of_2(HIDDEN), num_warps=FWD_WARPS)
+    return None
 
 
 def add_rmsnorm(residual, branch, weight, eps):
