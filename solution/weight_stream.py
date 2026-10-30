@@ -49,6 +49,9 @@ import torch
 ALIGN = 256  # bytes; every tensor of a slot starts at this alignment (the allocator's is 512)
 
 _STREAMERS = weakref.WeakKeyDictionary()  # decoder layer -> its WeightStreamer
+# decoder layer -> _HostLayer: its 4-bit tensors moved to pinned host memory while transformers
+# loaded the model (load_stream.py), waiting for a WeightStreamer to adopt them
+_LOADED = weakref.WeakKeyDictionary()
 
 
 class StreamSkip(Exception):
@@ -80,6 +83,47 @@ def pinned_host_buffer(nbytes, owner):
             _unregister(buffer)
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
     return buffer, weakref.finalize(owner, _unregister, buffer)
+
+
+class PinnedBuffer:
+    """A pinned host buffer that can be made ahead (load_stream.py pins them in a thread while the
+    loader reads the checkpoint) and handed to whoever needs it; unpinned by `unpin()` or when the
+    holder is collected."""
+
+    def __init__(self, nbytes):
+        self.nbytes = nbytes
+        self.buffer, self._finalizer = pinned_host_buffer(nbytes, self)
+
+    def unpin(self):
+        if self._finalizer is not None:
+            self._finalizer()
+            self._finalizer = None
+        self.buffer = None
+
+
+def predicted_layer_bytes(layer, only=None):
+    """The size of a layer's buffer in the streamers' layout, from the shapes of its (still meta)
+    4-bit linear layers, as bitsandbytes' quantize_4bit sizes its outputs: the packed weight,
+    the absmax of each block (uint8 codes with double quantization) and the fp32 second-level absmax."""
+    import bitsandbytes as bnb
+
+    def aligned(nbytes):
+        return -(-nbytes // ALIGN) * ALIGN
+
+    total = 0
+    for name, module in layer.named_modules():
+        if not isinstance(module, bnb.nn.Linear4bit) or (only and not only.intersection(name.split("."))):
+            continue
+        weight = module.weight
+        n = module.in_features * module.out_features
+        item = torch.empty(0, dtype=getattr(weight, "quant_storage", torch.uint8)).element_size()
+        blocks = -(-n // getattr(weight, "blocksize", 64))
+        total += aligned((n + 1) // (2 * item) * item)
+        if getattr(weight, "compress_statistics", True):
+            total += aligned(blocks) + aligned(-(-blocks // 256) * 4)
+        else:
+            total += aligned(blocks * 4)
+    return total
 
 
 def _layer_tensors(layer, device, only=None):
@@ -115,6 +159,83 @@ def _layer_tensors(layer, device, only=None):
     if not found:
         raise StreamSkip("a layer without 4-bit linear layers")
     return found
+
+
+def _plan_layer(layer, device, only, seen=None):
+    """[(segment, tensor)] of a layer's 4-bit tensors laid out in one buffer (each at ALIGN), and the
+    buffer's size."""
+    offset, plan = 0, []
+    for owner, field, tensor in _layer_tensors(layer, device, only):
+        if seen is not None:
+            if tensor.data_ptr() in seen:
+                raise StreamSkip("a 4-bit tensor shared between layers")
+            seen.add(tensor.data_ptr())
+        plan.append((_Segment(owner, field, tensor, offset), tensor))
+        offset += -(-tensor.numel() * tensor.element_size() // ALIGN) * ALIGN
+    return plan, offset
+
+
+class _HostLayer:
+    """A decoder layer's 4-bit tensors in a pinned host buffer of its own, laid out as a
+    WeightStreamer lays out a layer; the modules point at views of it."""
+
+    def __init__(self, layer, device, only, pinned=None):
+        plan, nbytes = _plan_layer(layer, device, only)
+        self.device, self.only, self.nbytes = device, only, nbytes
+        if pinned is not None and pinned.buffer is not None and pinned.nbytes >= nbytes:
+            self._pinned = pinned  # pinned ahead (load_stream.py)
+            self.buffer, self._unpin = pinned.buffer[:nbytes], pinned.unpin
+        else:
+            self._pinned = None
+            self.buffer, self._unpin = pinned_host_buffer(nbytes, self)
+        for segment, tensor in plan:
+            segment.view(self.buffer).copy_(tensor, non_blocking=True)
+        torch.cuda.synchronize(device)
+        self.segments = [segment for segment, _ in plan]
+        for segment in self.segments:
+            segment.assign(segment.view(self.buffer))
+
+    def restore(self):
+        """The layer's tensors back on the GPU, in tensors of their own."""
+        for segment in self.segments:
+            tensor = torch.empty(segment.shape, dtype=segment.dtype, device=self.device)
+            tensor.copy_(segment.view(self.buffer))
+            segment.assign(tensor)
+        torch.cuda.synchronize(self.device)
+        self.unpin()
+
+    def unpin(self):
+        if self._unpin is not None:
+            self._unpin()
+            self._unpin = None
+        self.buffer = None
+
+
+def offload_loaded_layer(layer, device, only=None, pinned=None):
+    """Called by load_stream.py once the loader has quantized every 4-bit linear layer of `layer`:
+    its tensors go to pinned host memory now (into `pinned`, a PinnedBuffer made ahead, when it is
+    big enough), for the WeightStreamer built before peft's kbit preparation to adopt (no second
+    copy). Returns the bytes moved."""
+    only = frozenset(only) if only else None
+    if layer in _LOADED or layer in _STREAMERS:
+        return 0
+    host = _HostLayer(layer, device, only, pinned)
+    _LOADED[layer] = host
+    return host.nbytes
+
+
+def restore_loaded_layers(model):
+    """Puts back on the GPU the layers of `model` that the loader moved to the host and that no
+    WeightStreamer adopted (streaming declined). Returns how many."""
+    if not isinstance(model, torch.nn.Module) or not len(_LOADED):
+        return 0
+    restored = 0
+    for layer in find_decoder_layers(model):
+        host = _LOADED.pop(layer, None)
+        if host is not None:
+            host.restore()
+            restored += 1
+    return restored
 
 
 class _Segment:
@@ -175,41 +296,56 @@ class WeightStreamer:
                 raise StreamSkip("a layer is streamed already")
             if getattr(layer, "gradient_checkpointing", False):
                 raise StreamSkip("gradient checkpointing would rerun the layers in the backward")
-        self.device = _first_device(layers[0])
+        # layers the loader moved to the host already (load_stream.py) are adopted as they are
+        adopted = []
+        for layer in layers:
+            host = _LOADED.get(layer)
+            ok = host is not None and host.only == only and host.buffer is not None
+            adopted.append(host if ok else None)
+        self.device = next((host.device for host in adopted if host is not None), None)
+        if self.device is None:
+            self.device = _first_device(layers[0])
         if self.device.type != "cuda":
             raise StreamSkip(f"weights on {self.device}")
 
         plans, sizes, seen = [], [], set()
-        for layer in layers:
-            offset, plan = 0, []
-            for owner, field, tensor in _layer_tensors(layer, self.device, only):
-                if tensor.data_ptr() in seen:
-                    raise StreamSkip("a 4-bit tensor shared between layers")
-                seen.add(tensor.data_ptr())
-                plan.append((_Segment(owner, field, tensor, offset), tensor))
-                offset += -(-tensor.numel() * tensor.element_size() // ALIGN) * ALIGN
-            plans.append(plan)
-            sizes.append(offset)
+        for layer, host in zip(layers, adopted):
+            if host is not None:
+                plans.append([(segment, None) for segment in host.segments])
+                sizes.append(host.nbytes)
+            else:
+                plan, size = _plan_layer(layer, self.device, only, seen)
+                plans.append(plan)
+                sizes.append(size)
 
         started = time.perf_counter()
         self.layers, self.slots, self.n, self.only = layers, slots, len(layers), only
         self.layer_bytes = sizes
         self.slot_bytes = max(sizes)
-        self._starts = [0]
-        for size in sizes:
-            self._starts.append(self._starts[-1] + size)
+        self.adopted = sum(host is not None for host in adopted)
         # everything that can fail comes before the first change to the model
-        self._host, self._unpin = pinned_host_buffer(self._starts[-1], self)
+        fresh = [j for j, host in enumerate(adopted) if host is None]
+        starts, total = {}, 0
+        for j in fresh:
+            starts[j] = total
+            total += sizes[j]
+        self._fresh, self._unpin = pinned_host_buffer(total, self) if fresh else (None, None)
+        self._hosts = [host.buffer if host is not None else self._fresh[starts[j]:starts[j] + sizes[j]]
+                       for j, host in enumerate(adopted)]
+        self._adopted_hosts = [host for host in adopted if host is not None]  # they keep the pinning
         self._slots = [torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device)
                        for _ in range(slots)]
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._ready = [torch.cuda.Event() for _ in range(slots)]  # copy into the slot done
         self._free = [torch.cuda.Event() for _ in range(slots)]  # compute queued when a copy was issued
-        for j, plan in enumerate(plans):
+        for j in fresh:
             host = self._host_layer(j)
-            for segment, tensor in plan:
+            for segment, tensor in plans[j]:
                 segment.view(host).copy_(tensor, non_blocking=True)
         torch.cuda.synchronize(self.device)
+        for layer, host in zip(layers, adopted):
+            if host is not None:
+                _LOADED.pop(layer, None)
 
         self._plans = [[segment for segment, _ in plan] for plan in plans]
         del plans
@@ -241,10 +377,10 @@ class WeightStreamer:
 
     @property
     def host_bytes(self):
-        return self._starts[-1]
+        return sum(self.layer_bytes)
 
     def _host_layer(self, j):
-        return self._host[self._starts[j]:self._starts[j + 1]]
+        return self._hosts[j]
 
     def _reset_timing(self):
         self.copy_ms, self.copy_bytes, self.copies_timed = 0.0, 0, 0
@@ -364,7 +500,9 @@ class WeightStreamer:
         self._slots = []
         if self._unpin is not None:
             self._unpin()
-        self._host = None
+        for host in self._adopted_hosts:
+            host.unpin()
+        self._fresh, self._hosts, self._adopted_hosts = None, [], []
 
 
 def _first_device(layer):
@@ -421,7 +559,8 @@ def stream_model_weights(model, slots=2, log=print, only=None):
     log(f"[solution] 4-bit weights of {streamer.n} layers streamed from pinned host memory"
         f"{'' if not only else ' (only ' + ','.join(sorted(only)) + ')'}: "
         f"{streamer.slots} GPU slots x {streamer.slot_bytes / 2**20:.1f} MiB, "
-        f"{freed / 2**20:.0f} MiB freed on the GPU, setup {streamer.setup_seconds:.2f} s, "
+        f"{freed / 2**20:.0f} MiB freed on the GPU, {streamer.adopted} layers already in host memory "
+        f"from the load, setup {streamer.setup_seconds:.2f} s, "
         f"host -> GPU {'?' if gbps is None else f'{gbps:.1f}'} GB/s")
     atexit.register(_report, weakref.ref(streamer), log)
     return streamer
@@ -444,6 +583,21 @@ def _report(ref, log):
         f"{s['waits_backward']} backward ones")
 
 
+def _stream_or_restore(model, slots, only, log=print):
+    """Streams the model's 4-bit weights; when that is declined, the layers the loader moved to the
+    host come back to the GPU (the model then is what it would have been without us)."""
+    streamer = None
+    try:
+        streamer = stream_model_weights(model, slots, log=log, only=only)
+    except Exception as exc:  # noqa: BLE001 - an optimisation must not break setup
+        log(f"[solution] weight streaming skipped: {exc!r}")
+    if streamer is None:
+        restored = restore_loaded_layers(model)
+        if restored:
+            log(f"[solution] {restored} layers moved to host memory during the load put back on the GPU")
+    return streamer
+
+
 def _only_from_env():
     """SOUP_SOLUTION_WEIGHT_STREAM_ONLY: comma-separated module name parts to stream (e.g. 'mlp',
     or 'gate_proj,up_proj,down_proj'); empty or unset streams all 4-bit layers."""
@@ -452,7 +606,7 @@ def _only_from_env():
     return parts or None
 
 
-def patch_weight_stream(slots=2, early=True, only=None):
+def patch_weight_stream(slots=2, early=True, only=None, load=None):
     """Streams the model's 4-bit weights during Soup's setup.
 
     early=True: right before peft's `prepare_model_for_kbit_training` (when Soup calls it without
@@ -460,11 +614,19 @@ def patch_weight_stream(slots=2, early=True, only=None):
     does not hold all 4-bit weights either. In any case once more after
     `SFTTrainerWrapper._setup_transformers` returns (a no-op when the early hook already streamed).
     Fake modules in Soup's regression tests take the original paths. `only` (default from
-    SOUP_SOLUTION_WEIGHT_STREAM_ONLY): see WeightStreamer."""
+    SOUP_SOLUTION_WEIGHT_STREAM_ONLY): see WeightStreamer. `load` (default: SOUP_SOLUTION_LOAD_STREAM,
+    on): with `early`, every layer's 4-bit tensors go to pinned host memory as soon as transformers
+    has quantized them during the load (load_stream.py), and the streamer adopts them."""
     from soup_cli.trainer import sft as soup_sft
 
     if only is None:
         only = _only_from_env()
+    if load is None:
+        load = os.environ.get("SOUP_SOLUTION_LOAD_STREAM", "1") not in ("0", "false", "no")
+    if early and load:
+        from .load_stream import patch_loader
+
+        patch_loader(layers=True, only=only)
     cls = soup_sft.SFTTrainerWrapper
     if not getattr(cls, "_soup_weight_stream", False):
         original_setup = cls._setup_transformers
@@ -473,10 +635,7 @@ def patch_weight_stream(slots=2, early=True, only=None):
             result = original_setup(self, *args, **kwargs)
             model = getattr(self, "model", None)
             if isinstance(model, torch.nn.Module):
-                try:
-                    stream_model_weights(model, slots, only=only)
-                except Exception as exc:  # noqa: BLE001 - an optimisation must not break setup
-                    print(f"[solution] weight streaming skipped: {exc!r}")
+                _stream_or_restore(model, slots, only)
             return result
 
         cls._setup_transformers = _setup_transformers
@@ -492,11 +651,12 @@ def patch_weight_stream(slots=2, early=True, only=None):
         @functools.wraps(original_prepare)
         def prepare_model_for_kbit_training(model, *args, **kwargs):
             checkpointing = kwargs.get("use_gradient_checkpointing", args[0] if args else True)
-            if checkpointing is False and isinstance(model, torch.nn.Module):
-                try:
-                    stream_model_weights(model, slots, only=only)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[solution] weight streaming skipped: {exc!r}")
+            if isinstance(model, torch.nn.Module):
+                if checkpointing is False:
+                    _stream_or_restore(model, slots, only)
+                elif restore_loaded_layers(model):
+                    print("[solution] gradient checkpointing: the layers moved to host memory during "
+                          "the load are back on the GPU")
             return original_prepare(model, *args, **kwargs)
 
         prepare_model_for_kbit_training._soup_weight_stream = True
