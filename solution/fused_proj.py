@@ -21,6 +21,19 @@ Attention here (inside `unpad.varlen`, the packed training step):
 - q, k, v leave the function as (B, H, N, D) token-major views; attention is unpad.attention, one
   variable-length launch for all rows (and the alignment tail) with the kv heads expanded inside it
   and not saved, its token-major output goes straight to o_proj (dequant + GEMM).
+Attention recompute (SOUP_SOLUTION_RECOMPUTE_ATTN=1|auto, `_AttnRecompute`): the attention keeps q,
+the compact k and v, its output and the log-sum-exp for its backward (7 KB per token per layer),
+and the post-attention norm keeps the fp32 sum residual + o_proj output (6 KB). In a recomputing
+layer neither is kept: in the backward, the post-attention norm asks for the o_proj output again
+and the layer's block runs once more with what is kept anyway (x16 rebuilt from the input norm, h,
+the half adapters, the rotary tables, the cu_seqlens) and the weights the backward rebuilds anyway:
+q|k|v GEMM + the adapters' addmm + rope, the attention kernel's forward, the o_proj GEMM. Every op
+is the forward's, on the same operands and shapes (the same cuBLAS algorithm and the same kernel,
+neither with atomics), so the rebuilt tensors are the forward's bit for bit and the gradients are
+those of the kept path. About 0.5 ms per layer at 830 tokens; `auto` recomputes only as many layers
+(from layer 0) as keep a step's attention memory at that of SOUP_SOLUTION_RECOMPUTE_TOKENS tokens
+(640) without the recompute, so short steps pay nothing.
+
 Only h (N x 32), the half adapter weights and the CUDA RNG state are kept for the backward; x16 is
 rebuilt in the backward, bit for bit, from the input and rstd that the input norm (rmsnorm.py) keeps
 for its own backward (`rmsnorm.rebuild`; kept as before when the input is not such a norm's
@@ -61,6 +74,7 @@ unpad's patch would wrap this one and call it only outside `varlen`, and mlp16's
 forward from `_soup_original_forward` and drop this one.
 """
 
+import math
 import os
 import weakref
 
@@ -74,7 +88,7 @@ from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 from .rmsnorm import norm_source, rebuild
-from .unpad import _CTX, sequences
+from .unpad import _CTX, _compact, kernel_operands, sequences, varlen_forward
 from .unpad import attention as packed_attention
 
 _STATE = {"enabled": True}
@@ -554,7 +568,7 @@ class _QKVRope(torch.autograd.Function):
     """x (1, N, D) -> q, k, v (1, H, N, Dh) in half: q and k rotated, LoRA added to q and v."""
 
     @staticmethod
-    def forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan):
+    def forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute=None):
         half, n, d = plan.half, plan.n_tokens, x.shape[-1]
         q_base, k_base, v_base = plan.bases
         nq, nk, nv = q_base.out_features, k_base.out_features, v_base.out_features
@@ -607,6 +621,9 @@ class _QKVRope(torch.autograd.Function):
         else:
             ctx.save_for_backward(h, a16, b16, cos, sin)
         ctx.source = source
+        if recompute is not None:  # what the attention recompute starts from (kept here anyway)
+            recompute.qkv_taken(source, x16, h, b16, cos, sin)
+        ctx.recompute = recompute
         ctx.plan, ctx.rng, ctx.x_shape, ctx.x_dtype = plan, rng, x.shape, x.dtype
         ctx.dims = (n, d, nq, nk, nv, r)
         return q4, k4, v4
@@ -618,7 +635,14 @@ class _QKVRope(torch.autograd.Function):
         plan = ctx.plan
         n, d, nq, nk, nv, r = ctx.dims
         half, s, p = plan.half, plan.scaling, plan.p
-        x16 = kept[0] if kept else rebuild(ctx.source, half).view(n, d)
+        recompute, ctx.recompute = ctx.recompute, None
+        rebuilt = recompute.take_x16() if recompute is not None else None  # its rebuild, if it ran
+        if kept:
+            x16 = kept[0]
+        else:
+            x16 = (rebuilt if rebuilt is not None else rebuild(ctx.source, half)).view(n, d)
+        if recompute is not None:
+            recompute.release()
         device = x16.device
 
         g = torch.empty((n, nq + nk + nv), dtype=half, device=device)
@@ -680,7 +704,173 @@ class _QKVRope(torch.autograd.Function):
         grads = [grad_aq, grad_bq, grad_av, grad_bv]
         params = [m.weight for m in plan.lora_q + plan.lora_v]
         grads = [None if g_ is None else g_.to(p_.dtype) for g_, p_ in zip(grads, params)]
-        return (grad_x, *grads, None, None, None)
+        return (grad_x, *grads, None, None, None, None)
+
+
+def _recompute_mode():
+    value = os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "0").strip().lower()
+    if value in ("1", "true", "yes", "on", "all"):
+        return "all"
+    return "auto" if value == "auto" else None
+
+
+# SOUP_SOLUTION_RECOMPUTE_ATTN (see the module doc); `check` (tests): the recompute compares what it
+# rebuilds with clones of the forward's tensors and appends any difference to `mismatches`
+_RECOMPUTE = {"mode": _recompute_mode(),
+              "tokens": int(os.environ.get("SOUP_SOLUTION_RECOMPUTE_TOKENS", "640") or "640"),
+              "check": False, "mismatches": []}
+
+
+def _kept_bytes(plan, d):
+    """Bytes per token a fused attention layer keeps for its backward: (as before, with rmsnorm.py's
+    split sum, with the recompute). Common to all three: the layer's fp32 input (the input norm
+    keeps it) and h; then the post-attention norm's fp32 sum or its half branch, and the
+    attention's q, compact k and v, output and log-sum-exp."""
+    nq, nk = plan.bases[0].out_features, plan.bases[1].out_features
+    r = plan.lora_q[0].weight.shape[0]
+    attention = 2 * nq + 4 * nk + 2 * nq + 4 * plan.heads
+    common = 4 * d + 4 * r
+    return common + 4 * d + attention, common + 2 * d + attention, common
+
+
+def recompute_layers(plan, d, layers):
+    """How many layers, from layer 0, recompute their attention block in this step: none, all, or
+    (auto) the fewest that keep the step's attention memory at what a step of
+    SOUP_SOLUTION_RECOMPUTE_TOKENS tokens keeps without the recompute."""
+    mode = _RECOMPUTE["mode"]
+    if mode is None:
+        return 0
+    if mode == "all":
+        return layers
+    t0, n = _RECOMPUTE["tokens"], plan.n_tokens
+    if n <= t0:
+        return 0
+    from .rmsnorm import _SPLIT
+
+    plain, split, rebuilt = _kept_bytes(plan, d)
+    base = split if _SPLIT["keep"] else plain
+    return min(layers, math.ceil(layers * (n - t0) / (n * (1.0 - rebuilt / base))))
+
+
+def _recompute_for(attn, plan, x):
+    """An _AttnRecompute for this layer when it recomputes in this step, else None."""
+    if _RECOMPUTE["mode"] is None or not torch.is_grad_enabled():
+        return None
+    index = getattr(attn, "layer_idx", None)
+    layers = getattr(getattr(attn, "config", None), "num_hidden_layers", None)
+    if not isinstance(index, int) or not isinstance(layers, int):
+        return None
+    return _AttnRecompute(plan) if index < recompute_layers(plan, x.shape[-1], layers) else None
+
+
+class _AttnRecompute:
+    """One layer's attention block rebuilt in its backward (see the module doc). The forward hands
+    it what it starts from (_QKVRope: x16's source, h, the half adapters, the rotary tables; the
+    variable-length attention: cu_seqlens, max length, scale; then the o_proj output it stands for).
+    In the backward, the post-attention norm calls `branch()` (the o_proj output) and
+    `branch_done()`, the attention `attention_tensors()`, _QKVRope `take_x16()` and `release()`;
+    whichever comes first runs the rebuild (`_rebuild`). Holds the rebuilt tensors only from then
+    until their last user."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.source = self.x16 = self.h = self.b16 = self.cos = self.sin = None
+        self.cu = self.max_len = self.scale = None
+        self.armed = False  # the variable-length attention took it: it keeps nothing of its own
+        self.out_key = None
+        self.tensors = self.branch_out = None
+        self.check = {} if _RECOMPUTE["check"] else None
+
+    # forward
+    def qkv_taken(self, source, x16, h, b16, cos, sin):
+        self.source, self.h, self.b16, self.cos, self.sin = source, h, b16, cos, sin
+        self.x16 = x16 if source is None else None  # without a source, _QKVRope keeps x16 itself
+        if self.check is not None:
+            self.check["x16"] = x16.clone()
+
+    def attention_taken(self, cu, max_len, scale, q, k, v, out, lse):
+        self.cu, self.max_len, self.scale, self.armed = cu, max_len, scale, True
+        if self.check is not None:
+            self.check.update(q=_compact(q).clone(), k=_compact(k).clone(), v=_compact(v).clone(),
+                              out=out.clone(), lse=lse.clone())
+
+    def output_taken(self, out):
+        self.out_key = (out.data_ptr(), tuple(out.shape), out.dtype)
+        if self.check is not None:
+            self.check["branch"] = out.detach().reshape(-1, out.shape[-1]).clone()
+
+    def accepts(self, branch):
+        return self.armed and self.out_key == (branch.data_ptr(), tuple(branch.shape), branch.dtype)
+
+    # backward
+    def _rebuild(self, with_branch):
+        plan = self.plan
+        half, n = plan.half, plan.n_tokens
+        q_base, k_base, _ = plan.bases
+        nq, nk = q_base.out_features, k_base.out_features
+        x16 = self.x16 if self.x16 is not None else rebuild(self.source, half)
+        x16 = x16.view(n, -1)
+        w = _weights(plan.bases, half, x16.device)
+        qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
+        h, b16, r = self.h, self.b16, plan.lora_q[0].weight.shape[0]
+        h_q, h_v = (h[0], h[1]) if h.dim() == 3 else (h[:, :r], h[:, r:])
+        qkv[:, :nq].addmm_(h_q, b16[:nq].t(), alpha=plan.scaling)
+        qkv[:, nq + nk:].addmm_(h_v, b16[nq:].t(), alpha=plan.scaling)
+        q4 = _heads(torch.empty((n, nq), dtype=half, device=x16.device), n, plan.heads, plan.head_dim)
+        k4 = _heads(torch.empty((n, nk), dtype=half, device=x16.device), n, plan.kv_heads,
+                    plan.head_dim)
+        rope._launch(_heads(qkv[:, :nq], n, plan.heads, plan.head_dim),
+                     _heads(qkv[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim), q4, k4,
+                     self.cos, self.sin, backward=False)
+        v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
+        q, k, v = kernel_operands(q4, k4, v4, half)
+        out, lse, seed, offset = varlen_forward(q, k, v, self.cu, self.max_len, self.scale)
+        self.tensors = (_compact(q), _compact(k), _compact(v), out, lse, seed, offset)
+        self.x16 = x16
+        if with_branch:
+            o = out.reshape(n, plan.heads * plan.head_dim)
+            w = _weights((plan.o_base,), half, x16.device)
+            bias = _cached_bias(plan.o_base, (plan.o_base,), half)
+            self.branch_out = torch.addmm(bias, o, w.t()) if bias is not None else torch.mm(o, w.t())
+        if self.check is not None:
+            got = dict(zip(("q", "k", "v", "out", "lse"), self.tensors[:5]), x16=x16,
+                       branch=self.branch_out)
+            for name, value in got.items():
+                want = self.check.get(name)
+                if value is None or want is None:
+                    continue
+                if name == "lse" and value.dim() == 3 and value.shape[0] == len(plan.bounds) - 1:
+                    # (sequences, heads, aligned length): the entries past a sequence are unwritten
+                    same = all(torch.equal(value[i, :, :end - start], want[i, :, :end - start])
+                               for i, (start, end) in enumerate(zip(plan.bounds[:-1], plan.bounds[1:])))
+                elif name == "lse" and value.dim() == 3:  # one row of all tokens, aligned
+                    same = torch.equal(value[..., :plan.n_tokens], want[..., :plan.n_tokens])
+                else:
+                    same = torch.equal(value, want.view_as(value))
+                if not same:
+                    _RECOMPUTE["mismatches"].append(name)
+
+    def branch(self):
+        if self.branch_out is None:
+            self._rebuild(with_branch=True)
+        return self.branch_out
+
+    def branch_done(self):
+        self.branch_out = None
+
+    def attention_tensors(self):
+        if self.tensors is None:
+            self._rebuild(with_branch=False)
+        tensors, self.tensors = self.tensors, None
+        return tensors
+
+    def take_x16(self):
+        x16, self.x16 = self.x16, None
+        return x16
+
+    def release(self):
+        self.source = self.x16 = self.h = self.b16 = self.cos = self.sin = self.cu = None
+        self.tensors = self.branch_out = self.check = None
 
 
 class _Linear4bitHalf(torch.autograd.Function):
@@ -706,21 +896,31 @@ def _fused_attention(attn, x, position_embeddings, plan):
     a_q, b_q = plan.lora_q
     a_v, b_v = plan.lora_v
     cos, sin = position_embeddings
+    recompute = _recompute_for(attn, plan, x)
     query, key, value = _QKVRope.apply(x, a_q.weight, b_q.weight, a_v.weight, b_v.weight, cos, sin,
-                                       plan)
+                                       plan, recompute)
     dropout = 0.0 if not attn.training else attn.attention_dropout
     n = plan.n_tokens
-    out = packed_attention(query, key, value, plan.bounds, attn.scaling, dropout)  # (1, N, H, Dh)
+    out = packed_attention(query, key, value, plan.bounds, attn.scaling, dropout,
+                           recompute)  # (1, N, H, Dh)
     out = out.reshape(n, plan.heads * plan.head_dim)
     out = _Linear4bitHalf.apply(out, plan.o_base, _cached_bias(plan.o_base, (plan.o_base,), plan.half))
-    return out.view(1, n, -1)
+    out = out.view(1, n, -1)
+    if recompute is not None and recompute.armed:
+        # the post-attention norm (rmsnorm.post_attention_addends) finds it here and keeps the
+        # residual only; its backward gets this output again from the recompute
+        recompute.output_taken(out)
+        out._soup_recompute = recompute
+    return out
 
 
 # ---------------------------------------------------------------------------------------------
 # MLP
 
 
-_MLP_MEMORY = {"recompute": False}
+_MLP_MEMORY = {"recompute": False,
+               "inplace": os.environ.get("SOUP_SOLUTION_MLP_BWD_INPLACE", "0").strip().lower()
+               not in ("0", "false", "no", "")}
 
 
 def set_mlp_recompute(on):
@@ -872,7 +1072,11 @@ class _MLP(torch.autograd.Function):
             grad_x = _recompute_backward(plan, saved, grad_hidden, padded)
         else:
             gate_up = saved
-            grad_gate_up = torch.empty_like(gate_up)
+            # in place (SOUP_SOLUTION_MLP_BWD_INPLACE=1): the saved (gate|up) has no other reader
+            # after this backward (offload.py's unpack hands over a fresh copy and drops its own
+            # reference), and _swiglu_bwd loads every element before storing what it computes
+            # from it: one (2I, N) half buffer less at the start of the backward (36 KB per token)
+            grad_gate_up = gate_up if _MLP_MEMORY["inplace"] else torch.empty_like(gate_up)
             _swiglu_bwd(grad_hidden, gate_up, grad_gate_up, inter, padded)
             del grad_hidden
             grad_x = _gate_up_matmul(plan, grad_gate_up.t(), None, grad_gate_up)
@@ -942,6 +1146,11 @@ def patch_qwen2_mlp_fused():
         plan = _mlp_plan(self, x)
         if plan is None:
             return previous(self, x)
+        if self is _CTX["last_mlp"]:
+            from .offload import DRAIN_LAST, drain_inflight
+
+            if DRAIN_LAST and torch.is_grad_enabled():
+                drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 
     if "_soup_original_forward" not in vars(cls):

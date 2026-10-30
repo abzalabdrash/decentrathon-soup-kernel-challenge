@@ -60,7 +60,7 @@ _STATE = {
     "carry": _env_flag("SOUP_SOLUTION_CARRY_RESIDUAL", "1"),
     "tail_id": None,  # the tail's token id; None: the last real id (tests vary it)
 }
-_CTX = {"spans": None, "cu": None}
+_CTX = {"spans": None, "cu": None, "last_mlp": None}
 _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
 
 
@@ -68,12 +68,12 @@ _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
 def varlen(spans):
     """While active, Qwen2Attention runs causal attention within each of these (start, end) spans
     of the single packed sequence (and within the padding tail after the last span)."""
-    previous = _CTX["spans"], _CTX["cu"]
+    previous = _CTX["spans"], _CTX["cu"], _CTX["last_mlp"]
     _CTX["spans"] = spans
     try:
         yield
     finally:
-        _CTX["spans"], _CTX["cu"] = previous
+        _CTX["spans"], _CTX["cu"], _CTX["last_mlp"] = previous
 
 
 def pack_batch(input_ids, attention_mask):
@@ -140,6 +140,7 @@ def varlen_model_forward(model, input_ids, position_ids, spans):
         bounds = sequences(spans, n + pad)
         if bounds is not None and hidden.is_cuda:
             _cu_seqlens(bounds, hidden.device)  # here, before any layer's work is queued
+        _CTX["last_mlp"] = getattr(layers[-1], "mlp", None) if len(layers) else None
         for layer in layers:
             extra = {"_soup_branch": branch, "_soup_carry": True} if carry else {}
             out = layer(hidden, attention_mask=None, position_ids=position_ids,
@@ -204,26 +205,47 @@ def _compact(t):
     return t.clone(memory_format=torch.contiguous_format)
 
 
+def varlen_forward(q, k, v, cu, max_len, scale):
+    """(out, lse, seed, offset) of the kernel's forward for `_VarlenAttention`'s operands; also the
+    bit-for-bit recompute of fused_proj.py's attention recompute (the kernel's forward has no
+    atomics: the same operands give the same output and log-sum-exp)."""
+    groups = q.shape[2] // k.shape[2]
+    out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+        q, _expand_heads(k, groups), _expand_heads(v, groups), None, cu, cu, max_len, max_len,
+        0.0, _CAUSAL_FROM_TOP_LEFT, True, scale=scale)
+    return out, lse, seed, offset
+
+
 class _VarlenAttention(torch.autograd.Function):
     """q (1, N, Hq, D), k and v (1, N, Hkv, D), last dim contiguous -> causal attention within each
     sequence of `cu` (int32 boundaries), (1, N, Hq, D) contiguous. Saved: q, the compact k and v,
-    the output and the log-sum-exp (with dropout 0 the backward needs nothing else)."""
+    the output and the log-sum-exp (with dropout 0 the backward needs nothing else); or, given a
+    `recompute` object (fused_proj.py's attention recompute), nothing but `cu`: the backward asks
+    that object for the five tensors, which it rebuilds bit for bit."""
 
     @staticmethod
-    def forward(ctx, q, k, v, cu, max_len, scale):
+    def forward(ctx, q, k, v, cu, max_len, scale, recompute=None):
         groups = q.shape[2] // k.shape[2]
-        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
-            q, _expand_heads(k, groups), _expand_heads(v, groups), None, cu, cu, max_len, max_len,
-            0.0, _CAUSAL_FROM_TOP_LEFT, True, scale=scale)
-        ctx.save_for_backward(_compact(q), _compact(k), _compact(v), out, lse, cu)
+        out, lse, seed, offset = varlen_forward(q, k, v, cu, max_len, scale)
+        ctx.recompute = recompute
+        if recompute is None:
+            ctx.save_for_backward(_compact(q), _compact(k), _compact(v), out, lse, cu)
+        else:
+            recompute.attention_taken(cu, max_len, scale, q, k, v, out, lse)
+            ctx.save_for_backward(cu)
         ctx.args = (seed, offset, max_len, scale, groups)
         return out
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_out):
-        q, k, v, out, lse, cu = ctx.saved_tensors
         seed, offset, max_len, scale, groups = ctx.args
+        if ctx.recompute is None:
+            q, k, v, out, lse, cu = ctx.saved_tensors
+        else:
+            (cu,) = ctx.saved_tensors
+            q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
+            ctx.recompute = None
         grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
         grad_q, grad_k, grad_v, _ = torch.ops.aten._efficient_attention_backward(
             grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), None, out, cu, cu,
@@ -231,7 +253,7 @@ class _VarlenAttention(torch.autograd.Function):
         if groups > 1:  # the expansion's backward: the sum over each kv head's q heads
             grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
             grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
-        return grad_q, grad_k, grad_v, None, None, None
+        return grad_q, grad_k, grad_v, None, None, None, None
 
 
 def _sdpa_dtype(t):
@@ -280,17 +302,23 @@ def _per_row(query, key, value, bounds, scale, dropout):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
-def attention(query, key, value, bounds, scale, dropout=0.0):
+def kernel_operands(query, key, value, dtype):
+    """The kernel's token-major q, k, v from the projections' (1, H, N, D) views."""
+    q, k, v = (t.transpose(1, 2).to(dtype) for t in (query, key, value))
+    return tuple(t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+
+
+def attention(query, key, value, bounds, scale, dropout=0.0, recompute=None):
     """Causal attention within each packed sequence of `bounds` (see `sequences`): query
     (1, Hq, N, D), key and value (1, Hkv, N, D) as the projections leave them (any strides with
-    the head dim contiguous) -> (1, N, Hq, D) token-major, in the dtype SDPA would return."""
+    the head dim contiguous) -> (1, N, Hq, D) token-major, in the dtype SDPA would return.
+    `recompute`: fused_proj.py's attention recompute object; the variable-length path then keeps
+    nothing for the backward but asks it (the per-row loop ignores it and keeps its tensors)."""
     if not _varlen_ok(query, key, value, dropout):
         return _per_row(query, key, value, bounds, scale, dropout)
-    dtype = _sdpa_dtype(query)
-    q, k, v = (t.transpose(1, 2).to(dtype) for t in (query, key, value))
-    q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
+    q, k, v = kernel_operands(query, key, value, _sdpa_dtype(query))
     max_len = max(end - start for start, end in zip(bounds[:-1], bounds[1:]))
-    return _VarlenAttention.apply(q, k, v, _cu_seqlens(bounds, q.device), max_len, scale)
+    return _VarlenAttention.apply(q, k, v, _cu_seqlens(bounds, q.device), max_len, scale, recompute)
 
 
 def patch_qwen2_attention():
