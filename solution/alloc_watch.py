@@ -13,14 +13,19 @@ original train). It reads host-side counters only, no synchronization:
 - it logs the reserved MiB at train begin, after step 1, its maximum and at the end, how many steps
   ended with the pool smaller than its peak so far, and the allocator's retries (the release path)
   and segment unmaps during training;
-- with the guard (on unless SOUP_SOLUTION_ALLOC_GUARD=0), whenever the pool is more than
+- with the guard (SOUP_SOLUTION_ALLOC_GUARD=1, off by default), whenever the pool is more than
   GUARD_SLACK_MIB below torch.cuda.max_memory_reserved() (at train begin, after a setup transient;
   after any step; at train end), it maps that memory again: chunks are allocated until the pool is back at its peak, then
   freed, and the freed blocks stay cached (mapped). Training then takes its memory from those blocks.
   The guard never lowers what nvidia-smi sees, it only makes nvidia-smi see the peak that PyTorch
   reports; when nothing shrinks it does nothing.
 
-Switches: SOUP_SOLUTION_ALLOC_GUARD=0 (watch only), SOUP_SOLUTION_ALLOC_GUARD_SLACK_MIB.
+Measured on the T4 (diag run of the MLP recompute, no record_stream left in training): the pool only
+grows during training (592 MiB at train begin, 1384 after step 1, 2012 at the end; 86 segment maps,
+0 alloc retries, 0 segment frees, 0 syncs of all streams), so the guard stays off; the watch's line
+in the log shows whether that still holds.
+
+Switches: SOUP_SOLUTION_ALLOC_GUARD=1 (guard on), SOUP_SOLUTION_ALLOC_GUARD_SLACK_MIB.
 """
 
 import os
@@ -34,7 +39,7 @@ PAGE = 2 * MIB  # expandable segments map in 2 MiB pages; smaller requests go to
 
 
 def _guard_on():
-    return os.environ.get("SOUP_SOLUTION_ALLOC_GUARD", "1") not in ("0", "false", "no", "")
+    return os.environ.get("SOUP_SOLUTION_ALLOC_GUARD", "0") not in ("0", "false", "no", "")
 
 
 def _slack():
