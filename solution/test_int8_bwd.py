@@ -15,6 +15,7 @@ def int8_on():
 
     saved = int8_bwd._STATE["on"]
     int8_bwd._STATE["on"] = True
+    int8_bwd.compile_now()
     yield int8_bwd
     int8_bwd._STATE["on"] = saved
 
@@ -70,3 +71,27 @@ def test_mlp_backward_int8_close_to_fp16(int8_on, monkeypatch):
     err = _rel(dx8, dx16)
     print(f"\nint8 MLP backward: relative error of dL/dx against fp16 {err:.4f}")
     assert err < 0.05
+
+
+def test_takeover_after_start_calls(int8_on, monkeypatch):
+    """The first START_CALLS eligible backwards stay fp16 while a thread compiles the kernels; the
+    next one waits for it, so the switch point does not depend on timing."""
+    from types import SimpleNamespace
+
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=21).cuda()
+    plan = SimpleNamespace(gate=mlp.gate_proj, up=mlp.up_proj, down=mlp.down_proj,
+                           half=torch.float16)
+    monkeypatch.setattr(int8_on, "START_CALLS", 3)
+    monkeypatch.setitem(int8_on._STATE, "calls", 0)
+    monkeypatch.setitem(int8_on._STATE, "thread", None)
+    ready = int8_on._READY.is_set()
+    int8_on._READY.clear()
+    try:
+        assert not int8_on.usable(plan, 20)  # tokens % 8: never counted
+        assert [int8_on.usable(plan, 832) for _ in range(5)] == [False] * 3 + [True] * 2
+        assert int8_on._STATE["calls"] == 5 and not int8_on._STATE["thread"].is_alive()
+    finally:
+        if ready:
+            int8_on._READY.set()

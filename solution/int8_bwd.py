@@ -31,7 +31,9 @@ step and the eval do not change; the input gradient of the MLP gets int8 quantiz
 (measured against the fp16 backward in test_int8_bwd.py).
 """
 
+import atexit
 import os
+import threading
 
 import torch
 import triton
@@ -40,7 +42,14 @@ import triton.language as tl
 from . import nf4
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "0").strip().lower()
-          not in ("0", "false", "no", "")}
+          not in ("0", "false", "no", ""), "thread": None, "calls": 0}
+# The three kernels are compiled by a thread started at the first MLP backward, not by the warm-up
+# (the first step waits for it: five kernels there put the first step 1.5 s later on the T4). The
+# first START_CALLS MLP backwards of the run (four steps of the 28-layer model) take the fp16 path
+# meanwhile; the next one waits for the thread if it is not done, so which backwards run int8 never
+# depends on timing.
+START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_START_CALLS", "112"))
+_READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
 # SwiGLU backward: (features, tokens) tile and feature groups. bench_int8_mlp.py on the T4: 0.44 ms
@@ -167,9 +176,38 @@ def _decode_t(base, inv, out_i8, out_stride, row_offset):
         ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
 
 
+def _start_compile():
+    """The thread that compiles the kernels (once); the GIL is mostly free while the training waits
+    on the GPU, and the fp16 backward runs meanwhile."""
+    if _STATE["thread"] is not None:
+        return
+
+    def work():
+        try:
+            if _warm() is None:
+                _READY.set()
+        except Exception as exc:  # noqa: BLE001 - stay on the fp16 backward
+            print(f"[solution] int8 backward kernels not compiled ({type(exc).__name__}: {exc}); "
+                  "the fp16 backward stays", flush=True)
+
+    thread = threading.Thread(target=work, name="soup-int8-compile", daemon=True)
+    _STATE["thread"] = thread
+    thread.start()
+    atexit.register(thread.join, 120.0)  # never leave the interpreter while it compiles
+
+
+def compile_now():
+    """Compiles the kernels in the calling thread, so that the next eligible call takes the int8
+    path (tests and benchmarks)."""
+    if not _READY.is_set() and _warm() is None:
+        _READY.set()
+    _STATE["calls"] = max(_STATE["calls"], START_CALLS)
+
+
 def usable(plan, tokens):
-    """Whether the int8 path takes this MLP backward: CUDA int8 GEMMs exist, the weights are NF4 in
-    nf4.py's layout, the shapes meet `_int_mm` (more than 16 rows, K and N multiples of 8)."""
+    """Whether the int8 path takes this MLP backward: switched on, the weights are NF4 in nf4.py's
+    layout, the shapes meet `_int_mm` (more than 16 rows, K and N multiples of 8) and the kernels'
+    tiles, START_CALLS such backwards ran before (the kernels compile meanwhile)."""
     if not _STATE["on"] or tokens <= 16 or tokens % 8:
         return False
     for base in (plan.gate, plan.up, plan.down):
@@ -178,8 +216,16 @@ def usable(plan, tokens):
         if not nf4._fast_path(base.weight.data, base.weight.quant_state, plan.half):
             return False
     inter = plan.gate.out_features
-    return (plan.down.in_features % 8 == 0 and plan.down.out_features % 8 == 0
-            and inter % (GROUPS * TILE_I) == 0 and (2 * inter) % TQ_R == 0)
+    if not (plan.down.in_features % 8 == 0 and plan.down.out_features % 8 == 0
+            and inter % (GROUPS * TILE_I) == 0 and (2 * inter) % TQ_R == 0):
+        return False
+    _STATE["calls"] += 1
+    if not _READY.is_set():
+        _start_compile()
+        if _STATE["calls"] <= START_CALLS:
+            return False
+        _STATE["thread"].join()
+    return _READY.is_set()
 
 
 def mlp_backward(plan, gate_up, grad16, buffer):
