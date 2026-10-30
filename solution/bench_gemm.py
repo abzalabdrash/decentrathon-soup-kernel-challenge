@@ -278,7 +278,7 @@ def bench_m(m, iters, rounds, libraries):
                     if fn() is None:
                         continue
                     label = f"{library}/{form}"
-                    row["variants"][label] = {"kernels": [_short(k) for k in kernel_names(fn)]}
+                    row["variants"][label] = {}
                     candidates.append((library, fn))
                     where.append((len(rows), label, gemm.flops))
         rows.append(row)
@@ -302,7 +302,13 @@ def bench_m(m, iters, rounds, libraries):
     pair_fns = [fwd_pair[0], fwd_pair[1], bwd_seq, bwd_conc_add]
     timed = time_interleaved(candidates + [("default", fn) for fn in pair_fns], iters, rounds)
     for (row_index, label, flops), (us, clock) in zip(where, timed):
-        rows[row_index]["variants"][label].update(us=us, tflops=flops / us / 1e6, clock=clock)
+        rows[row_index]["variants"][label].update(us=us, tflops=flops / us / 1e6, clock=clock,
+                                                  mcycles=us * clock / 1e3 if clock else None)
+    # the kernel names in a pass of their own, after the timing (profiling between the timed
+    # rounds would stall the card)
+    for (library, fn), (row_index, label, _) in zip(candidates, where):
+        with blas(library):
+            rows[row_index]["variants"][label]["kernels"] = [_short(k) for k in kernel_names(fn)]
     pair_times = [us for us, _ in timed[len(candidates):]]
     pairs = {"gate|up fwd": (pair_times[0], pair_times[1]),
              "gate|up bwd (two outputs + add)": (pair_times[2], pair_times[3])}
@@ -336,6 +342,23 @@ def report(results):
         for name, (seq, conc) in pairs.items():
             print(f"two streams, {name}: {seq:.0f} us one after the other, {conc:.0f} us concurrently "
                   f"({100 * (1 - conc / seq):+.0f}%)")
+        if all(v.get("mcycles") for r in rows for v in r["variants"].values()):
+            print("\nclock-normalized (Mcycles per call = us x SM MHz / 1e3: the kernels' work at equal clock, "
+                  "the card being power-limited under these loads); best marked *:\n")
+            print("| GEMM | " + " | ".join(variants) + " |")
+            print("|---|" + "---|" * len(variants))
+            totals = dict.fromkeys(variants, 0.0)
+            for r in rows:
+                vs = r["variants"]
+                base = vs["default/as_trained"]["mcycles"]
+                win = min(vs, key=lambda v: vs[v]["mcycles"])
+                for v in variants:
+                    totals[v] += vs[v]["mcycles"] if v in vs else base
+                print(f"| {r['gemm']} | " + " | ".join(
+                    f"{vs[v]['mcycles']:.2f}{'*' if v == win else ''} ({100 * (1 - vs[v]['mcycles'] / base):+.0f}%)"
+                    if v in vs else "" for v in variants) + " |")
+            base = totals["default/as_trained"]
+            print("| layer | " + " | ".join(f"{t:.2f} ({100 * (1 - t / base):+.0f}%)" for t in totals.values()) + " |")
         print("\nkernels (default / cublaslt, as trained):")
         for r in rows:
             for lib in ("default", "cublaslt"):
@@ -359,11 +382,11 @@ def main():
           f"{torch.backends.cuda.preferred_blas_library()} by default, "
           f"fp16 reduced-precision reduction {torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction}")
     results = {m: bench_m(m, args.iters, args.rounds, args.libraries) for m in args.m}
-    report(results)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump({str(m): {"rows": rows, "pairs": pairs} for m, (rows, pairs) in results.items()}, f,
                       indent=1)
+    report(results)
 
 
 if __name__ == "__main__":
