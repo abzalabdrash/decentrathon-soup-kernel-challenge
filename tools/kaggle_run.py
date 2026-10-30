@@ -80,10 +80,16 @@ def inject_token_fallback(cell):
     return False
 
 
-def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1):
+def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=()):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
+    if env:  # experiment switches for solution.apply(); the measured subprocesses inherit os.environ
+        lines = ["import os\n"] + [f"os.environ[{k!r}] = {v!r}\n" for k, v in env]
+        for cell in code_cells:
+            if "harness/run_task.py" in "".join(cell["source"]):
+                cell["source"] = lines + cell["source"]
+                break
     # cell 1: REPO_URL / COMMIT
     code_cells[0]["source"] = [f'REPO_URL = "{repo_url}"  # your repository\n',
                                f'COMMIT = "{commit}"  # the commit you submit; empty = the default branch\n']
@@ -211,6 +217,8 @@ def main():
     parser.add_argument("--public", action="store_true", help="make the kernel public (for the submission)")
     parser.add_argument("--accelerator", default="NvidiaTeslaT4")
     parser.add_argument("--timeout", type=int, default=5400, help="max run time in seconds")
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                        help="environment variable for the measured runs (repeatable), e.g. SOUP_SOLUTION_UNPAD=0")
     parser.add_argument("--repeats", type=int, default=1,
                         help="run_task.py --repeats N (the jury uses 2: base, solution, solution, base)")
     parser.add_argument("--poll", type=int, default=30)
@@ -236,7 +244,8 @@ def main():
     push_dir.mkdir(parents=True, exist_ok=True)
     nb_name = f"{args.slug}.ipynb"
     (push_dir / nb_name).write_text(
-        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats),
+        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
+                                  [tuple(e.split("=", 1)) for e in args.env]),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
