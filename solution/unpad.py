@@ -60,7 +60,7 @@ _STATE = {
     "carry": _env_flag("SOUP_SOLUTION_CARRY_RESIDUAL", "1"),
     "tail_id": None,  # the tail's token id; None: the last real id (tests vary it)
 }
-_CTX = {"spans": None, "cu": None}
+_CTX = {"spans": None, "cu": None, "last_mlp": None}
 _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
 
 
@@ -68,12 +68,12 @@ _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
 def varlen(spans):
     """While active, Qwen2Attention runs causal attention within each of these (start, end) spans
     of the single packed sequence (and within the padding tail after the last span)."""
-    previous = _CTX["spans"], _CTX["cu"]
+    previous = _CTX["spans"], _CTX["cu"], _CTX["last_mlp"]
     _CTX["spans"] = spans
     try:
         yield
     finally:
-        _CTX["spans"], _CTX["cu"] = previous
+        _CTX["spans"], _CTX["cu"], _CTX["last_mlp"] = previous
 
 
 def pack_batch(input_ids, attention_mask):
@@ -140,6 +140,7 @@ def varlen_model_forward(model, input_ids, position_ids, spans):
         bounds = sequences(spans, n + pad)
         if bounds is not None and hidden.is_cuda:
             _cu_seqlens(bounds, hidden.device)  # here, before any layer's work is queued
+        _CTX["last_mlp"] = getattr(layers[-1], "mlp", None) if len(layers) else None
         for layer in layers:
             extra = {"_soup_branch": branch, "_soup_carry": True} if carry else {}
             out = layer(hidden, attention_mask=None, position_ids=position_ids,

@@ -405,15 +405,39 @@ class Offloader:
                 f"of them layer inputs {s['residuals']}")
 
 
+_ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
+# SOUP_SOLUTION_OFFLOAD_DRAIN_LAST=1: the last layer's MLP forward first lets the copies still in
+# flight finish (drain_inflight), so the previous layer's (gate|up) is not alive next to its own
+DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().lower() not in (
+    "0", "false", "no", "")
+
+
+def drain_inflight():
+    """The compute stream waits (on the GPU) for every D2H copy still in flight and their GPU
+    tensors are dropped: their blocks go back to the allocator for what the stream does next."""
+    offloader = _ACTIVE["offloader"]
+    if offloader is None:
+        return
+    with offloader.lock:
+        while offloader.inflight:
+            oldest = offloader.inflight.popleft()
+            oldest.home.wait_event(oldest.copied)
+            oldest.gpu = None
+            offloader.stats["drained"] += 1
+
+
 @contextlib.contextmanager
 def offload_saved_tensors(**knobs):
     """While active, large saved activations live in pinned host memory between the forward and
     the backward. Yields the Offloader (stats, summary())."""
     offloader = Offloader(**knobs)
+    previous = _ACTIVE["offloader"]
+    _ACTIVE["offloader"] = offloader
     try:
         with torch.autograd.graph.saved_tensors_hooks(offloader.pack, offloader.unpack):
             yield offloader
     finally:
+        _ACTIVE["offloader"] = previous
         offloader.close()
 
 

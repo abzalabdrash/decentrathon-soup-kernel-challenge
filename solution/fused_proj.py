@@ -1146,6 +1146,11 @@ def patch_qwen2_mlp_fused():
         plan = _mlp_plan(self, x)
         if plan is None:
             return previous(self, x)
+        if self is _CTX["last_mlp"]:
+            from .offload import DRAIN_LAST, drain_inflight
+
+            if DRAIN_LAST and torch.is_grad_enabled():
+                drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 
     if "_soup_original_forward" not in vars(cls):
