@@ -57,7 +57,7 @@ to record_stream.
 Residual offload (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1, night task N1b): the decoder layers' fp32
 inputs, which the input norms keep for their backward (6 KB per token per layer, 228 MiB over the
 layers of a 1,440-token step once the attention recompute has removed the rest), go to host memory
-too. rmsnorm.py arms the one tensor to take (`residual_saved`) around its save_for_backward, so no
+too. rmsnorm.py marks the one tensor to take (`mark_residual`) before its save_for_backward, so no
 other fp32 tensor is ever touched; each layer then saves two tensors (its input, then its gate|up),
 both windows grow by one, and the input stays on the GPU after its first unpack until its last user
 (the post-attention norm, the x16 rebuild and the input norm read it in the same layer's backward).
@@ -95,25 +95,23 @@ HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 HALF_DTYPES = (torch.float16, torch.bfloat16)
 RESIDUAL_MIN_NUMEL = 256 * 1024  # an armed fp32 residual below this (170 tokens) stays on the GPU
 
-# SOUP_SOLUTION_OFFLOAD_RESIDUAL (see the module doc): `armed` is the data pointer of the fp32
-# residual whose save_for_backward is running (residual_saved), None otherwise
+# SOUP_SOLUTION_OFFLOAD_RESIDUAL (see the module doc): `marked` holds the data pointers of fp32
+# layer inputs that a custom Function is saving (mark_residual); the pack hook takes the mark. A
+# Python Function's saved tensors are packed after its forward returns, so the mark has to outlive
+# the save_for_backward call; a mark nobody takes (no graph) only means one fp32 tensor at that
+# address may later go to host too, which is still correct
 _RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "0").strip().lower()
-             not in ("0", "false", "no", ""), "armed": None}
+             not in ("0", "false", "no", ""), "marked": set()}
 
 
-@contextlib.contextmanager
-def residual_saved(tensor):
-    """While active, an Offloader takes `tensor` (an fp32 layer input being saved for the
-    backward) to host memory like the MLP's activations (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1)."""
-    if not _RESIDUAL["on"]:
-        yield
-        return
-    previous = _RESIDUAL["armed"]
-    _RESIDUAL["armed"] = tensor.data_ptr()
-    try:
-        yield
-    finally:
-        _RESIDUAL["armed"] = previous
+def mark_residual(tensor):
+    """An active Offloader takes `tensor` (an fp32 layer input about to be saved for the backward)
+    to host memory like the MLP's activations (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1)."""
+    if _RESIDUAL["on"]:
+        marked = _RESIDUAL["marked"]
+        if len(marked) > 64:  # marks never taken (no graph): forget them
+            marked.clear()
+        marked.add(tensor.data_ptr())
 
 # Slabs pinned ahead of time by prepin(), taken by the stack before it pins one itself; while a
 # prepin thread is still working the stack waits for its next slab instead of pinning one more.
@@ -281,9 +279,11 @@ class Offloader:
             return self._offload(tensor)
 
     def _pack_residual(self, tensor):
-        armed = _RESIDUAL["armed"]
-        if (armed is None or tensor.data_ptr() != armed or not tensor.is_cuda
-                or not tensor.is_contiguous()
+        marked = _RESIDUAL["marked"]
+        if not marked or tensor.data_ptr() not in marked:
+            return tensor
+        marked.discard(tensor.data_ptr())
+        if (not tensor.is_cuda or not tensor.is_contiguous()
                 or not RESIDUAL_MIN_NUMEL <= tensor.numel() <= MAX_NUMEL // 2):
             return tensor
         storage = tensor.untyped_storage()

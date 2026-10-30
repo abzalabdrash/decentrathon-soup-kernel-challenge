@@ -361,11 +361,14 @@ class AddRMSNormFunction(torch.autograd.Function):
         ctx.residual_node = _input_norm_node(residual) if addends is not None else None
         kept = s if addends is None else (None if ctx.residual_node is not None else r2)
         extra = (b2,) if addends is KEEP_BRANCH else ()
-        with _offloaded(kept if offload else None):
-            if ctx.residual_node is not None:
-                ctx.save_for_backward(weight, rstd, *extra)
-            else:
-                ctx.save_for_backward(kept, weight, rstd, *extra)
+        if offload and kept is not None:
+            from .offload import mark_residual
+
+            mark_residual(kept)  # taken by offload.py's pack hook when the forward returns
+        if ctx.residual_node is not None:
+            ctx.save_for_backward(weight, rstd, *extra)
+        else:
+            ctx.save_for_backward(kept, weight, rstd, *extra)
         ctx.shape = residual.shape
         ctx.dtypes = (residual.dtype, branch.dtype)
         return s.view(residual.shape), y.view(residual.shape)
@@ -413,17 +416,6 @@ def _input_norm_node(residual):
             and getattr(node, "addends", 0) is None):
         return node
     return None
-
-
-def _offloaded(tensor):
-    """offload.residual_saved(tensor) when the residual offload is on (offload.py), else nothing."""
-    import contextlib
-
-    if tensor is None:
-        return contextlib.nullcontext()
-    from .offload import residual_saved
-
-    return residual_saved(tensor)
 
 
 def rmsnorm(x, weight, eps):
