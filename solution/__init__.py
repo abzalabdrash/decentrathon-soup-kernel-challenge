@@ -23,7 +23,9 @@ Modules:
 - warmup.py: the kernels compiled by a helper process during apply(), loaded by a background
   thread while Soup loads the model;
 - startup.py: apply()'s imports without work the run does not use (trl's second metadata scan,
-  scikit-learn, wandb); a first-step phase mark; a profile of the trainer build (diagnostics);
+  scikit-learn, wandb, bitsandbytes' Inductor), the imported objects frozen for the garbage
+  collector, the tokenizer hashed fast by datasets in Soup's setup; a first-step phase mark; a
+  profile of the trainer build (diagnostics);
 - phases.py: wall-clock marks of the run's phases in the log;
 - diag.py: diagnostics of a run (SOUP_SOLUTION_DIAG=1 only): memory at the marks, a PCIe probe,
   an allocation snapshot of one step, a chrome trace of two steps.
@@ -32,7 +34,7 @@ Switches (environment, for experiments): SOUP_SOLUTION_CE_CHUNK (rows of logits 
 512), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0, SOUP_SOLUTION_RMSNORM=0,
 SOUP_SOLUTION_NF4=0, SOUP_SOLUTION_ROPE=0, SOUP_SOLUTION_FUSED_PROJ=0, SOUP_SOLUTION_MLP_MEMORY=
 offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOTS=2), SOUP_SOLUTION_WARMUP=0,
-SOUP_SOLUTION_IMPORT_DIET=0; diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
+SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0; diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
 import os
@@ -101,9 +103,12 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
-    from .startup import patch_soup_first_step_mark, patch_soup_startup_profile
+    from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
+                          patch_soup_startup_profile)
 
     patch_soup_first_step_mark()
+    if _on("SOUP_SOLUTION_DATASET_HASH"):
+        patch_soup_dataset_hashing()  # datasets hashes the tokenizer in 0.09 s instead of 1 s
     if os.environ.get("SOUP_SOLUTION_PROFILE_STARTUP", "0") not in ("0", "false", "no", ""):
         patch_soup_startup_profile()  # off by default: cProfile of the trainer build, see startup.py
     if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):
@@ -116,4 +121,8 @@ def apply():
         watch_compiles()  # logs any kernel compiled or loaded outside the warm-up
         patch_soup_warmup(start_in_setup=False)
         start_background_warmup()  # waits for the helper, then loads its kernels from the cache
+    if _on("SOUP_SOLUTION_IMPORT_DIET"):
+        from .startup import freeze_imported_objects
+
+        freeze_imported_objects()  # later full garbage collections skip the imported objects
     mark("apply end")

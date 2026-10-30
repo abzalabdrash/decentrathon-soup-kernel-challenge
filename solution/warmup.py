@@ -258,11 +258,14 @@ def warm_nf4():
                    num_warps=4, enable_fp_fusion=False)
 
 
-def _rope(backward):
-    # q (1, 12, N, 128) and k (1, 2, N, 128) are transposed views of the fp32 projections: strides
+def _rope(backward, dtype):
+    # q (1, 12, N, 128) and k (1, 2, N, 128) are transposed views of the projections: strides
     # (N * 1536, 128, 1536) and (N * 256, 128, 256), all multiples of 16 for any N; the outputs keep
     # them; cos and sin fp32 (1, N, 128) with the batch stride passed as 0. The backward's gradients
     # come contiguous, (12 * N * 128, N * 128, 128): also all "D". n_tokens is not specialized.
+    # fused_proj.py launches it on views of its half qkv buffer, (N * 2048, 128, 2048) and the like:
+    # the same classes, with q, k and the outputs in the half dtype (`dtype`); rope.py's own
+    # attention path in fp32.
     import torch
 
     from .rope import BLOCK_TOKENS, NUM_WARPS, rope_qk_kernel
@@ -276,7 +279,8 @@ def _rope(backward):
         k_in = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
     q_out = (n * HIDDEN, HEAD_DIM, HIDDEN)
     k_out = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
-    compile_kernel(rope_qk_kernel, f32, f32, f32, f32, f32, f32, *q_in, *k_in, *q_out, *k_out,
+    compile_kernel(rope_qk_kernel, dtype, dtype, dtype, dtype, f32, f32,
+                   *q_in, *k_in, *q_out, *k_out,
                    0, HEAD_DIM, n, Q_HEADS,
                    HALF=HEAD_DIM // 2, BLOCK_N=BLOCK_TOKENS, BACKWARD=backward,
                    num_warps=NUM_WARPS)
@@ -286,8 +290,14 @@ def _rope(backward):
 def warm_rope():
     if not _switched_on("SOUP_SOLUTION_ROPE"):
         return SKIPPED
-    _rope(backward=False)
-    _rope(backward=True)
+    import torch
+
+    dtypes = [torch.float32]
+    if _switched_on("SOUP_SOLUTION_FUSED_PROJ"):
+        dtypes.insert(0, training_half_dtype())  # fused_proj.py's launches, first
+    for dtype in dtypes:
+        _rope(backward=False, dtype=dtype)
+        _rope(backward=True, dtype=dtype)
 
 
 @register(name="example_swiglu_fwd_kernel")

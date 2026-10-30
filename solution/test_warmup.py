@@ -198,6 +198,47 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
     assert compiles == []
 
 
+def _fused_rope_calls(n):
+    """rope.py's kernel launched as fused_proj.py launches it: q and k views of the half qkv buffer
+    (N, 2048) into half (N, 1536) and (N, 256) outputs, fp32 cos / sin; then the backward from
+    contiguous gradients into views of the (N, 2304) gradient buffer."""
+    from solution import rope
+    from solution.fused_proj import _heads
+
+    half = torch.float16
+    qkv = torch.randn(n, 2048, device="cuda", dtype=half)
+    cos = torch.randn(1, n, 128, device="cuda")
+    sin = torch.randn(1, n, 128, device="cuda")
+    q4 = _heads(torch.empty(n, 1536, dtype=half, device="cuda"), n, 12, 128)
+    k4 = _heads(torch.empty(n, 256, dtype=half, device="cuda"), n, 2, 128)
+    rope._launch(_heads(qkv[:, :1536], n, 12, 128), _heads(qkv[:, 1536:1792], n, 2, 128), q4, k4,
+                 cos, sin, backward=False)
+    g = torch.empty(n, 2304, dtype=half, device="cuda")
+    rope._launch(torch.randn(1, 12, n, 128, device="cuda", dtype=half),
+                 torch.randn(1, 2, n, 128, device="cuda", dtype=half),
+                 _heads(g[:, :1536], n, 12, 128), _heads(g[:, 1536:1792], n, 2, 128), cos, sin,
+                 backward=True)
+
+
+def test_fused_proj_rope_launches_compile_nothing_after_warmup(fresh, monkeypatch):
+    """The half RoPE of fused_proj.py's attention (the one-layer model of the test above takes
+    rope.py's fp32 path on this card; on the T4 the real step takes this one)."""
+    from solution import rope
+
+    monkeypatch.delenv("SOUP_SOLUTION_ROPE", raising=False)
+    monkeypatch.delenv("SOUP_SOLUTION_FUSED_PROJ", raising=False)
+    _builtin_warmups(fresh, monkeypatch)
+    compiles = fresh.watch_compiles(log=False)
+    rope.rope_qk_kernel.device_caches.clear()
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(300)
+    assert not fresh.warmup_report()["errors"]
+    compiles.clear()
+    for n in (832, 640, 1424):  # packed batches, padded to a multiple of 16
+        _fused_rope_calls(n)
+    assert compiles == []
+
+
 def test_helper_process_compiles_for_this_one(tmp_path):
     """bench_warmup.py helper in a fresh process with an empty triton cache: the helper (no GPU,
     no CUDA context) compiles, and every kernel the in-process warm-up then meets is read from the
