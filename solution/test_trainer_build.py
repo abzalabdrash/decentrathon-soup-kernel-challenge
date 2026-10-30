@@ -262,3 +262,35 @@ def test_early_rows_not_for_changed_tokenizer(tokenizer, tmp_path):
         assert fr is not early.format_row
     finally:
         undo()
+
+
+def test_early_probes_serve_same_answers(monkeypatch):
+    """SOUP_SOLUTION_EARLY_PROBES: entry_points() and accelerate's P2P check answered from the probe
+    thread give what the calls give, and only while a run's probes exist and sys.path is unchanged."""
+    import importlib.metadata as metadata
+
+    accelerate_state = pytest.importorskip("accelerate.state")
+    saved_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    saved_flag = trainer_build._PROBES["patched"]
+    trainer_build._PROBES["patched"] = False
+    try:
+        trainer_build._patch_probes()
+        assert metadata.entry_points is not saved_ep
+        expected_all = saved_ep()
+        expected_group = saved_ep(group="console_scripts")
+        # no probes: the originals
+        assert trainer_build._PROBES["current"] is None
+        assert sorted(metadata.entry_points(group="console_scripts")) == sorted(expected_group)
+        probes = trainer_build._Probes()
+        probes._work()
+        trainer_build._PROBES["current"] = probes
+        assert probes.entry_points == expected_all
+        assert metadata.entry_points(group="console_scripts") == expected_group
+        assert accelerate_state.check_cuda_p2p_ib_support() == probes.p2p
+        monkeypatch.setattr(sys, "path", sys.path + ["/nonexistent-soup-test-dir"])
+        assert metadata.entry_points(group="console_scripts") == expected_group  # the original again
+    finally:
+        trainer_build._PROBES["current"] = None
+        metadata.entry_points = saved_ep
+        accelerate_state.check_cuda_p2p_ib_support = saved_p2p
+        trainer_build._PROBES["patched"] = saved_flag

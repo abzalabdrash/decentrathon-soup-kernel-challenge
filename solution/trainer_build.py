@@ -44,6 +44,19 @@ chat-template override, prompt strategy or vocabulary expansion, a tokenizer wit
 Soup changes nothing in it after the load), and the tokenizer's vocabulary size, template and special
 tokens must be unchanged when the result is used; otherwise, or if the thread failed, Soup's call runs
 as usual (and raises what it raises).
+
+SOUP_SOLUTION_EARLY_PROBES=1: two lookups on the way to the first step that wait without working,
+moved under the model load on a thread of this process, with the same result handed over: accelerate's
+check for old RTX 4000 cards without P2P (`check_cuda_p2p_ib_support`, accelerate/utils/environment.py,
+called by its first PartialState while Soup builds TrainingArguments), which runs `nvidia-smi
+--query-gpu=count,name` and waits for it (~75 ms on the T4 with ~5% CPU in the main thread); and
+`importlib.metadata.entry_points()`, which Soup's plugin discovery calls at the start of train()
+(soup_cli/plugins/__init__.py:193): a read of every installed distribution's entry points (~70 ms on
+Kaggle). Started with the tokenizer load inside Soup's setup (as EARLY_ROWS); the entry points are
+served (a select on the same immutable EntryPoints object) only while sys.path is the one they were
+read with, until Soup's train() returns. Nothing is installed during a run (the rules forbid it; the
+harness compares `pip freeze`), and the GPUs do not change, so the answers are the ones the calls
+would give later; the organizers allow the same for packages_distributions().
 """
 
 import dis
@@ -320,9 +333,10 @@ def _early_masks(original):
     return _ensure_assistant_masks
 
 
-def _install_early(wrapper, args, kwargs):
-    """For one Soup setup: the hook that starts the thread once the tokenizer is loaded, and Soup's
-    two calls that take its results. Returns the undo function (None when not installed)."""
+def _install_early(wrapper, args, kwargs, rows=True, probes=False):
+    """For one Soup setup: the hook that starts the threads once the tokenizer is loaded (the rows
+    with `rows`, the probes with `probes`), and Soup's calls that take the rows' results. Returns
+    the undo function (None when not installed)."""
     try:
         import transformers
         from soup_cli.data import sft_format
@@ -344,10 +358,13 @@ def _install_early(wrapper, args, kwargs):
     def from_pretrained(cls, *a, **k):
         tokenizer = loader.__func__(cls, *a, **k)
         if _EARLY["current"] is early:
-            try:
-                early.start(tokenizer)
-            except Exception:  # noqa: BLE001 - Soup tokenizes itself then
-                pass
+            if probes:
+                _start_probes(tokenizer)
+            if rows:
+                try:
+                    early.start(tokenizer)
+                except Exception:  # noqa: BLE001 - Soup tokenizes itself then
+                    pass
         return tokenizer
 
     from_pretrained._soup_original = loader
@@ -372,6 +389,94 @@ def _install_early(wrapper, args, kwargs):
             soup_sft._ensure_assistant_masks = masks
 
     return undo
+
+
+# ---------------------------------------------------------------- SOUP_SOLUTION_EARLY_PROBES
+
+_PROBES = {"current": None, "patched": False}
+
+
+class _Probes:
+    def __init__(self):
+        self.entry_points = self.sys_path = self.p2p = None
+        self.p2p_function = None
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._work, name="solution-early-probes", daemon=True)
+
+    def _work(self):
+        try:
+            import importlib.metadata as metadata
+
+            self.sys_path = tuple(sys.path)
+            self.entry_points = getattr(metadata.entry_points, "_soup_original", metadata.entry_points)()
+        except Exception:  # noqa: BLE001
+            self.entry_points = None
+        try:
+            from accelerate.utils import environment
+
+            self.p2p = bool(environment.check_cuda_p2p_ib_support())
+        except Exception:  # noqa: BLE001
+            self.p2p = None
+        self.done.set()
+
+
+def _probe_entry_points(original):
+    def entry_points(**params):
+        probes = _PROBES["current"]
+        if probes is not None and probes.done.wait(5.0) and probes.entry_points is not None \
+                and probes.sys_path == tuple(sys.path):
+            try:
+                return probes.entry_points.select(**params)
+            except Exception:  # noqa: BLE001
+                pass
+        return original(**params)
+
+    entry_points._soup_original = original
+    return entry_points
+
+
+def _probe_p2p(original):
+    def check_cuda_p2p_ib_support():
+        probes = _PROBES["current"]
+        if probes is not None and probes.done.wait(5.0) and probes.p2p is not None:
+            return probes.p2p
+        return original()
+
+    check_cuda_p2p_ib_support._soup_original = original
+    return check_cuda_p2p_ib_support
+
+
+def _patch_probes():
+    """The two calls, served from the probes while a run has them (otherwise the originals)."""
+    if _PROBES["patched"]:
+        return
+    try:
+        import importlib.metadata as metadata
+
+        import accelerate.state as accelerate_state
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(metadata.entry_points, "_soup_original", None) is None:
+        metadata.entry_points = _probe_entry_points(metadata.entry_points)
+    current = getattr(accelerate_state, "check_cuda_p2p_ib_support", None)
+    if callable(current) and getattr(current, "_soup_original", None) is None:
+        accelerate_state.check_cuda_p2p_ib_support = _probe_p2p(current)
+    _PROBES["patched"] = True
+
+
+def _start_probes(tokenizer):
+    try:
+        import torch
+        from transformers import PreTrainedTokenizerBase
+
+        if _PROBES["current"] is not None or not isinstance(tokenizer, PreTrainedTokenizerBase) \
+                or not torch.cuda.is_available():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    probes = _Probes()
+    _PROBES["current"] = probes
+    probes.thread.start()
 
 
 # ---------------------------------------------------------------- scoping
@@ -419,10 +524,12 @@ def install():
 
 
 def patch_soup_trainer_build():
-    """SFTTrainerWrapper.setup runs with the replacements of the switches that are on, and with the
-    early tokenization (SOUP_SOLUTION_EARLY_ROWS); none by default: then nothing is wrapped."""
+    """SFTTrainerWrapper.setup runs with the replacements of the switches that are on, the early
+    tokenization (SOUP_SOLUTION_EARLY_ROWS) and the early probes (SOUP_SOLUTION_EARLY_PROBES, which
+    last until train() returns); none by default: then nothing is wrapped."""
     early = _flag("SOUP_SOLUTION_EARLY_ROWS")
-    if not _replacements() and not early:
+    probes = _flag("SOUP_SOLUTION_EARLY_PROBES")
+    if not _replacements() and not early and not probes:
         return
     from soup_cli.trainer import sft as soup_sft
 
@@ -430,10 +537,13 @@ def patch_soup_trainer_build():
     if getattr(cls, "_soup_trainer_build", False):
         return
     original_setup = cls.setup
+    original_train = cls.train
+    if probes:
+        _patch_probes()
 
     def setup(self, *args, **kwargs):
         undo = install()
-        undo_early = _install_early(self, args, kwargs) if early else None
+        undo_early = _install_early(self, args, kwargs, rows=early, probes=probes) if (early or probes) else None
         try:
             return original_setup(self, *args, **kwargs)
         finally:
@@ -441,5 +551,13 @@ def patch_soup_trainer_build():
                 undo_early()
             undo()
 
+    def train(self, *args, **kwargs):
+        try:
+            return original_train(self, *args, **kwargs)
+        finally:
+            _PROBES["current"] = None  # the probes serve this run's setup and the start of train only
+
     cls.setup = setup
+    if probes:
+        cls.train = train
     cls._soup_trainer_build = True
