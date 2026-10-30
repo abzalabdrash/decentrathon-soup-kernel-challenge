@@ -103,7 +103,10 @@ EXIT_TIMEOUT = 60.0  # seconds the interpreter's exit waits for the warm-up thre
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
 # 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
 # about 1 s of its time in every case. One core is left to the main thread.
-WORKERS = max(1, min(3, (os.cpu_count() or 2) - 1))
+# 2 workers by default: T15c's variants session on the T4 (soup-t15, 3f5b14c, means of 2 rounds)
+# put the first step at +9.73 s from apply begin with 2 against +10.46 s with 3 (4 vCPUs: the third
+# worker competes with the main thread's model load)
+WORKERS = max(1, min(2, (os.cpu_count() or 2) - 1))
 VOCAB = 151936  # Qwen2.5's vocabulary: V and stride_row of the fused head (divisible by 16)
 INTERMEDIATE = 8960  # Qwen2.5-1.5B's MLP width: 16 * 560
 TOKENS = 826  # a typical packed batch; only its class matters (tokens * 8960 is always "D")
