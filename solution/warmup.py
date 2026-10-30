@@ -222,8 +222,10 @@ def warm_nf4():
 
     n = HIDDEN * HIDDEN
     f32, u8 = torch.float32, torch.uint8
-    compile_kernel(nf4_dequant_kernel, u8, u8, f32, f32, f32, f32, torch.float16, n, n // QBLOCK,
-                   QBLOCK=QBLOCK, ABLOCK=ABLOCK, BLOCKS=BLOCKS_PER_PROGRAM,
+    # the kernel reads the packed weight as int32 words; its arguments: words, qabsmax, code2,
+    # absmax2, offset, nf4 table, out, n_blocks (see nf4.py's launch)
+    compile_kernel(nf4_dequant_kernel, torch.int32, u8, f32, f32, f32, f32, torch.float16,
+                   n // QBLOCK, QBLOCK=QBLOCK, ABLOCK=ABLOCK, BLOCKS=BLOCKS_PER_PROGRAM,
                    num_warps=4, enable_fp_fusion=False)
 
 
