@@ -218,6 +218,9 @@ def prepare_imports(log=True):
         loaded = [name for name in _SKIPPED if name in sys.modules]
         print("[solution] imports: " + ", ".join(f"{name} {s:.2f} s" for name, s in seconds.items())
               + f"; loaded of {', '.join(_SKIPPED)}: {', '.join(loaded) or 'none'}", flush=True)
+    from .startup_profile import mark as profile_mark
+
+    profile_mark("imports done")  # SOUP_SOLUTION_STARTUP_PROFILE=1 only
     return seconds
 
 
@@ -409,6 +412,9 @@ def patch_soup_first_step_mark():
     cls = soup_sft.SFTTrainerWrapper
     if getattr(cls, "_soup_first_step_mark", False):
         return
+    from .startup_profile import install_marks
+
+    install_marks()  # SOUP_SOLUTION_STARTUP_PROFILE=1 only: marks inside the trainer build
     original_train = cls.train
 
     class FirstStepMark(transformers.TrainerCallback):

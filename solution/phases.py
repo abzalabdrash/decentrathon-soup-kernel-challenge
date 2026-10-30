@@ -36,6 +36,10 @@ def mark(name):
             memory = ""
     print(f"[solution] phase {name} +{time.time() - _START:.2f} s" + (f"  {memory}" if memory else ""),
           flush=True)
+    if os.environ.get("SOUP_SOLUTION_STARTUP_PROFILE", "0") not in ("0", "false", "no", ""):
+        from .startup_profile import on_mark
+
+        on_mark(name)  # off by default: CPU split per mark and a sampling profile, see startup_profile.py
 
 
 def patch_soup_phases():
