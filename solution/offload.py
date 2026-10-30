@@ -406,6 +406,10 @@ class Offloader:
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
+# SOUP_SOLUTION_CLEAR_CUBLAS_WS=1: at the start of training, after the warm-up (which waits for its
+# thread first), the cuBLAS workspaces are freed so the warm-up thread's is not kept for the run
+CLEAR_CUBLAS = os.environ.get("SOUP_SOLUTION_CLEAR_CUBLAS_WS", "0").strip().lower() not in (
+    "0", "false", "no", "")
 # SOUP_SOLUTION_OFFLOAD_DRAIN_LAST=1: the last layer's MLP forward first lets the copies still in
 # flight finish (drain_inflight), so the previous layer's (gate|up) is not alive next to its own
 DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().lower() not in (
@@ -471,6 +475,11 @@ def patch_soup_train_offload():
         if not _real_cuda_trainer(trainer):
             return original(self, *args, **kwargs)
         model = trainer.model
+        if CLEAR_CUBLAS:
+            # the warm-up thread's cuBLAS workspace (8 MiB, one per thread and stream) is no
+            # longer used; the training threads make theirs again at their next GEMM
+            torch.cuda.synchronize()
+            torch._C._cuda_clearCublasWorkspaces()
         with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader:
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
