@@ -26,6 +26,8 @@ import contextlib
 import json
 import re
 import statistics
+import subprocess
+import threading
 
 import torch
 
@@ -139,21 +141,80 @@ def blas(library):
         torch.backends.cuda.preferred_blas_library(previous)
 
 
-def time_us(fn, iters, rounds):
-    """Median over rounds of the mean time of `iters` back-to-back calls, in microseconds."""
+def warm(fn):
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
-    times = []
-    for _ in range(rounds):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            fn()
-        end.record()
-        end.synchronize()
-        times.append(start.elapsed_time(end) * 1000.0 / iters)
-    return statistics.median(times)
+
+
+def time_round(fn, iters):
+    """The mean time of `iters` back-to-back calls, in microseconds."""
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / iters
+
+
+class _Sampler:
+    """`nvidia-smi -lms 100` in the background: the latest (SM clock MHz, power W), for when NVML is
+    not importable (a query per measurement would leave idle gaps that cool the card down)."""
+
+    def __init__(self):
+        self.latest = (None, None)
+        try:
+            self.proc = subprocess.Popen(["nvidia-smi", "--query-gpu=clocks.sm,power.draw",
+                                          "--format=csv,noheader,nounits", "-lms", "100"],
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            self.proc = None
+            return
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            try:
+                clock, power = (float(v) for v in line.split(",")[:2])
+            except ValueError:
+                continue
+            self.latest = (clock, power)
+
+
+_SAMPLER = {}
+
+
+def gpu_state():
+    """(SM clock MHz, power W) right now, or (None, None) when neither NVML nor nvidia-smi answers."""
+    try:
+        return torch.cuda.clock_rate(), torch.cuda.power_draw() / 1000.0
+    except Exception:  # noqa: BLE001 - no pynvml
+        if "s" not in _SAMPLER:
+            _SAMPLER["s"] = _Sampler()
+        return _SAMPLER["s"].latest
+
+
+def time_interleaved(candidates, iters, rounds):
+    """Medians over rounds, every candidate timed once per round in turn (a clock that drifts as the
+    card heats or hits its power limit then biases no candidate). candidates: [(library, fn)].
+    Returns [(median us, mean SM clock MHz or None)]."""
+    for library, fn in candidates:
+        with blas(library):
+            warm(fn)
+    times = [[] for _ in candidates]
+    clocks = [[] for _ in candidates]
+    for r in range(rounds):
+        order = list(range(len(candidates)))
+        order = order[r % len(order):] + order[:r % len(order)]
+        for i in order:
+            library, fn = candidates[i]
+            with blas(library):
+                times[i].append(time_round(fn, iters))
+            clock, _ = gpu_state()
+            if clock is not None:
+                clocks[i].append(clock)
+    return [(statistics.median(t), statistics.mean(c) if c else None) for t, c in zip(times, clocks)]
 
 
 def kernel_names(fn):
@@ -180,8 +241,8 @@ def _short(name):
     return name.replace("void ", "").split("(")[0].split("<")[0][:90]
 
 
-def two_streams(first, second, iters, rounds):
-    """(sequential, on two streams) time of the pair, microseconds per pair."""
+def two_streams(first, second):
+    """(sequential, on two streams) callables of a pair of independent GEMMs."""
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
     main = torch.cuda.current_stream()
 
@@ -199,13 +260,13 @@ def two_streams(first, second, iters, rounds):
         first()
         second()
 
-    return time_us(sequential, iters, rounds), time_us(concurrent, iters, rounds)
+    return sequential, concurrent
 
 
 def bench_m(m, iters, rounds, libraries):
     ops = make_operands(m)
     gemms = layer_gemms(ops)
-    rows = []
+    rows, candidates, where = [], [], []
     for gemm in gemms:
         row = {"gemm": f"{gemm.name}_{gemm.phase}", "m": gemm.m, "n": gemm.n, "k": gemm.k,
                "a": "T" if gemm.a.stride(0) == 1 else "N", "b": "T" if gemm.b.stride(0) == 1 else "N",
@@ -216,27 +277,38 @@ def bench_m(m, iters, rounds, libraries):
                     fn = gemm.call(form)
                     if fn() is None:
                         continue
-                    us = time_us(fn, iters, rounds)
-                    row["variants"][f"{library}/{form}"] = {
-                        "us": us, "tflops": gemm.flops / us / 1e6,
-                        "kernels": [_short(k) for k in kernel_names(fn)]}
+                    label = f"{library}/{form}"
+                    row["variants"][label] = {"kernels": [_short(k) for k in kernel_names(fn)]}
+                    candidates.append((library, fn))
+                    where.append((len(rows), label, gemm.flops))
         rows.append(row)
 
-    pairs = {}
     by_key = {f"{g.name}_{g.phase}": g for g in gemms}
     gate_f, up_f = by_key["gate_fwd"], by_key["up_fwd"]
     up_out = torch.empty(INTER, m, dtype=HALF, device="cuda")
-    pairs["gate|up fwd"] = two_streams(gate_f.as_trained, lambda: torch.mm(up_f.a, up_f.b, out=up_out),
-                                       iters, rounds)
+    fwd_pair = two_streams(gate_f.as_trained, lambda: torch.mm(up_f.a, up_f.b, out=up_out))
     gate_b, up_b = by_key["gate_bwd"], by_key["up_bwd"]
     other = torch.zeros(m, D, dtype=torch.float32, device="cuda")
 
     def up_alone():
         torch.addmm(other, up_b.a, up_b.b, beta=0, out_dtype=torch.float32, out=other)
 
-    seq, conc = two_streams(gate_b.as_trained, up_alone, iters, rounds)
-    add = time_us(lambda: other.add_(gate_b.c32), iters, rounds)
-    pairs["gate|up bwd (two outputs + add)"] = (seq, conc + add)
+    bwd_seq, bwd_conc = two_streams(gate_b.as_trained, up_alone)
+
+    def bwd_conc_add():
+        bwd_conc()
+        other.add_(gate_b.c32)
+
+    pair_fns = [fwd_pair[0], fwd_pair[1], bwd_seq, bwd_conc_add]
+    timed = time_interleaved(candidates + [("default", fn) for fn in pair_fns], iters, rounds)
+    for (row_index, label, flops), (us, clock) in zip(where, timed):
+        rows[row_index]["variants"][label].update(us=us, tflops=flops / us / 1e6, clock=clock)
+    pair_times = [us for us, _ in timed[len(candidates):]]
+    pairs = {"gate|up fwd": (pair_times[0], pair_times[1]),
+             "gate|up bwd (two outputs + add)": (pair_times[2], pair_times[3])}
+    clocks = [c for _, c in timed if c is not None]
+    if clocks:
+        print(f"M = {m}: SM clock during the measurements {min(clocks):.0f} .. {max(clocks):.0f} MHz")
     return rows, pairs
 
 
@@ -244,8 +316,8 @@ def report(results):
     for m, (rows, pairs) in results.items():
         print(f"\n## M = {m}\n")
         variants = list(dict.fromkeys(v for r in rows for v in r["variants"]))
-        print("| GEMM | M x N x K | layout a,b -> out | " + " | ".join(variants) + " | best |")
-        print("|---|---|---|" + "---|" * (len(variants) + 1))
+        print("| GEMM | M x N x K | layout a,b -> out | " + " | ".join(variants) + " | best | SM MHz |")
+        print("|---|---|---|" + "---|" * (len(variants) + 2))
         trained = best = 0.0
         for r in rows:
             vs = r["variants"]
@@ -255,7 +327,9 @@ def report(results):
             best += win[1]["us"]
             cells = [f"{vs[v]['us']:.0f} us {vs[v]['tflops']:.1f} TF" if v in vs else "" for v in variants]
             print(f"| {r['gemm']} | {r['m']} x {r['n']} x {r['k']} | {r['a']},{r['b']} -> {r['out']} | "
-                  + " | ".join(cells) + f" | {win[0]} ({100 * (1 - win[1]['us'] / base['us']):+.0f}%) |")
+                  + " | ".join(cells) + f" | {win[0]} ({100 * (1 - win[1]['us'] / base['us']):+.0f}%) | "
+                  + (f"{statistics.mean(c):.0f}" if (c := [v['clock'] for v in vs.values() if v.get('clock')])
+                     else "") + " |")
         print(f"\nper layer as trained {trained / 1000:.2f} ms, with the best variant of each "
               f"{best / 1000:.2f} ms; x{LAYERS} layers: {LAYERS * trained / 1000:.1f} -> "
               f"{LAYERS * best / 1000:.1f} ms per step ({LAYERS * (trained - best) / 1000:.1f} ms saved)")
@@ -279,6 +353,8 @@ def main():
     parser.add_argument("--out")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
+    clock, power = gpu_state()
+    print(f"SM clock {clock} MHz, power {power} W before the measurements")
     print(f"{torch.cuda.get_device_name()}, torch {torch.__version__}, cuBLAS "
           f"{torch.backends.cuda.preferred_blas_library()} by default, "
           f"fp16 reduced-precision reduction {torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction}")
