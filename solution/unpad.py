@@ -58,6 +58,7 @@ _STATE = {
     "pad": int(os.environ.get("SOUP_SOLUTION_PAD_TOKENS", "16") or "0"),
     "varlen": _env_flag("SOUP_SOLUTION_VARLEN_ATTN", "1"),
     "carry": _env_flag("SOUP_SOLUTION_CARRY_RESIDUAL", "1"),
+    "tail_id": None,  # the tail's token id; None: the last real id (tests vary it)
 }
 _CTX = {"spans": None, "cu": None}
 _CAUSAL_FROM_TOP_LEFT = 1  # aten's custom_mask_type for SDPA's is_causal
@@ -124,7 +125,10 @@ def varlen_model_forward(model, input_ids, position_ids, spans):
     n = input_ids.shape[1]
     pad = _pad_count(n)
     if pad:
-        input_ids = torch.cat([input_ids, input_ids[:, -1:].expand(1, pad)], dim=1)
+        fill = input_ids[:, -1:]
+        if _STATE["tail_id"] is not None:
+            fill = torch.full_like(fill, _STATE["tail_id"])
+        input_ids = torch.cat([input_ids, fill.expand(1, pad)], dim=1)
         tail = torch.arange(pad, dtype=position_ids.dtype, device=position_ids.device)
         position_ids = torch.cat([position_ids, tail.unsqueeze(0)], dim=1)
     hidden = model.embed_tokens(input_ids)
