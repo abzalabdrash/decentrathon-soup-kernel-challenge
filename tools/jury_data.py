@@ -28,6 +28,7 @@ from prepare_data import DATASET, EVAL_ROWS, REVISION, TRAIN_ROWS, write_jsonl  
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 MAX_LENGTH = 512
+MAX_PROMPT = 448  # Soup refuses a row whose answer is truncated away at max_length: keep 64 of it
 COUNT = 256
 PUBLIC = set(TRAIN_ROWS) | set(EVAL_ROWS)
 
@@ -37,19 +38,49 @@ def span(text):
     return range(int(start), int(end))
 
 
+def _tokenizer():
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(MODEL)
+
+
+def _ids(tokenizer, messages, **kwargs):
+    ids = tokenizer.apply_chat_template(messages, tokenize=True, **kwargs)
+    return ids["input_ids"] if hasattr(ids, "keys") else ids  # transformers 5: an encoding
+
+
+def _user(row):
+    return row["instruction"] + (("\n\n" + row["input"]) if row["input"] else "")
+
+
+def _trainable(dataset, ranked, needed):
+    """The first `needed` rows of `ranked` whose prompt leaves at least MAX_LENGTH - MAX_PROMPT
+    tokens of the answer ("no causal-loss target remains after truncation" otherwise: Soup stops)."""
+    tokenizer = _tokenizer()
+    kept = []
+    for i in ranked:
+        prompt = _ids(tokenizer, [{"role": "user", "content": _user(dataset[i])}],
+                      add_generation_prompt=True)
+        if len(prompt) <= MAX_PROMPT:
+            kept.append(i)
+            if len(kept) == needed:
+                break
+    return kept
+
+
 def pick(dataset, select, count):
     """(train rows, eval rows) by character length of instruction + input + output."""
     lengths = [len(a) + len(b) + len(c) for a, b, c in
                zip(dataset["instruction"], dataset["input"], dataset["output"])]
     order = [i for i in sorted(range(len(lengths)), key=lambda i: (lengths[i], i)) if i not in PUBLIC]
     if select == "longest":
-        ranked = order[::-1]
+        ranked = _trainable(dataset, order[::-1], 2 * count)
         return ranked[:count], ranked[count:2 * count]
     if select == "shortest":
         return order[:count], order[count:2 * count]
     if select == "extremes":
         half = count // 2
-        short, long_ = order[:count], order[::-1][:count]
+        short, long_ = order[:count], _trainable(dataset, order[::-1], count)
         train = [row for pair in zip(short[:half], long_[:half]) for row in pair]
         evals = [row for pair in zip(short[half:], long_[half:]) for row in pair]
         return train, evals
@@ -58,20 +89,12 @@ def pick(dataset, select, count):
 
 def token_counts(rows):
     try:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        tokenizer = _tokenizer()
     except Exception as exc:  # noqa: BLE001 - the counts are informative only
         return None, f"no tokenizer ({exc.__class__.__name__}): counts not estimated"
-    counts = []
-    for row in rows:
-        user = row["instruction"] + (("\n\n" + row["input"]) if row["input"] else "")
-        ids = tokenizer.apply_chat_template([{"role": "user", "content": user},
-                                             {"role": "assistant", "content": row["output"]}],
-                                            tokenize=True)
-        if hasattr(ids, "keys"):  # transformers 5 returns an encoding, 4 a list of ids
-            ids = ids["input_ids"]
-        counts.append(min(len(ids), MAX_LENGTH))
+    counts = [min(len(_ids(tokenizer, [{"role": "user", "content": _user(row)},
+                                       {"role": "assistant", "content": row["output"]}])),
+                  MAX_LENGTH) for row in rows]
     return counts, ""
 
 
