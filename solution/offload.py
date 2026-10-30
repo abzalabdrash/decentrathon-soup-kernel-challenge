@@ -54,6 +54,14 @@ keeps running ahead of the GPU and the allocator never has stream uses to track:
 A tensor used on another stream than its home (two backward streams: not this training) falls back
 to record_stream.
 
+Residual offload (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1, night task N1b): the decoder layers' fp32
+inputs, which the input norms keep for their backward (6 KB per token per layer, 228 MiB over the
+layers of a 1,440-token step once the attention recompute has removed the rest), go to host memory
+too. rmsnorm.py arms the one tensor to take (`residual_saved`) around its save_for_backward, so no
+other fp32 tensor is ever touched; each layer then saves two tensors (its input, then its gate|up),
+both windows grow by one, and the input stays on the GPU after its first unpack until its last user
+(the post-attention norm, the x16 rebuild and the input norm read it in the same layer's backward).
+
 Knobs for experiments (environment): SOUP_SOLUTION_OFFLOAD_MIN_NUMEL, SOUP_SOLUTION_OFFLOAD_INFLIGHT,
 SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). bench_offload.py
 measures time and peak of the three modes and the pinning speed of the machine.
@@ -85,6 +93,27 @@ ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
 HALF_DTYPES = (torch.float16, torch.bfloat16)
+RESIDUAL_MIN_NUMEL = 256 * 1024  # an armed fp32 residual below this (170 tokens) stays on the GPU
+
+# SOUP_SOLUTION_OFFLOAD_RESIDUAL (see the module doc): `armed` is the data pointer of the fp32
+# residual whose save_for_backward is running (residual_saved), None otherwise
+_RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "0").strip().lower()
+             not in ("0", "false", "no", ""), "armed": None}
+
+
+@contextlib.contextmanager
+def residual_saved(tensor):
+    """While active, an Offloader takes `tensor` (an fp32 layer input being saved for the
+    backward) to host memory like the MLP's activations (SOUP_SOLUTION_OFFLOAD_RESIDUAL=1)."""
+    if not _RESIDUAL["on"]:
+        yield
+        return
+    previous = _RESIDUAL["armed"]
+    _RESIDUAL["armed"] = tensor.data_ptr()
+    try:
+        yield
+    finally:
+        _RESIDUAL["armed"] = previous
 
 # Slabs pinned ahead of time by prepin(), taken by the stack before it pins one itself; while a
 # prepin thread is still working the stack waits for its next slab instead of pinning one more.
@@ -201,7 +230,7 @@ class _Saved:
     in flight (the original) or after a prefetch (with `ready`, the H2D's event)."""
 
     __slots__ = ("shape", "dtype", "device", "index", "slot", "host", "copied", "gpu", "ready",
-                 "home", "__weakref__")
+                 "home", "keep", "unpacked", "__weakref__")
 
     def __del__(self):
         slot = getattr(self, "slot", None)
@@ -223,7 +252,7 @@ class Offloader:
         self.stream = torch.cuda.Stream(self.device)
         self.min_numel = _env_int("SOUP_SOLUTION_OFFLOAD_MIN_NUMEL", MIN_NUMEL) \
             if min_numel is None else min_numel
-        layer = saved_per_layer()
+        layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0)
         self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", layer) \
             if max_inflight is None else max_inflight
         self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", layer) \
@@ -239,6 +268,8 @@ class Offloader:
         self.stats = collections.Counter()
 
     def pack(self, tensor):
+        if tensor.dtype == torch.float32:
+            return self._pack_residual(tensor)
         if (tensor.dtype not in HALF_DTYPES or not self.min_numel <= tensor.numel() <= MAX_NUMEL
                 or not tensor.is_cuda or not tensor.is_contiguous()):
             return tensor
@@ -248,6 +279,23 @@ class Offloader:
             return tensor
         with self.lock:
             return self._offload(tensor)
+
+    def _pack_residual(self, tensor):
+        armed = _RESIDUAL["armed"]
+        if (armed is None or tensor.data_ptr() != armed or not tensor.is_cuda
+                or not tensor.is_contiguous()
+                or not RESIDUAL_MIN_NUMEL <= tensor.numel() <= MAX_NUMEL // 2):
+            return tensor
+        storage = tensor.untyped_storage()
+        if (storage.nbytes() != tensor.numel() * tensor.element_size()
+                or storage.data_ptr() in self.weight_storages or _is_weight(tensor)):
+            return tensor
+        with self.lock:
+            saved = self._offload(tensor)
+            if type(saved) is _Saved:
+                saved.keep = True
+                self.stats["residuals"] += 1
+            return saved
 
     def _offload(self, tensor):
         if tensor.device != self.device:
@@ -273,6 +321,7 @@ class Offloader:
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
         saved.slot, saved.host, saved.copied = slot, host, side.record_event()
         saved.gpu, saved.ready, saved.home = tensor, None, home
+        saved.keep, saved.unpacked = False, False
         saved.index = self.count
         self.count += 1
         self.by_index[saved.index] = saved
@@ -292,6 +341,8 @@ class Offloader:
         with self.lock:
             current = torch.cuda.current_stream(saved.device)
             tensor = saved.gpu
+            if saved.unpacked:  # a kept residual, unpacked before in this backward
+                return tensor
             if tensor is None:
                 current.wait_event(saved.copied)
                 tensor = torch.empty(saved.shape, dtype=saved.dtype, device=saved.device)
@@ -314,6 +365,8 @@ class Offloader:
                 except ValueError:
                     pass
                 self.stats["still_on_gpu"] += 1
+            if saved.keep:  # its other readers in this layer's backward get the same tensor
+                saved.gpu, saved.unpacked = tensor, True
             self._prefetch_before(saved.index, current)
         return tensor
 
@@ -348,7 +401,8 @@ class Offloader:
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
-                f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}")
+                f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
+                f"of them layer inputs {s['residuals']}")
 
 
 @contextlib.contextmanager

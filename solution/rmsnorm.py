@@ -345,7 +345,7 @@ class AddRMSNormFunction(torch.autograd.Function):
     gets the branch from that object in the backward."""
 
     @staticmethod
-    def forward(ctx, residual, branch, weight, eps, addends=None):
+    def forward(ctx, residual, branch, weight, eps, addends=None, offload=False):
         r2, b2 = _rows(residual), _rows(branch)
         sum_dtype = torch.promote_types(residual.dtype, branch.dtype)
         s = torch.empty(r2.shape, dtype=sum_dtype, device=residual.device)
@@ -356,12 +356,16 @@ class AddRMSNormFunction(torch.autograd.Function):
         if addends is not None and residual.dtype != sum_dtype:
             addends = None  # the split backward re-forms the sum in the residual's dtype
         ctx.addends = addends
-        if addends is None:
-            ctx.save_for_backward(s, weight, rstd)
-        elif addends is KEEP_BRANCH:
-            ctx.save_for_backward(r2, weight, rstd, b2)
-        else:
-            ctx.save_for_backward(r2, weight, rstd)
+        # with addends, the residual is read back in the backward from the input norm that keeps
+        # it (residual_node: no second saved reference, offloaded once), else saved here
+        ctx.residual_node = _input_norm_node(residual) if addends is not None else None
+        kept = s if addends is None else (None if ctx.residual_node is not None else r2)
+        extra = (b2,) if addends is KEEP_BRANCH else ()
+        with _offloaded(kept if offload else None):
+            if ctx.residual_node is not None:
+                ctx.save_for_backward(weight, rstd, *extra)
+            else:
+                ctx.save_for_backward(kept, weight, rstd, *extra)
         ctx.shape = residual.shape
         ctx.dtypes = (residual.dtype, branch.dtype)
         return s.view(residual.shape), y.view(residual.shape)
@@ -377,7 +381,12 @@ class AddRMSNormFunction(torch.autograd.Function):
             d_res, d_branch, dw = _backward(_rows(dy), s, weight, rstd, dsum,
                                             residual_dtype, branch_dtype, ctx.needs_input_grad[2])
         else:
-            r2, weight, rstd, *kept = ctx.saved_tensors
+            if ctx.residual_node is not None:
+                weight, rstd, *kept = ctx.saved_tensors
+                r2 = ctx.residual_node.saved_tensors[0]
+                ctx.residual_node = None
+            else:
+                r2, weight, rstd, *kept = ctx.saved_tensors
             b2 = kept[0] if addends is KEEP_BRANCH else _rows(addends.branch())
             if ctx.needs_input_grad[2]:  # a trained norm weight: the general kernel on the sum
                 s = torch.add(r2, b2.to(r2.dtype))  # the forward's fp32 add of the same values
@@ -393,7 +402,28 @@ class AddRMSNormFunction(torch.autograd.Function):
         d_res = d_res.view(ctx.shape)
         # as torch's add backward, both addends get the same tensor when their dtypes agree
         d_branch = d_res if d_branch is None else d_branch.view(ctx.shape)
-        return d_res, d_branch, dw, None, None
+        return d_res, d_branch, dw, None, None, None
+
+
+def _input_norm_node(residual):
+    """The input norm's node that keeps `residual` as its saved sum (an AddRMSNormFunction of the
+    layer's input that kept the sum itself), else None."""
+    node = getattr(residual, "grad_fn", None)
+    if (isinstance(node, AddRMSNormFunction._backward_cls) and residual.output_nr == 0
+            and getattr(node, "addends", 0) is None):
+        return node
+    return None
+
+
+def _offloaded(tensor):
+    """offload.residual_saved(tensor) when the residual offload is on (offload.py), else nothing."""
+    import contextlib
+
+    if tensor is None:
+        return contextlib.nullcontext()
+    from .offload import residual_saved
+
+    return residual_saved(tensor)
 
 
 def rmsnorm(x, weight, eps):
@@ -447,10 +477,11 @@ def warm_rebuild():
     return None
 
 
-def add_rmsnorm(residual, branch, weight, eps, addends=None):
+def add_rmsnorm(residual, branch, weight, eps, addends=None, offload=False):
     """(r, y) with r = residual + branch and y = Qwen2RMSNorm(r), same shapes; `addends`: what the
-    backward keeps (AddRMSNormFunction)."""
-    return AddRMSNormFunction.apply(residual, branch, weight, float(eps), addends)
+    backward keeps (AddRMSNormFunction); `offload`: the fp32 tensor it keeps is a layer input that
+    offload.py may move to host memory (SOUP_SOLUTION_OFFLOAD_RESIDUAL)."""
+    return AddRMSNormFunction.apply(residual, branch, weight, float(eps), addends, offload)
 
 
 def post_attention_addends(residual, branch):
@@ -524,14 +555,22 @@ def _addable(residual, branch):
             and branch.device == residual.device and branch.dtype in DTYPES)
 
 
-def add_norm(norm, residual, branch, norm_cls):
+def add_norm(norm, residual, branch, norm_cls, offload=False):
     """(residual + branch, norm(residual + branch)) for a Qwen2RMSNorm `norm`: one kernel when the
     norm is a plain one the kernel fits, else the add and the norm's own forward. The sum is the
     base's `residual + branch` (fp32 residual, half branch: summed and kept in fp32)."""
     if (_plain_norm(norm, norm_cls) and fits(residual, norm.weight) and _addable(residual, branch)):
-        return add_rmsnorm(residual, branch, norm.weight, norm.variance_epsilon)
+        return add_rmsnorm(residual, branch, norm.weight, norm.variance_epsilon, offload=offload)
     total = residual + branch
     return total, norm(total)
+
+
+def _offload_inputs():
+    """Whether the layers' fp32 inputs go to host memory (offload.py, SOUP_SOLUTION_OFFLOAD_RESIDUAL;
+    only an active Offloader takes them, i.e. inside Soup's training)."""
+    from .offload import _RESIDUAL
+
+    return _RESIDUAL["on"] and torch.is_grad_enabled()
 
 
 def patch_qwen2_decoder_layer():
@@ -568,9 +607,10 @@ def patch_qwen2_decoder_layer():
             return original(self, hidden_states, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             use_cache=use_cache, position_embeddings=position_embeddings, **kwargs)
+        offload = _offload_inputs()
         if _soup_branch is not None:
             residual, hidden_states = add_norm(self.input_layernorm, hidden_states, _soup_branch,
-                                               norm_cls)
+                                               norm_cls, offload=offload)
         else:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -587,7 +627,8 @@ def patch_qwen2_decoder_layer():
                 and hidden_states.device == residual.device and hidden_states.dtype in DTYPES):
             residual, hidden_states = add_rmsnorm(residual, hidden_states, norm.weight,
                                                   norm.variance_epsilon,
-                                                  post_attention_addends(residual, hidden_states))
+                                                  post_attention_addends(residual, hidden_states),
+                                                  offload=offload)
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
