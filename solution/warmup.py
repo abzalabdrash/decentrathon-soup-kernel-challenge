@@ -67,7 +67,10 @@ once per class the training launches can take (see above), all classes of one ke
 registration (the workers run registrations side by side). A registration that raises is logged
 and skipped; the others still run. `start_background_warmup()` reads the registry when it is
 called, so `apply()` calls it after the patches. A warm-up registered in this file also runs in
-the helper process (below); one registered from a patch function runs in the thread only.
+the helper process (below), from its start; one registered later, from a patch function, is sent
+to the helper when `start_background_warmup()` runs if it is a module-level function or a
+`functools.partial` of one with JSON arguments (the helper imports it by name), and is left to the
+thread otherwise.
 
 The helper process, then the thread
 -----------------------------------
@@ -95,6 +98,7 @@ begin shows whether the warm-up fits.
 """
 
 import atexit
+import functools
 import importlib
 import json
 import os
@@ -478,7 +482,7 @@ def start_compile_helper(log=True):
                            p for p in (package_root, os.environ.get("PYTHONPATH")) if p))
             proc = subprocess.Popen(
                 [sys.executable, "-m", __name__, "--helper", str(major * 10 + minor), half, *names],
-                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True)
         except Exception as exc:  # noqa: BLE001 - the in-process warm-up compiles everything then
             _STATE["errors"]["(helper start)"] = repr(exc)
@@ -491,12 +495,86 @@ def start_compile_helper(log=True):
         return proc
 
 
+def _reference(name, fn):
+    """{name, module, qualname, args, kwargs} by which the helper imports the same warm-up: `fn`
+    is a module-level function or a functools.partial of one with JSON arguments. None otherwise
+    (a lambda or a closure stays in this process)."""
+    args, kwargs = (), {}
+    if isinstance(fn, functools.partial):
+        fn, args, kwargs = fn.func, fn.args, fn.keywords or {}
+    module, qualname = getattr(fn, "__module__", None), getattr(fn, "__qualname__", "")
+    if not module or module == "__main__" or "<" in qualname:
+        return None
+    try:
+        target = importlib.import_module(module)
+        for part in qualname.split("."):
+            target = getattr(target, part)
+        if target is not fn:
+            return None
+        spec = {"name": name, "module": module, "qualname": qualname, "args": list(args),
+                "kwargs": dict(kwargs)}
+        json.dumps(spec)
+    except Exception:  # noqa: BLE001 - not importable by name, or arguments that are not JSON
+        return None
+    return spec
+
+
+def _send_late_registrations(jobs):
+    """Sends the helper the registrations made after it started (see the module docstring), one
+    JSON line each, and closes its input: the helper then knows its whole work."""
+    helper = _STATE["helper"]
+    if helper is None or helper["proc"].stdin is None or helper["proc"].stdin.closed:
+        return []
+    sent = []
+    try:
+        for name, fn in jobs:
+            if name in helper["names"] or name in NEEDS_GPU:
+                continue
+            spec = _reference(name, fn)
+            if spec is not None:
+                helper["proc"].stdin.write(json.dumps(spec) + "\n")
+                sent.append(name)
+    except Exception:  # noqa: BLE001 - a helper that is gone: the thread compiles them
+        pass
+    finally:
+        try:
+            helper["proc"].stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+    helper["names"] = helper["names"] + sent
+    return sent
+
+
+def _late_jobs(stream):
+    """The helper's side: the registrations the training process sends on stdin, until it closes
+    it. Returns ([(name, fn)], {name: error})."""
+    jobs, errors = [], {}
+    for line in stream:
+        if not line.strip():
+            continue
+        name = "?"
+        try:
+            spec = json.loads(line)
+            name = spec["name"]
+            fn = importlib.import_module(spec["module"])
+            for part in spec["qualname"].split("."):
+                fn = getattr(fn, part)
+            if spec["args"] or spec["kwargs"]:
+                fn = functools.partial(fn, *spec["args"], **spec["kwargs"])
+            jobs.append((name, fn))
+        except Exception as exc:  # noqa: BLE001 - the training process's thread does it then
+            errors[name] = repr(exc)
+    return jobs, errors
+
+
 def _wait_for_helper(log):
     """Waits for the helper (at most HELPER_TIMEOUT s) and returns its report, or None."""
     helper = _STATE["helper"]
     if helper is None:
         return None
     proc = helper["proc"]
+    if proc.stdin is not None and proc.stdin.closed:
+        proc.stdin = None  # closed by _send_late_registrations: nothing left for communicate()
     try:
         out, err = proc.communicate(timeout=HELPER_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - a hung helper: kill it, compile here
@@ -569,7 +647,19 @@ def helper_main(argv):
     _triton_key()
     import_s = time.perf_counter() - begin
     jobs = [(name, fn) for name, fn in WARMUPS if name in names and name not in NEEDS_GPU]
-    results, errors = _run_jobs(jobs, WORKERS)
+    results, errors = {}, {}
+
+    def run(batch):
+        done, failed = _run_jobs(batch, WORKERS)
+        results.update(done)
+        errors.update(failed)
+
+    first = threading.Thread(target=run, args=(jobs,), name="helper-builtin", daemon=True)
+    first.start()
+    late, late_errors = _late_jobs(sys.stdin)  # until the training process closes our input
+    errors.update(late_errors)
+    run(late)  # next to what is left of the first batch
+    first.join()
     print(json.dumps({"import_s": round(import_s, 3),
                       "compile_s": round(time.perf_counter() - begin - import_s, 3),
                       "results": results, "errors": errors,
@@ -663,6 +753,7 @@ def start_background_warmup(log=True):
             _DONE.set()
             return None
         _STATE["begin"] = time.perf_counter()
+        _send_late_registrations(list(WARMUPS))
         thread = threading.Thread(target=_run, args=(list(WARMUPS), device, log),
                                   name="solution-warmup", daemon=True)
         _STATE["thread"] = thread
