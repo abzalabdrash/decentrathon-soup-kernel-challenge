@@ -18,8 +18,9 @@ Attention here (inside `unpad.varlen`, the packed training step):
   `addmm_(qkv_slice, h, B.T, alpha=scaling)` adds the adapter output into the q and v columns of
   qkv with one rounding;
 - the rotary embedding of q and k is one launch of rope.py's kernel (fp32 math, half out);
-- q, k, v leave the function as (B, H, N, D) token-major views; repeat_kv and per-row causal SDPA run as
-  in unpad.py, the per-row outputs are concatenated token-major (one copy) and o_proj is dequant + GEMM.
+- q, k, v leave the function as (B, H, N, D) token-major views; attention is unpad.attention, one
+  variable-length launch for all rows (and the alignment tail) with the kv heads expanded inside it
+  and not saved, its token-major output goes straight to o_proj (dequant + GEMM).
 Only x16, h (N x 32), the half adapter weights and the CUDA RNG state are kept for the backward; the
 dropout masks are drawn again from that state in the backward (the same kernel on the same input
 gives the same masks), so no mask and no fp32 q/k/v is stored. The backward rebuilds the weights,
@@ -67,7 +68,8 @@ from . import rope
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
-from .unpad import _CTX
+from .unpad import _CTX, sequences
+from .unpad import attention as packed_attention
 
 _STATE = {"enabled": True}
 _HALVES = (torch.float16, torch.bfloat16)
@@ -235,7 +237,7 @@ def _half_for(x, half):
 
 class _AttnPlan:
     __slots__ = ("bases", "o_base", "lora_q", "lora_v", "p", "scaling", "half", "heads", "kv_heads",
-                 "head_dim", "bias", "spans", "n_tokens")
+                 "head_dim", "bias", "spans", "bounds", "n_tokens")
 
 
 def _attention_plan(attn, x, position_embeddings, attention_mask, past_key_values):
@@ -289,13 +291,10 @@ def _attention_plan(attn, x, position_embeddings, attention_mask, past_key_value
         return None
     if torch.is_grad_enabled() and (cos.requires_grad or sin.requires_grad):
         return None
-    # the spans must tile the packed sequence in order (pack_batch's spans do)
-    position = 0
-    for start, end in spans:
-        if start != position or end <= start:
-            return None
-        position = end
-    if position != n_tokens:
+    # the spans must follow each other from 0 (pack_batch's do); tokens after the last span are
+    # the alignment tail of unpad.varlen_model_forward
+    bounds = sequences(spans, n_tokens)
+    if bounds is None:
         return None
     if any(_bnb_would_fuse(n_tokens, b, half, x.device) for b in bases + (o_base,)):
         return None
@@ -304,7 +303,7 @@ def _attention_plan(attn, x, position_embeddings, attention_mask, past_key_value
     plan.p, plan.scaling, plan.half = p, scaling, half
     plan.heads, plan.kv_heads, plan.head_dim = heads, kv_heads, head_dim
     plan.bias = _cached_bias(attn, bases, half)
-    plan.spans, plan.n_tokens = spans, n_tokens
+    plan.spans, plan.bounds, plan.n_tokens = spans, bounds, n_tokens
     return plan
 
 
@@ -366,8 +365,9 @@ class _QKVRope(torch.autograd.Function):
         qkv[:, :nq].addmm_(h_q, b16[:nq].t(), alpha=plan.scaling)
         qkv[:, nq + nk:].addmm_(h_v, b16[nq:].t(), alpha=plan.scaling)
 
-        # rotated q and k in their own token-major buffers: SDPA keeps q for the backward, and a view
-        # of qkv would keep k and v alive with it; qkv itself dies once repeat_kv has copied v
+        # rotated q and k in their own token-major buffers: attention keeps q and k for the backward,
+        # and a view of qkv would keep all of qkv alive with them; v leaves as a view of qkv and
+        # attention saves a compact copy of it, so qkv dies after the attention forward
         cos, sin = _tables(cos, sin)
         q4 = _heads(torch.empty((n, nq), dtype=half, device=x.device), n, plan.heads, plan.head_dim)
         k4 = _heads(torch.empty((n, nk), dtype=half, device=x.device), n, plan.kv_heads,
@@ -475,29 +475,14 @@ class _Linear4bitHalf(torch.autograd.Function):
 
 
 def _fused_attention(attn, x, position_embeddings, plan):
-    import transformers.models.qwen2.modeling_qwen2 as mq
-
     a_q, b_q = plan.lora_q
     a_v, b_v = plan.lora_v
     cos, sin = position_embeddings
     query, key, value = _QKVRope.apply(x, a_q.weight, b_q.weight, a_v.weight, b_v.weight, cos, sin,
                                        plan)
-    groups = plan.heads // plan.kv_heads
-    if groups > 1:
-        key = mq.repeat_kv(key, groups)
-        value = mq.repeat_kv(value, groups)
     dropout = 0.0 if not attn.training else attn.attention_dropout
     n = plan.n_tokens
-    if len(plan.spans) == 1:
-        out = F.scaled_dot_product_attention(query, key, value, dropout_p=dropout,
-                                             scale=attn.scaling, is_causal=n > 1).transpose(1, 2)
-    else:
-        lengths = [end - start for start, end in plan.spans]
-        pieces = [F.scaled_dot_product_attention(q, k, v, dropout_p=dropout, scale=attn.scaling,
-                                                 is_causal=length > 1).transpose(1, 2)
-                  for q, k, v, length in zip(query.split(lengths, dim=2), key.split(lengths, dim=2),
-                                             value.split(lengths, dim=2), lengths)]
-        out = torch.cat(pieces, dim=1)  # (1, N, H, Dh), token-major
+    out = packed_attention(query, key, value, plan.bounds, attn.scaling, dropout)  # (1, N, H, Dh)
     out = out.reshape(n, plan.heads * plan.head_dim)
     out = _Linear4bitHalf.apply(out, plan.o_base, _cached_bias(plan.o_base, (plan.o_base,), plan.half))
     return out.view(1, n, -1)
