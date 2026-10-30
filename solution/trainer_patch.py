@@ -76,6 +76,9 @@ def patch_sft_trainer():
 
     cls.compute_loss = compute_loss
     cls._soup_fused_metrics = True
+    from .boundary import patch_step_boundary
+
+    patch_step_boundary()  # SOUP_SOLUTION_STEP_BOUNDARY=1: the step boundary without model walks
 
 
 def _metrics_from_logits(trainer, mode, inputs, outputs):
