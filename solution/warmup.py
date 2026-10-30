@@ -5,8 +5,10 @@ kernel it meets (Kaggle T4, commit d649c7c: the first two steps took about 4.5 s
 two ordinary ones; from the end of apply() to the first step there are about 6 s: the model load,
 3.1 s, and the trainer setup, 2.9 s). Here a daemon thread compiles them ahead, so that the first
 step finds them in Triton's in-memory cache: the 11 variants a real step compiles (rms_norm_rows_fwd
-and _bwd two each, nf4_dequant_kernel, rope_qk_kernel forward and backward, fused_ce_rows_kernel two,
-the example SwiGLU forward and backward) and a rarer third one of fused_ce_rows_kernel.
+and _bwd two each, nf4_dequant_kernel, rope_qk_kernel forward and backward in half for
+fused_proj.py's attention, fused_ce_rows_kernel two, the example SwiGLU forward and backward), a
+rarer third one of fused_ce_rows_kernel, and rope_qk_kernel in fp32 for the attention without
+fused_proj.py.
 
 What makes a launch compile (triton 3.6.0, triton/runtime/jit.py)
 -----------------------------------------------------------------
@@ -213,30 +215,33 @@ def warm_rmsnorm_fwd():
 
 @register(name="nf4_dequant_kernel")
 def warm_nf4():
-    # every 4-bit weight of the model has N * K and N * K / 64 divisible by 16: one class
-    if not _switched_on("SOUP_SOLUTION_NF4"):
+    # the packed weight read as int32 words; every 4-bit weight of the model has N * K / 64 blocks
+    # divisible by 16, and the fp16 output (a weight of its own, or a row slice of fused_proj.py's
+    # shared q|k|v or gate|up buffer, at a multiple of 1536 elements) is aligned: one class
+    if not _switched_on("SOUP_SOLUTION_NF4") and not _switched_on("SOUP_SOLUTION_FUSED_PROJ"):
         return SKIPPED
     import torch
 
     from .nf4 import ABLOCK, BLOCKS_PER_PROGRAM, QBLOCK, nf4_dequant_kernel
 
-    n = HIDDEN * HIDDEN
     f32, u8 = torch.float32, torch.uint8
-    compile_kernel(nf4_dequant_kernel, u8, u8, f32, f32, f32, f32, torch.float16, n, n // QBLOCK,
+    compile_kernel(nf4_dequant_kernel, torch.int32, u8, f32, f32, f32, f32, torch.float16,
+                   HIDDEN * HIDDEN // QBLOCK,
                    QBLOCK=QBLOCK, ABLOCK=ABLOCK, BLOCKS=BLOCKS_PER_PROGRAM,
                    num_warps=4, enable_fp_fusion=False)
 
 
-def _rope(backward):
-    # q (1, 12, N, 128) and k (1, 2, N, 128) are transposed views of the fp32 projections: strides
-    # (N * 1536, 128, 1536) and (N * 256, 128, 256), all multiples of 16 for any N; the outputs keep
-    # them; cos and sin fp32 (1, N, 128) with the batch stride passed as 0. The backward's gradients
-    # come contiguous, (12 * N * 128, N * 128, 128): also all "D". n_tokens is not specialized.
+def _rope(backward, io_dtype):
+    # Every stride is a multiple of 16 for any N, so their values do not matter, only the dtypes:
+    # fused_proj.py (attention in half) passes half q / k views of its (N, 2048) q|k|v buffer and
+    # writes half outputs; rope.py's drop-in (unpad.py's attention) passes fp32 views of the fp32
+    # projections; cos and sin are fp32 (1, N, 128) in both, with the batch stride passed as 0.
+    # n_tokens is not specialized.
     import torch
 
     from .rope import BLOCK_TOKENS, NUM_WARPS, rope_qk_kernel
 
-    f32, n = torch.float32, TOKENS
+    f32, n, io = torch.float32, TOKENS, io_dtype
     if backward:
         q_in = (n * Q_HEADS * HEAD_DIM, n * HEAD_DIM, HEAD_DIM)
         k_in = (n * KV_HEADS * HEAD_DIM, n * HEAD_DIM, HEAD_DIM)
@@ -245,7 +250,7 @@ def _rope(backward):
         k_in = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
     q_out = (n * HIDDEN, HEAD_DIM, HIDDEN)
     k_out = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
-    compile_kernel(rope_qk_kernel, f32, f32, f32, f32, f32, f32, *q_in, *k_in, *q_out, *k_out,
+    compile_kernel(rope_qk_kernel, io, io, io, io, f32, f32, *q_in, *k_in, *q_out, *k_out,
                    0, HEAD_DIM, n, Q_HEADS,
                    HALF=HEAD_DIM // 2, BLOCK_N=BLOCK_TOKENS, BACKWARD=backward,
                    num_warps=NUM_WARPS)
@@ -253,10 +258,17 @@ def _rope(backward):
 
 @register(name="rope_qk_kernel")
 def warm_rope():
-    if not _switched_on("SOUP_SOLUTION_ROPE"):
+    # the fused attention's half variant first (what training runs with fused_proj on), then the
+    # drop-in's fp32 one (what unpad.py's attention runs when the fused path is off or declines)
+    fused, drop_in = _switched_on("SOUP_SOLUTION_FUSED_PROJ"), _switched_on("SOUP_SOLUTION_ROPE")
+    if not fused and not drop_in:
         return SKIPPED
-    _rope(backward=False)
-    _rope(backward=True)
+    import torch
+
+    dtypes = ([training_half_dtype()] if fused else []) + ([torch.float32] if drop_in else [])
+    for io_dtype in dtypes:
+        _rope(False, io_dtype)
+        _rope(True, io_dtype)
 
 
 @register(name="example_swiglu_fwd_kernel")

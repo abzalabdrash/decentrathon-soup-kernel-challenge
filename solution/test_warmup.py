@@ -25,6 +25,8 @@ def fresh(monkeypatch):
 
     from solution import warmup
 
+    # another test's apply() may have started the real warm-up: let it finish first
+    warmup.wait_for_warmup(300)
     monkeypatch.setattr(warmup, "BUILTIN", list(warmup.WARMUPS), raising=False)
     monkeypatch.setattr(warmup, "WARMUPS", [])
     monkeypatch.setattr(warmup, "COMPILES", [])
@@ -165,8 +167,9 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
 
     _builtin_warmups(fresh, monkeypatch)
     for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE",
-                   "SOUP_SOLUTION_UNPAD", "SOUP_SOLUTION_MLP16"):
+                   "SOUP_SOLUTION_UNPAD", "SOUP_SOLUTION_MLP16", "SOUP_SOLUTION_FUSED_PROJ"):
         monkeypatch.delenv(switch, raising=False)
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP", "0")  # this test starts the warm-up itself
     solution.apply()
     model = one_layer_model()
     compiles = fresh.watch_compiles(log=False)
@@ -176,6 +179,8 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
         model_step(model, lengths)
     needed = _keys(compiles)
     assert {k[0] for k in needed} == OUR_KERNELS
+    if solution._on("SOUP_SOLUTION_FUSED_PROJ"):  # the model takes fused_proj.py's half attention
+        assert any(k[0] == "rope_qk_kernel" and "q_ptr:*fp16" in k[1] for k in needed)
 
     _forget_compiled()
     compiles.clear()
@@ -193,7 +198,8 @@ def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
 
 
 def test_switched_off_patches_warm_nothing(fresh, monkeypatch):
-    for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE"):
+    for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE",
+                   "SOUP_SOLUTION_FUSED_PROJ"):
         monkeypatch.setenv(switch, "0")
     for name, fn in fresh.BUILTIN:
         if name.startswith(("rms_norm", "nf4", "rope")):

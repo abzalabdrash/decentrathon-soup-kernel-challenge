@@ -95,6 +95,8 @@ def one_layer_model(vocab=640, seed=0):
                     q.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
                 setattr(parent, name, q)
     model = model.cuda()  # quantizes the Params4bit
+    # what from_pretrained with a 4-bit config sets: peft then wraps the layers in its bnb Linear4bit
+    model.is_loaded_in_4bit = True
     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
                                              target_modules=["q_proj", "v_proj"],
