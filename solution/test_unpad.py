@@ -569,3 +569,33 @@ def test_residual_carry_falls_back_per_layer(layer_patches):
         assert _rel(g, ref) < 1e-3
     model.model.layers[0].gradient_checkpointing = True  # never carried through a checkpoint
     assert not unpad._carries(model.model.layers)
+
+
+# ------------------------------------------------------------------------------------------------
+# the backward's key splits (SOUP_SOLUTION_ATTN_SPLITS_KEY)
+
+
+@pytest.mark.parametrize("pattern", ["354 tokens in 4 rows", "1427 tokens in 4 rows, one long"])
+@pytest.mark.parametrize("splits", [1, 2])
+def test_backward_key_splits(pattern, splits):
+    """With a fixed number of key splits the gradients match the default backward to rounding, and
+    one split (no atomics) gives the same dq bit for bit run after run."""
+    lengths = PATTERNS[pattern]
+    bounds = unpad.sequences(_spans(lengths), sum(lengths))
+    qkv, q, k, v = _qkv(sum(lengths), seed=3)
+    grad = torch.randn(1, sum(lengths), HEADS, HEAD_DIM, device="cuda",
+                       generator=torch.Generator("cuda").manual_seed(4))
+
+    def attention(q_, k_, v_, b):
+        return unpad.attention(q_, k_, v_, b, SCALE)
+
+    unpad._STATE["splits_key"] = 0
+    ref_out, ref_grad = _run(attention, qkv, q, k, v, bounds, grad)
+    unpad._STATE["splits_key"] = splits
+    out, got = _run(attention, qkv, q, k, v, bounds, grad)
+    again = _run(attention, qkv, q, k, v, bounds, grad)[1]
+    assert unpad._STATE["splits_key"] == splits  # the torch of the run takes the keyword
+    assert torch.equal(out, ref_out)
+    assert _rel(got, ref_grad) < 2e-3
+    if splits == 1:
+        assert torch.equal(got, again)
