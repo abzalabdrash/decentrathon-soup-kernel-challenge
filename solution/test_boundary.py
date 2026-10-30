@@ -9,19 +9,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 
 def _peft_model(seed=0):
-    from peft import LoraConfig, get_peft_model
-    from transformers import Qwen2Config, Qwen2ForCausalLM
+    """The 4-bit tiny Qwen2 with peft LoRA of test_fused_proj (a plain-linear peft model makes peft
+    probe torchao, whose old version on Kaggle raises)."""
+    from solution.test_fused_proj import _tiny_peft_model
 
     torch.manual_seed(seed)
-    config = Qwen2Config(vocab_size=256, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-                         num_attention_heads=4, num_key_value_heads=2, tie_word_embeddings=True)
-    model = Qwen2ForCausalLM(config).cuda()
-    model = get_peft_model(model, LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"]))
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            if "lora_B" in name:
-                p.normal_(0, 0.05)
-    return model
+    return _tiny_peft_model()
 
 
 @pytest.fixture
@@ -38,9 +31,10 @@ def boundary_on():
 
 
 def _grads(model):
-    ids = torch.randint(0, 256, (2, 40), device="cuda", generator=torch.Generator("cuda").manual_seed(1))
-    out = model(input_ids=ids, labels=ids)
-    out.loss.backward()
+    ids = torch.randint(0, 512, (2, 160), device="cuda", generator=torch.Generator("cuda").manual_seed(1))
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(input_ids=ids, labels=ids)
+    (out.loss * 1024.0).backward()
 
 
 def test_floating_point_ops_and_clip_match(boundary_on):
