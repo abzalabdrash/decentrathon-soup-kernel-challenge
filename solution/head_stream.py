@@ -23,10 +23,12 @@ removed. The saved adapter holds only the LoRA tensors, as before.
 Embedding lookup: the ids come to the host (one synchronization; the packed path synchronizes right
 before anyway), the rows are gathered from the host copy into a pinned staging buffer and copied to
 the GPU (2.5 MB for 826 tokens), then cast to fp32: the base's lookup in its fp32 weight gives the
-same values bit for bit (the fp16 -> fp32 round trip is exact). A training forward starts the copies
-of the first K chunks of the head at the final norm (a pre-hook), after the last layer: its MLP sets
-the forward's peak, and a ring allocated at the embedding lookup (more overlap, about 2 ms per 24 MiB
-chunk) was alive there (Kaggle T4, step 6: +48 MiB on the step's peak).
+same values bit for bit (the fp16 -> fp32 round trip is exact). A training forward allocates the
+ring and starts the copies of the first K chunks of the head right after the lookup, while the PCIe
+bus is idle. Measured on the T4 (one Kaggle session, two rounds each, main 75658f3): against the
+first chunks started at the final norm, the nvidia-smi peak was 40 MiB lower (1,309 against 1,349;
+reserved 1,142 against 1,182: the ring's block is placed before the forward's activations instead of
+being carved out at the head), at equal time; T13's session measured -20 MiB the same way.
 
 The head, for N hidden rows (labelled rows first, as in fused_ce.py) and chunk c of W:
     L_c = h16 @ W_c^T                               fp16 cuBLAS GEMM, (N, R), in a reused buffer
@@ -73,10 +75,10 @@ from .fused_ce import IGNORE_INDEX, compute_dtype
 
 DEFAULT_ROWS = 8192  # vocabulary rows per chunk: 8192 x 1536 x 2 bytes = 24 MiB per slot
 DEFAULT_SLOTS = 2
-# where a training forward starts copying the head's first chunks: "norm" (the final norm, after the
-# last layer, whose MLP sets the forward's peak: the ring is not alive then), "embedding" (the start
-# of the forward: more overlap, the ring alive through the forward), "head" (no early copies)
-DEFAULT_PREFETCH = "norm"
+# where a training forward starts copying the head's first chunks: "embedding" (the start of the
+# forward: the ring alive through the forward; the lowest reserved peak on the T4), "norm" (the final
+# norm, after the last layer), "head" (no early copies)
+DEFAULT_PREFETCH = "embedding"
 MAX_ROWS = 32768  # one Triton block holds a row's whole chunk
 BLOCK_D = 512
 STAGING_ROWS = 4096  # pinned staging rows of the embedding lookup (grows on demand)
