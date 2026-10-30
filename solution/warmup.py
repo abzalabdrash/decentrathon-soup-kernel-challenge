@@ -85,6 +85,7 @@ trl and datasets imported next to the model load end at 3.38 s, imported first t
 2.69 s. The log line "waited N s for the warmup" at `train` begin shows whether the warm-up fits.
 """
 
+import atexit
 import importlib
 import os
 import sys
@@ -115,6 +116,18 @@ def _new_state():
 _STATE = _new_state()
 _DONE = threading.Event()
 _HOOKS = {"installed": False}
+EXIT_WAIT_SECONDS = 120.0  # at interpreter exit: how long to let a compile in flight finish
+
+
+def _wait_at_exit():
+    """Lets a warm-up still in flight finish before the interpreter shuts down. The workers are
+    daemon threads; one of them inside Triton's compiler (C++ passes, ptxas and C-compiler
+    subprocesses, the cubin load) while Python finalizes ends the process with `terminate called
+    without an active exception` and exit code 134. Soup's regression tests (check 10) run apply()
+    and exit within a second, so the harness saw that abort in about half of the runs. Registered
+    with atexit when the thread starts; in a training run the warm-up is long done by then."""
+    if _STATE["thread"] is not None and not _DONE.is_set():
+        _DONE.wait(EXIT_WAIT_SECONDS)
 
 
 def register(fn=None, *, name=None):
@@ -428,6 +441,7 @@ def start_background_warmup(log=True):
         thread = threading.Thread(target=_run, args=(list(WARMUPS), device, log),
                                   name="solution-warmup", daemon=True)
         _STATE["thread"] = thread
+        atexit.register(_wait_at_exit)
         thread.start()
         return thread
 

@@ -17,28 +17,28 @@ never comes back to the GPU: this module then leaves it alone and only serves as
 
 import torch
 
-ROWS = 8192  # rows converted and compared at a time
+
+ROWS_PER_CHUNK = 8192  # 8192 x 1536 fp32 = 48 MiB per comparison chunk
+
+
+def _round_trip_exact(half, full):
+    """True when `half` cast back to fp32 equals `full` element for element. Compared in row chunks:
+    one `half.to(fp32)` of the whole embedding would add a third 933 MiB tensor next to the fp32
+    weight and its fp16 copy, a setup spike that nvidia-smi (100 ms sampling) misses while torch's
+    reserved peak records it, which fails check 9 (peaks must agree within 3%)."""
+    rows = full.shape[0] if full.dim() > 1 else 1
+    half2, full2 = half.reshape(rows, -1), full.reshape(rows, -1)
+    for start in range(0, rows, ROWS_PER_CHUNK):
+        end = min(start + ROWS_PER_CHUNK, rows)
+        if not torch.equal(half2[start:end].to(torch.float32), full2[start:end]):
+            return False
+    return True
 
 
 def _streamed(weight):
     from .head_stream import streamer_for
 
     return streamer_for(weight) is not None
-
-
-def _exact_half(weight):
-    """`weight` (fp32) in fp16 when the round trip is exact, else None. Row blocks at a time: the
-    whole-tensor comparison held an fp32 copy and a bool mask next to the weight (+1.1 GB at the
-    setup's peak, solution/T13 notes)."""
-    half = torch.empty(weight.shape, dtype=torch.float16, device=weight.device)
-    rows = weight.shape[0] if weight.dim() else 1
-    flat_half, flat = half.view(rows, -1), weight.reshape(rows, -1)
-    for start in range(0, rows, ROWS):
-        block = flat[start:start + ROWS]
-        flat_half[start:start + ROWS].copy_(block)
-        if not torch.equal(flat_half[start:start + ROWS].to(torch.float32), block):
-            return None
-    return half
 
 
 def shrink_embeddings(model):
@@ -63,8 +63,9 @@ def shrink_embeddings(model):
             continue
         if _streamed(weight):
             continue  # its values live in host memory (head_stream.py); the GPU holds 4 bytes
-        half = _exact_half(weight.data)
-        if half is None:
+        half = weight.data.to(torch.float16)
+        if not _round_trip_exact(half, weight.data):
+            del half
             continue
         weight.data = half
         done += 1
