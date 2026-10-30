@@ -17,25 +17,28 @@ by bitsandbytes on one GPU, inside Soup's `_setup_transformers`):
 - when the second pass begins, a thread fills a ring of K pinned host buffers
   (SOUP_SOLUTION_LOAD_PINNED_SLOTS, default 4, each the size of the largest tensor: 26 MiB for
   Qwen2.5-1.5B) with the next tensors, from the same `slice[...]`;
-- the bf16 -> fp16 cast: with SOUP_SOLUTION_LOAD_PINNED_CAST=cpu (default) the thread converts into an
-  fp16 view of the buffer with `copy_`, the kernel `.to(float16)` runs, so the bytes are the ones the
-  original path copies by construction; with =gpu the thread copies the raw bf16 bytes (one memmove
-  in one thread: about a quarter of the CPU time of torch's bf16 -> fp16 conversion per byte) and the
-  GPU converts them in place in the tensor after its copy (torch's CUDA cast; both casts are IEEE
-  round-to-nearest-even, the tests check all 65,536 bf16 values and every tensor of the real
-  checkpoint bit for bit). The CPU time matters: on the T4 the first training step waits for the
-  kernels the warm-up thread compiles meanwhile, and the load competes with it for the 4 CPUs;
+- the bf16 -> fp16 cast: with SOUP_SOLUTION_LOAD_PINNED_CAST=gpu (default) the thread copies the raw
+  bf16 bytes (one memmove in one thread) and the GPU converts them in place in the tensor after its
+  copy (torch's CUDA cast; both it and torch's CPU cast are IEEE round-to-nearest-even: the tests
+  check all 65,536 bf16 values and every tensor of the real checkpoint bit for bit); with =cpu the
+  thread converts into an fp16 view of the buffer with `copy_`, the kernel the original `.to()`
+  runs, so the bytes are the original ones by construction, but that conversion is slow on the T4
+  host (1.2 GB/s in the thread: the loop then waits for it);
 - the job of a tensor allocates its GPU tensor where `.to()` does (current stream, same shape and
   dtype) and copies the buffer into it with `non_blocking=True`; an event after each copy tells the
   thread when the buffer may be refilled (no record_stream). With SOUP_SOLUTION_LOAD_PINNED_WINDOW=W
-  (default 1, 0-2) the next W tensors are copied ahead on a side stream, ordered by events: the side
+  (default 0, up to 2) the next W tensors are copied ahead on a side stream, ordered by events: the side
   stream first waits for the default stream's past (the allocator may hand out a block the default
   stream's work freed), the default stream waits for the copy before the tensor is handed over, so
   every later use and the free are ordered after it. The load's GPU peak grows by at most W tensors;
-  W=0 allocates exactly what the original does;
+  W=0 allocates exactly what the original does, and on the T4 W=1 was not faster (the loop's own
+  Python and quantization work is what is left);
 - the rest of the loop is untouched: bitsandbytes' Bnb4bitQuantize (quantize_4bit per weight, the
   double-quant offset from that weight's own absmax) on the same fp16 tensor, so the packed
   weights, absmax and quant states are bit for bit those of the original load.
+T4 (session soup-night-load, ABBA, 2 rounds each): tensor loop 3.91 s -> 2.24 s (CPU cast 3.12 s),
+Soup's model setup 5.33 -> 3.67 s, peak 539 MiB unchanged; the first step comes only 0.1-0.2 s
+earlier, because it then waits 0.7-0.9 s for the warm-up thread's kernel compilation (7.2 s).
 The embedding stays on load_stream.py's path (read to the host, its job is not ours). Anything
 unexpected (a tensor asked out of order or from another thread, a non-default current stream:
 bitsandbytes launches its kernels on the legacy default stream, a slice that is not what was
@@ -76,10 +79,10 @@ def new_copier(device, log=print):
     if not enabled():
         return None
     try:
-        cast = os.environ.get("SOUP_SOLUTION_LOAD_PINNED_CAST", "cpu").strip().lower()
-        return PinnedCopier(device, window=_env_int("SOUP_SOLUTION_LOAD_PINNED_WINDOW", 1, 0, 2),
+        cast = os.environ.get("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu").strip().lower()
+        return PinnedCopier(device, window=_env_int("SOUP_SOLUTION_LOAD_PINNED_WINDOW", 0, 0, 2),
                             slots=_env_int("SOUP_SOLUTION_LOAD_PINNED_SLOTS", 4, 2, 16),
-                            cast="gpu" if cast == "gpu" else "cpu", log=log)
+                            cast="cpu" if cast == "cpu" else "gpu", log=log)
     except Exception as exc:  # noqa: BLE001 - load as usual
         log(f"[solution] pinned load copies skipped: {exc!r}")
         return None
@@ -122,7 +125,7 @@ class PinnedCopier:
     the loop's first pass and returns the job the second pass calls; `close` ends it when the load
     returns or raises. Device operations are small methods, so that the CPU tests can replace them."""
 
-    def __init__(self, device, window=1, slots=4, cast="cpu", log=print):
+    def __init__(self, device, window=0, slots=4, cast="gpu", log=print):
         self.device = torch.device(device)
         self.window, self.slots, self.log = max(0, int(window)), max(1, int(slots)), log
         self.cast = cast
