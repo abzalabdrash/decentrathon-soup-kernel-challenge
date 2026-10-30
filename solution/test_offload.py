@@ -276,15 +276,23 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     """Forward and backward on one stream (the training run): every copy, drop and prefetch is
     ordered by stream waits on events; no record_stream for the allocator to track, no CPU-side
     wait (the CPU keeps running ahead of the GPU). The values still come back exactly."""
+    import threading
+
     from solution.offload import Offloader
 
     calls = []
+    me = threading.get_ident()  # the patches are process-wide: a warm-up thread may sync its events
+    original_sync, original_record = torch.cuda.Event.synchronize, torch.Tensor.record_stream
 
     def record_stream(self, stream):
-        calls.append("record_stream")
+        if threading.get_ident() == me:
+            calls.append("record_stream")
+        return original_record(self, stream)
 
     def synchronize(self):
-        calls.append("synchronize")
+        if threading.get_ident() == me:
+            calls.append("synchronize")
+        return original_sync(self)
 
     n, k = 1 << 20, 6
     values = [torch.randn(n, device="cuda").half() for _ in range(k)]
@@ -651,8 +659,8 @@ def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
     reset()
     monkeypatch.setattr(mlp_cls, "_soup_fused_proj", True, raising=False)
     monkeypatch.delenv("SOUP_SOLUTION_MLP_MEMORY")
-    assert DEFAULT_MODE == "recompute"
-    assert patch_mlp_memory() == "recompute" and applied() == (False, False, True)
+    assert DEFAULT_MODE == "offload"
+    assert patch_mlp_memory("recompute") == "recompute" and applied() == (False, False, True)
     assert patch_mlp_memory("none") == "none" and applied() == (False, False, False)
     assert patch_mlp_memory("recompute") == "recompute" and applied() == (False, False, True)
-    assert patch_mlp_memory("offload") == "offload" and applied() == (True, False, False)
+    assert patch_mlp_memory() == "offload" and applied() == (True, False, False)

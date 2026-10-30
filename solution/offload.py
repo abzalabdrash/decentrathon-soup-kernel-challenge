@@ -10,16 +10,16 @@ forward, where the fused head adds its chunk of logits: the step's peak.
 
 SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
 
-- recompute (default): with fused_proj.py's MLP, its autograd function saves only its half input
-  x16 (N x 1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the
-  (gate|up) GEMM again on the same operands, with the weights it rebuilds for the input gradient
-  anyway (one GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses
-  PCIe and no tensor gets record_stream, so the caching allocator never waits for side-stream
-  events (the offload's events stalled the forward 119 ms per step in torch.empty on the T4, and
-  its copies took 176 ms of copy-engine time per step from the weight streaming). Without the fused
-  MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate and up (two 4-bit GEMMs) in
-  the backward, same ops in the same order as mlp16.py, so the same numbers.
-- offload: saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
+- recompute: with fused_proj.py's MLP, its autograd function saves only its half input x16 (N x
+  1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the (gate|up)
+  GEMM again on the same operands, with the weights it rebuilds for the input gradient anyway (one
+  GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses PCIe. On the
+  T4 (main 4744723, diag runs of one commit) it costs ~50 ms of GPU per step (steps 3+: 24.86 s
+  against 22.52 s with the offload) and does not lower the peak (1979 against 2003 MiB): the
+  offload keeps one or two (gate|up) on the GPU, recompute keeps 28 x16. Worth it only when PCIe is
+  saturated. Without the fused MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate
+  and up (two 4-bit GEMMs) in the backward, same ops in the same order as mlp16.py.
+- offload (default): saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
   tensor of MIN_NUMEL to MAX_NUMEL elements that owns its storage and is not a weight (a parameter,
   a trainable leaf, a view of one, or anything sharing the storage of a parameter or buffer of the
   trained model), i.e. gate and up, is copied to pinned host memory on a side
@@ -71,7 +71,7 @@ import torch
 from .swiglu import swiglu
 
 MODES = ("offload", "recompute", "none")
-DEFAULT_MODE = "recompute"
+DEFAULT_MODE = "offload"
 
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
@@ -488,7 +488,7 @@ def _fused_mlp():
 
 
 def patch_mlp_memory(mode=None):
-    """Apply SOUP_SOLUTION_MLP_MEMORY=recompute|offload|none (default DEFAULT_MODE), or `mode`
+    """Apply SOUP_SOLUTION_MLP_MEMORY=offload|recompute|none (default DEFAULT_MODE), or `mode`
     when given. Returns the mode applied. Call it after mlp16's and fused_proj's MLP patches: with
     the fused MLP in place it sets what that MLP saves (fused_proj.set_mlp_recompute); without it,
     recompute replaces Qwen2MLP.forward. With offload, prepin() of SOUP_SOLUTION_OFFLOAD_PREPIN_MB
