@@ -26,7 +26,8 @@ loaded with 4-bit on-the-fly quantization on one GPU:
 The GPU then holds one checkpoint tensor (at most 27.5 MB in fp16) and one layer's 4-bit tensors at
 a time. If streaming is declined later, everything comes back to the GPU as it would have been
 (weight_stream.restore_loaded_layers, head_stream's restore). Any other load takes the original code.
-Switch: SOUP_SOLUTION_LOAD_STREAM=0.
+Switch: SOUP_SOLUTION_LOAD_STREAM=0. With SOUP_SOLUTION_LOAD_PINNED=1 the checkpoint -> GPU copies of
+the loads handled here go through pinned buffers filled by a thread (load_pinned.py).
 """
 
 import functools
@@ -119,6 +120,9 @@ class _Load:
         self.layers_moved = self.layer_bytes = self.embedding_bytes = 0
         self.layer_seconds = self.embedding_seconds = 0.0  # spent here (copies to the host, pinning)
         self.pinner = _Pinner(self._requests(), device)
+        from .load_pinned import new_copier
+
+        self.copier = new_copier(device)  # load_pinned.py (SOUP_SOLUTION_LOAD_PINNED=1), else None
 
     def _requests(self):
         """The pinned buffers this load will need, in the order it needs them."""
@@ -271,18 +275,21 @@ def _loader(original):
             print(f"[solution] load streaming skipped: {exc!r}")
             return original(*args, **kwargs)
         _ACTIVE["load"] = load
+        started = time.perf_counter()
         try:
             return original(*args, **kwargs)
         finally:
             _ACTIVE["load"] = None
             LAST["load"] = load
+            if load.copier is not None:
+                load.copier.close()
             load.pinner.close()
             if load.layer_bytes + load.embedding_bytes:
                 print(f"[solution] load streaming: {load.layers_moved} layers' 4-bit weights "
                       f"({load.layer_bytes / 2**20:.0f} MiB, {load.layer_seconds:.2f} s) and the embedding "
                       f"({load.embedding_bytes / 2**20:.0f} MiB, {load.embedding_seconds:.2f} s) to pinned "
                       f"host memory as they were loaded; buffers pinned by a thread alongside the load in "
-                      f"{load.pinner.seconds:.2f} s")
+                      f"{load.pinner.seconds:.2f} s; tensor loop {time.perf_counter() - started:.2f} s")
 
     return convert_and_load_state_dict_in_model
 
@@ -321,9 +328,22 @@ def _setter(original):
     return set_param_for_module
 
 
+def _spawner(original):
+    @functools.wraps(original)
+    def spawn_materialize(*args, **kwargs):
+        job = original(*args, **kwargs)
+        load = _ACTIVE["load"]
+        if load is None or load.copier is None:
+            return job
+        return load.copier.add(job, original, args, kwargs)  # load_pinned.py: the job the loop calls
+
+    return spawn_materialize
+
+
 def patch_loader(layers=None, only=None, embedding=None):
     """Turns on the load-time moves (layers: weight_stream.py; embedding: head_stream.py) and
-    installs the loader hooks (once per function)."""
+    installs the loader hooks (once per function); with SOUP_SOLUTION_LOAD_PINNED=1 also the hook
+    of load_pinned.py's copies."""
     if layers is not None:
         _STATE["layers"] = bool(layers)
         _STATE["only"] = frozenset(only) if only else None
@@ -337,3 +357,7 @@ def patch_loader(layers=None, only=None, embedding=None):
     _wrap(modeling_utils, "convert_and_load_state_dict_in_model", _loader)
     _wrap(core_model_loading, "get_device", _device)
     _wrap(core_model_loading, "set_param_for_module", _setter)
+    from .load_pinned import enabled as load_pinned_enabled
+
+    if load_pinned_enabled() and hasattr(core_model_loading, "spawn_materialize"):
+        _wrap(core_model_loading, "spawn_materialize", _spawner)
