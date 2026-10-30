@@ -563,8 +563,10 @@ def test_offload_of_fused_proj_mlp(restore_classes):
     assert torch.equal(out, ref_out) and torch.equal(gx, ref_gx)
     assert shapes == [((2 * inter, 832), True)] * layers, shapes
     s = off.stats
-    # the last layer's tensor is still on the GPU, each later one was prefetched one step ahead
-    assert s["still_on_gpu"] == 1 and s["prefetched"] == s["prefetch_hits"] == layers - 1
+    # the last layers' tensors (up to the window, fewer when a copy ended before the next pack) are
+    # still on the GPU, each one before them was prefetched ahead
+    assert 1 <= s["still_on_gpu"] <= window
+    assert s["prefetched"] == s["prefetch_hits"] == layers - s["still_on_gpu"]
     assert s["fetched"] == 0 and off.host.live() == 0
     print(f"\nfused MLP: {off.summary()}")
 
