@@ -4,6 +4,7 @@
 #
 #   export MSYS_NO_PATHCONV=1
 #   wsl -d Ubuntu -- bash tools/kaggle_wsl.sh <1|2> --mode solution --slug soup-tNN --commit <sha> [--env K=V ...]
+#   wsl -d Ubuntu -- bash tools/kaggle_wsl.sh <1|2> --attach --slug soup-tNN --mode solution   # re-join a running kernel
 #
 # 1 = account namedesign (token file kaggle1.token), 2 = account peagverr (kaggle2.token); both have the
 # private dataset soup-secrets with the GitHub read token. The commit must be pushed to origin first.
@@ -12,9 +13,10 @@
 # Results: runs_kaggle/<stamp>-<mode>-<slug>/output/ (gitignored). The CLI needs Python >= 3.11, hence WSL.
 #
 # Kaggle runs at most two GPU notebooks per account at a time (a third push fails or the kernel dies at
-# once). Several sessions on this laptop share account 1, so this script takes one of MAX_SLOTS slot
-# files in a directory shared by every worktree and waits while both are taken; a slot older than
-# 50 minutes counts as stale (a crashed run).
+# once). Several sessions on this laptop share the accounts, so this script takes one of MAX_SLOTS slot
+# files in a directory shared by every worktree and waits while both are taken. A slot is stale when
+# its holder is gone (its pid at this VM boot no longer exists: WSL restarted or the watcher was
+# killed; the Kaggle kernel itself keeps running) or after 50 minutes.
 acct=$1; shift
 case "$acct" in
   1) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle1.token; user=namedesign ;;
@@ -30,14 +32,23 @@ done
 MAX_SLOTS=2
 LOCKDIR=/mnt/c/Users/abdra/Projects/soup/runs_kaggle/.kaggle_slots_$user
 mkdir -p "$LOCKDIR"
-find "$LOCKDIR" -name '*.lock' -mmin +50 -delete 2>/dev/null
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+stale_locks() {
+  find "$LOCKDIR" -name '*.lock' -mmin +50 -delete 2>/dev/null
+  for f in "$LOCKDIR"/*.lock; do
+    [ -e "$f" ] || continue
+    read -r pid boot _ < "$f"
+    if [ "$boot" != "$BOOT_ID" ] || ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; fi
+  done
+}
+stale_locks
 sleep $((RANDOM % 7))
 while [ "$(ls "$LOCKDIR"/*.lock 2>/dev/null | wc -l)" -ge "$MAX_SLOTS" ]; do
   echo "[kaggle_wsl] both GPU slots of $user are taken ($(ls "$LOCKDIR" | tr '\n' ' ')); waiting 60 s"
   sleep 60
-  find "$LOCKDIR" -name '*.lock' -mmin +50 -delete 2>/dev/null
+  stale_locks
 done
-echo "$$ $(date) $slug" > "$LOCKDIR/$slug.lock"
+echo "$$ $BOOT_ID $(date) $slug" > "$LOCKDIR/$slug.lock"
 trap 'rm -f "$LOCKDIR/$slug.lock"' EXIT
 export KAGGLE_API_TOKEN=$(tr -d '\r\n ' < "$tok")
 export PATH=$HOME/miniforge3/envs/soup/bin:$PATH
