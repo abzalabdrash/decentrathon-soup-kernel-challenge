@@ -10,6 +10,9 @@ fp16 when the round trip is exact element for element (it is for an fp16 checkpo
 model on an Ampere card is left alone). A forward hook casts the embedding output to fp32, so the
 residual stream and the rotary tables keep the base's dtype; the fused head (fused_ce.py) uses the
 fp16 weight directly. The parameter is frozen, so nothing else sees the change.
+
+With head_stream.py on (the default), the weight is in pinned host memory before peft's cast and
+never comes back to the GPU: this module then leaves it alone and only serves as the fallback.
 """
 
 import torch
@@ -32,6 +35,12 @@ def _round_trip_exact(half, full):
     return True
 
 
+def _streamed(weight):
+    from .head_stream import streamer_for
+
+    return streamer_for(weight) is not None
+
+
 def shrink_embeddings(model):
     """Returns the number of embedding parameters moved to fp16 (0, 1 or 2)."""
     if not isinstance(model, torch.nn.Module):
@@ -52,6 +61,8 @@ def shrink_embeddings(model):
         seen.add(id(weight))
         if weight.dtype != torch.float32 or not weight.is_cuda or weight.requires_grad:
             continue
+        if _streamed(weight):
+            continue  # its values live in host memory (head_stream.py); the GPU holds 4 bytes
         half = weight.data.to(torch.float16)
         if not _round_trip_exact(half, weight.data):
             del half
