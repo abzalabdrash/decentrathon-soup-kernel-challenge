@@ -545,6 +545,13 @@ def helper_main(argv):
     Prints one JSON line: seconds and errors per registration."""
     begin = time.perf_counter()
     arch, half, names = int(argv[1]), argv[2], set(argv[3:])
+    try:
+        # the training process comes first when both want a core (Kaggle's T4 machines have 4
+        # vCPUs; apply()'s imports and the model load use one): the warm-up has seconds to spare
+        # (Kaggle, 7cca7a0: the helper was done 3.2 s before the first step)
+        os.nice(10)
+    except (AttributeError, OSError):  # not on POSIX
+        pass
     import torch
 
     _HELPER["half"] = getattr(torch, half)

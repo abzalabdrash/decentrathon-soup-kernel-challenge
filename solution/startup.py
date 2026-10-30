@@ -16,11 +16,13 @@ apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all four off):
   and only the repository root, which holds no distribution, was added to sys.path. While trl is
   imported, `packages_distributions` returns a copy of transformers' mapping. trl uses it only to
   find the version of liger_kernel and vllm (`_is_package_available(..., return_version=True)`).
-- 0.84 s: `transformers.generation.candidate_generator` imports scikit-learn when it is installed
-  (candidate_generator.py:30-31), for `roc_curve` in assisted generation with an adaptive
-  confidence threshold (:190-196, :253, :327). Training never generates. While that module is
-  imported, `transformers.utils.is_sklearn_available` answers False; the module keeps that answer
-  (it skips the adaptive threshold, as on a machine without scikit-learn).
+- 0.84 s: two transformers modules import scikit-learn (and scipy) when it is installed:
+  `generation.candidate_generator` (candidate_generator.py:30-31), for `roc_curve` in assisted
+  generation with an adaptive confidence threshold (:190-196, :253, :327), and the GLUE / XNLI
+  metric helpers of `transformers.data` (data/metrics/__init__.py:18-20), which `transformers.data`
+  imports with its collators. Training never generates nor computes GLUE metrics. While those two
+  are imported, `transformers.utils.is_sklearn_available` answers False; they keep that answer
+  (as on a machine without scikit-learn: no adaptive threshold, GLUE metrics unavailable).
 - 0.46 s: trl's base trainer imports wandb when it is installed (trl/trainer/base_trainer.py:
   17-23), to put the W&B run's URL into a model card (:87). Soup reports to W&B only with its
   `--wandb` flag (soup_cli/commands/train.py:1257), which the run does not use; `report_to` is
@@ -80,6 +82,7 @@ import importlib
 import os
 import sys
 import time
+import types
 
 from .phases import mark
 
@@ -93,8 +96,12 @@ def _flag(name):
 @contextlib.contextmanager
 def _replaced(owner, name, value):
     """`owner.name = value` for the duration of the block, then the original back (unless someone
-    else replaced it meanwhile)."""
+    else replaced it meanwhile). For a module, the one in sys.modules once `name` is read: the
+    first attribute read of `transformers` puts transformers' lazy module object in its place in
+    sys.modules, and `from transformers import name` reads that one."""
     original = getattr(owner, name)
+    if isinstance(owner, types.ModuleType):
+        owner = sys.modules.get(owner.__name__, owner)
     setattr(owner, name, value)
     try:
         yield original
@@ -175,6 +182,7 @@ def prepare_imports(log=True):
 
         with _replaced(transformers.utils, "is_sklearn_available", _not_installed):
             _import("transformers.generation.candidate_generator", seconds)
+            _import("transformers.data", seconds)  # trl imports its collators
         with _dynamo_disabled():
             _import("bitsandbytes", seconds)
         with distributions_from_transformers():

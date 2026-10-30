@@ -32,6 +32,11 @@ print("restored=" + str(metadata.packages_distributions is original_pd
                         and "TORCHDYNAMO_DISABLE" not in os.environ))
 print("trl_mapping_exact=" + str(trl_import_utils.PACKAGE_DISTRIBUTION_MAPPING
                                  == metadata.packages_distributions()))
+metrics = importlib.import_module("transformers.data.metrics")
+print("sklearn_answer=" + str(metrics.is_sklearn_available()))
+from solution.startup import _not_installed
+base_trainer = sys.modules["trl.trainer.base_trainer"]
+print("wandb_answer_kept=" + str(base_trainer.is_wandb_available is _not_installed))
 print("bnb_plain=" + str(type(ops._dequantize_4bit_compute).__name__ == "function"
                          and not hasattr(ops._dequantize_4bit_compute, "_torchdynamo_orig_callable")))
 print("heavy=" + ",".join(m for m in ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx")
@@ -45,10 +50,13 @@ def test_prepare_imports_in_a_fresh_process():
                          text=True, timeout=600, env=env)
     assert out.returncode == 0, out.stderr[-3000:]
     res = dict(line.split("=", 1) for line in out.stdout.splitlines() if "=" in line)
-    assert {"trl", "trl.trainer.sft_trainer", "bitsandbytes"} <= set(res["imported"].split(","))
+    assert {"trl", "trl.trainer.sft_trainer", "bitsandbytes", "transformers.data"} <= set(
+        res["imported"].split(","))
     assert res["restored"] == "True"
     assert res["trl_mapping_exact"] == "True"  # trl got the mapping a scan gives now
     assert res["bnb_plain"] == "True"
+    assert res["sklearn_answer"] == "False"  # what the module saw at its import
+    assert res["wandb_answer_kept"] == "True"  # trl's base trainer got the replacement
     assert res["heavy"] == ""
 
 
@@ -63,6 +71,29 @@ def test_dynamo_switch_restores_an_earlier_value(monkeypatch):
     with _dynamo_disabled():
         pass
     assert "TORCHDYNAMO_DISABLE" not in os.environ
+
+
+def test_replaced_acts_on_the_module_in_sys_modules(monkeypatch):
+    """A module that puts another object in its place in sys.modules on its first attribute read
+    (transformers does): the replacement and the restore act on that object."""
+    import types
+
+    from solution.startup import _replaced
+
+    first, second = types.ModuleType("soup_test_lazy"), types.ModuleType("soup_test_lazy")
+    second.flag = "original"
+    monkeypatch.setitem(sys.modules, "soup_test_lazy", first)
+
+    def swap(name):
+        sys.modules["soup_test_lazy"] = second
+        return getattr(second, name)
+
+    first.__getattr__ = swap
+    with _replaced(first, "flag", "ours"):
+        ns = {}
+        exec("from soup_test_lazy import flag", ns)
+        assert ns["flag"] == "ours"
+    assert second.flag == "original"
 
 
 def test_replaced_puts_back_unless_changed_meanwhile():
