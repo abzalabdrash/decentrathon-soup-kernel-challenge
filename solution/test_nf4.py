@@ -57,7 +57,8 @@ def _original_matmul4bit(monkeypatch):
     return lambda: monkeypatch.setattr(bnb_autograd, "MatMul4Bit", cls)
 
 
-@pytest.mark.parametrize("k,n", SHAPES + [(96, 40), (100, 7), (101, 7)])
+# (96, 40): 60 blocks, a partial program and a partial 256-block scale; (64, 13): 13 blocks
+@pytest.mark.parametrize("k,n", SHAPES + [(96, 40), (64, 13)])
 def test_dequant_bit_exact(k, n):
     import bitsandbytes.functional as bnb_functional
 
@@ -72,13 +73,16 @@ def test_dequant_bit_exact(k, n):
     assert torch.equal(ours, ref)
 
 
-@pytest.mark.parametrize("quant_type,compress_statistics", [("nf4", False), ("fp4", True)])
-def test_dequant_other_formats_fall_back(quant_type, compress_statistics):
+@pytest.mark.parametrize("quant_type,compress_statistics,k,n", [
+    ("nf4", False, 256, 64), ("fp4", True, 256, 64),
+    ("nf4", True, 100, 7), ("nf4", True, 101, 7),  # N * K not a multiple of 64 (odd, too)
+])
+def test_dequant_other_formats_fall_back(quant_type, compress_statistics, k, n):
     import bitsandbytes.functional as bnb_functional
 
     from solution.nf4 import _fast_path, dequantize_nf4
 
-    layer = _layer(256, 64, seed=1, quant_type=quant_type, compress_statistics=compress_statistics)
+    layer = _layer(k, n, seed=1, quant_type=quant_type, compress_statistics=compress_statistics)
     qs = layer.weight.quant_state
     assert not _fast_path(layer.weight, qs, torch.float16)
     assert torch.equal(dequantize_nf4(layer.weight, qs), bnb_functional.dequantize_4bit(layer.weight, qs))

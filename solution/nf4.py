@@ -21,6 +21,14 @@ rounded to fp32, then to fp16); the kernel is compiled without FMA contraction s
 and the add stay two roundings (with contraction 13 to 78 weights per matrix of this task come out one
 ulp off). The result is bit-for-bit `bitsandbytes.functional.dequantize_4bit`.
 
+How the kernel moves data (the pass is bound by memory bandwidth): each 64-element block is 8 int32
+words of packed codes, and one word gives 8 consecutive fp16 outputs, i.e. one 16-byte store. The
+absmax is computed once per block and kept in a register; the NF4 levels are read from the 16-entry
+table, which sits in one 64-byte L1 line. Masks are per block (N * K must be a multiple of 64, true
+for every layer of this model; other sizes go to bitsandbytes), so the word loads and the stores stay
+vectorized. Compiled for sm_75 this is about a quarter fewer instructions than reading bytes and
+interleaving the two nibbles, and the packed codes are no longer read one byte per load.
+
 The matmul stays in cuBLAS: on a T4 Triton 3.6 has no tensor-core path, so the kernel only replaces
 the dequantization. The patched `MatMul4Bit` keeps only the packed weight and the quant state for the
 backward, as the original does; the fp16 weight lives only inside each call. Where bitsandbytes would
@@ -39,15 +47,14 @@ BLOCKS_PER_PROGRAM = 32  # 32 x 64 = 2048 weights per program
 
 @triton.jit
 def nf4_dequant_kernel(
-    packed_ptr,  # uint8 (ceil(n / 2),): two 4-bit codes per byte, high nibble first
+    words_ptr,  # int32 (n / 8,): the packed weight read as words, 8 codes per word
     qabsmax_ptr,  # uint8 (n_blocks,): 8-bit code of each block's absmax
     code2_ptr,  # fp32 (256,): state2.code, the map of those 8-bit codes
     absmax2_ptr,  # fp32 (ceil(n_blocks / ABLOCK),): state2.absmax
     offset_ptr,  # fp32 (): quant_state.offset
     nf4_ptr,  # fp32 (16,): quant_state.code, the NF4 levels
     out_ptr,  # fp16 (n,): the row-major (N, K) weight
-    n,
-    n_blocks,
+    n_blocks,  # n / QBLOCK
     QBLOCK: tl.constexpr,
     ABLOCK: tl.constexpr,
     BLOCKS: tl.constexpr,
@@ -60,19 +67,21 @@ def nf4_dequant_kernel(
     absmax = tl.load(code2_ptr + q) * scale
     absmax = absmax + tl.load(offset_ptr)
 
-    half: tl.constexpr = QBLOCK // 2
-    byte = blk[:, None] * half + tl.arange(0, half)[None, :]
-    packed = tl.load(packed_ptr + byte, mask=byte * 2 < n, other=0)
-    hi = tl.load(nf4_ptr + (packed >> 4).to(tl.int32)) * absmax[:, None]
-    lo = tl.load(nf4_ptr + (packed & 15).to(tl.int32)) * absmax[:, None]
-    vals = tl.interleave(hi, lo)  # (BLOCKS, QBLOCK): element 2j from the high nibble of byte j
+    # element j of a word: bytes in little-endian order, high nibble first, so the code of element
+    # j sits at bit 4, 0, 12, 8, 20, 16, 28, 24
+    words: tl.constexpr = QBLOCK // 8
+    w = tl.load(words_ptr + blk[:, None] * words + tl.arange(0, words)[None, :], mask=live[:, None], other=0)
+    j = tl.arange(0, 8)
+    codes = (w[:, :, None] >> ((j // 2) * 8 + (1 - j % 2) * 4)[None, None, :]) & 15
+    levels = tl.reshape(tl.load(nf4_ptr + codes), (BLOCKS, QBLOCK))
+    vals = levels * absmax[:, None]
     elem = blk[:, None] * QBLOCK + tl.arange(0, QBLOCK)[None, :]
-    tl.store(out_ptr + elem, vals.to(out_ptr.dtype.element_ty), mask=elem < n)
+    tl.store(out_ptr + elem, vals.to(out_ptr.dtype.element_ty), mask=live[:, None])
 
 
 def _fast_path(weight, quant_state, dtype):
     """True when the kernel handles this weight: NF4 with nested absmax in bitsandbytes' layout,
-    blocksizes 64 / 256, fp16 output, everything on one CUDA device."""
+    blocksizes 64 / 256, N * K a multiple of 64, fp16 output, everything on one CUDA device."""
     from bitsandbytes.functional import QuantState
 
     if not isinstance(quant_state, QuantState) or not torch.is_tensor(weight):
@@ -91,9 +100,9 @@ def _fast_path(weight, quant_state, dtype):
         return False
     if weight.device.index != torch.cuda.current_device():  # the kernel launches on the current device
         return False
-    n_blocks = -(-n // QBLOCK)
-    return (weight.dtype == torch.uint8 and weight.is_contiguous() and weight.numel() == (n + 1) // 2
-            and 0 < n < 2 ** 31
+    n_blocks = n // QBLOCK
+    return (weight.dtype == torch.uint8 and weight.is_contiguous() and weight.numel() == n // 2
+            and 0 < n < 2 ** 31 and n % QBLOCK == 0 and weight.data_ptr() % 4 == 0
             and quant_state.absmax.dtype == torch.uint8 and quant_state.absmax.numel() == n_blocks
             and quant_state.code.dtype == torch.float32 and quant_state.code.numel() == 16
             and quant_state.offset.dtype == torch.float32 and quant_state.offset.numel() == 1
@@ -109,9 +118,10 @@ def _launch(weight, quant_state, dtype, out=None):
     if out is None:
         out = torch.empty((n_rows, n_cols), dtype=dtype, device=weight.device)
     state2 = quant_state.state2
+    words = weight.view(-1).view(torch.int32)
     nf4_dequant_kernel[(triton.cdiv(n_blocks, BLOCKS_PER_PROGRAM),)](
-        weight, quant_state.absmax, state2.code, state2.absmax, quant_state.offset,
-        quant_state.code, out, n_rows * n_cols, n_blocks,
+        words, quant_state.absmax, state2.code, state2.absmax, quant_state.offset,
+        quant_state.code, out, n_blocks,
         QBLOCK=QBLOCK, ABLOCK=ABLOCK, BLOCKS=BLOCKS_PER_PROGRAM,
         num_warps=4, enable_fp_fusion=False,
     )
