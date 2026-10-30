@@ -7,7 +7,7 @@ big MLP products 1.6-1.9x faster than fp16 at the step's token counts (solution/
 docs/RESEARCH.md): it does half the bytes and draws less power per operation, so the card throttles
 less. The MLP backward of fused_proj.py becomes, with M the step's tokens (padded to 8):
 
-1. grad (M, D) half -> per-token absmax int8 (`quant_rows_int8_kernel`): g_q, s_g;
+1. grad (M, D) half -> per-token absmax int8 (torch ops: a small pass): g_q, s_g;
 2. W_down (D, I) NF4 -> W_down^T (I, D) int8 with one scale per input feature, the column maxima
    of the weight (`nf4_int8_t_kernel`, the NF4 decode of nf4.py, then round(v * 127 / colmax));
 3. acc_h (I, M) int32 = W_down^T_q @ g_q^T (`torch._int_mm`, "TN");
@@ -18,8 +18,8 @@ less. The MLP backward of fused_proj.py becomes, with M the step's tokens (padde
    (`quant_t_int8_kernel`);
 6. W_gate, W_up (I, D) NF4 -> [W_gate^T | W_up^T] (D, 2I) int8, one scale per input feature shared
    by both (the contraction runs over gate and up together);
-7. acc_x (M, D) int32 = dgu_q @ W^T_q^T (`torch._int_mm`), and `int8_scale_kernel` gives the fp32
-   input gradient acc_x * s_g2[m] * s_w2[k].
+7. acc_x (M, D) int32 = dgu_q @ W^T_q^T (`torch._int_mm`), and the fp32 input gradient
+   acc_x * s_g2[m] * s_w2[k] (torch ops).
 The weights' column maxima are computed once per weight and run (from its fp16 rebuild; the rules
 allow precomputed auxiliary tensors for the whole run) and kept on the module. The int8 weights
 take the place of the fp16 rebuild in fused_proj's shared buffer (the (D, 2I) int8 copy is exactly
@@ -43,7 +43,10 @@ _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "0").strip().lower()
           not in ("0", "false", "no", "")}
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
-TILE_I, TILE_M, GROUPS = 32, 32, 10  # SwiGLU backward: (features, tokens) tile, feature groups
+# SwiGLU backward: (features, tokens) tile and feature groups. bench_int8_mlp.py on the T4: 0.44 ms
+# per layer at 832 tokens and 0.83 ms at 1440 with (32, 64, 10); (32, 32, 10) 0.51 / 0.89; (16, 64,
+# 20) 0.61 / 1.10; (8, 128, *) 1.1-1.8
+TILE_I, TILE_M, GROUPS = 32, 64, 10
 TQ_R, TQ_M = 64, 64  # (rows, tokens) tile of the transposing quantization: 128-byte loads, 64-byte stores
 
 
@@ -70,20 +73,6 @@ def nf4_int8_t_kernel(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr
     q8 = tl.minimum(tl.maximum(scaled, -127.0), 127.0).to(tl.int8)
     dest = cols[:, None].to(tl.int64) * out_stride + (row_offset + rows)[None, :]
     tl.store(out_ptr + dest, tl.trans(q8))
-
-
-@triton.jit
-def quant_rows_int8_kernel(x_ptr, q_ptr, scale_ptr, n_cols, BLOCK: tl.constexpr):
-    # one row of x (half) -> int8 with scale = absmax / 127 (0 for a row of zeros: the padding rows)
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK)
-    ok = cols < n_cols
-    x = tl.load(x_ptr + row * n_cols + cols, mask=ok, other=0.0).to(tl.float32)
-    amax = tl.max(tl.abs(x), axis=0)
-    inv = tl.where(amax > 0.0, 127.0 / amax, 0.0)
-    q8 = tl.minimum(tl.maximum(tl.floor(x * inv + 0.5), -127.0), 127.0).to(tl.int8)
-    tl.store(q_ptr + row * n_cols + cols, q8, mask=ok)
-    tl.store(scale_ptr + row, amax / 127.0)
 
 
 @triton.jit
@@ -137,19 +126,16 @@ def quant_t_int8_kernel(src_ptr, pmax_ptr, amax_ptr, q_ptr, n_rows, tokens,
     tl.store(q_ptr + dest, tl.trans(q8), mask=live[:, None])
 
 
-@triton.jit
-def int8_scale_kernel(acc_ptr, amax_ptr, w_scale_ptr, out_ptr, n_cols, BLOCK: tl.constexpr):
-    # out (fp32) = acc (int32) * (amax[row] / 127) * w_scale[col], one row per program
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK)
-    ok = cols < n_cols
-    acc = tl.load(acc_ptr + row * n_cols + cols, mask=ok, other=0).to(tl.float32)
-    s_row = tl.load(amax_ptr + row) / 127.0
-    out = acc * s_row * tl.load(w_scale_ptr + cols, mask=ok, other=0.0)
-    tl.store(out_ptr + row * n_cols + cols, out, mask=ok)
-
-
 # ---------------------------------------------------------------------------------------------
+
+
+def _quant_rows(x):
+    """Per-row absmax int8 of a 2-D half tensor: (int8 rows, fp32 scales = absmax / 127); a row of
+    zeros (the padding rows) gets scale 0 and zeros."""
+    amax = x.abs().amax(dim=1).float()
+    inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
+    q = torch.floor(x.float().mul_(inv[:, None]).add_(0.5)).clamp_(-127, 127).to(torch.int8)
+    return q, amax / 127.0
 
 
 def _column_scales(base, half, buf):
@@ -204,10 +190,8 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     inter = plan.gate.out_features
     device = grad16.device
     i8 = buffer.view(torch.int8)
-    # 1. the incoming gradient per token
-    g_q = torch.empty((tokens, d), dtype=torch.int8, device=device)
-    s_g = torch.empty(tokens, dtype=torch.float32, device=device)
-    quant_rows_int8_kernel[(tokens,)](grad16, g_q, s_g, d, BLOCK=triton.next_power_of_2(d))
+    # 1. the incoming gradient per token (torch ops: a small pass, no kernel to compile)
+    g_q, s_g = _quant_rows(grad16)
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
@@ -231,15 +215,14 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
-    # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors
+    # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
-    grad_x = torch.empty((tokens, d), dtype=torch.float32, device=device)
-    int8_scale_kernel[(tokens,)](acc_x, amax, scale_gu, grad_x, d, BLOCK=triton.next_power_of_2(d))
+    grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])
     return grad_x
 
 
 def _warm():
-    """warmup.py registration of the five kernels in the classes training launches."""
+    """warmup.py registration of the three kernels in the classes training launches."""
     from .warmup import HIDDEN, INTERMEDIATE, SKIPPED, TOKENS, compile_kernel, training_half_dtype
 
     if not _STATE["on"]:
@@ -252,10 +235,8 @@ def _warm():
             compile_kernel(nf4_int8_t_kernel, i32, u8, f32, f32, f32, f32, f32, i8,
                            n_cols // QBLOCK, stride, offset, ROWS=W_ROWS, QBLOCK=QBLOCK,
                            ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
-    compile_kernel(quant_rows_int8_kernel, half, i8, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
     compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, f32, INTERMEDIATE, tokens,
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
-    compile_kernel(int8_scale_kernel, i32, f32, f32, f32, HIDDEN, BLOCK=triton.next_power_of_2(HIDDEN))
     return None
