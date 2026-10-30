@@ -7,6 +7,8 @@
     python -m solution.bench_warmup first-call  # first training-shape launch, without / with warm-up
     python -m solution.bench_warmup first-step  # first steps of a one-layer 4-bit model after apply()
     python -m solution.bench_warmup apply       # warm-up started before / after apply()
+    python -m solution.bench_warmup load        # the real model load next to the warm-up / imports
+    python -m solution.bench_warmup workers     # the warm-up with 1 to 4 worker threads
     python -m solution.bench_warmup all
 
 Kernels are compiled for fp16, the T4's dtype, on any card.
@@ -137,9 +139,10 @@ def _child_env(cache_root):
     return dict(os.environ, TRITON_CACHE_DIR=tempfile.mkdtemp(prefix="triton-", dir=cache_root))
 
 
-def _child(args, cache_root):
+def _child(args, cache_root, **env):
     out = subprocess.run([sys.executable, "-m", "solution.bench_warmup", *args], cwd=REPO,
-                         env=_child_env(cache_root), capture_output=True, text=True, timeout=900)
+                         env=dict(_child_env(cache_root), **env), capture_output=True, text=True,
+                         timeout=900)
     if out.returncode != 0:
         raise RuntimeError(f"{args}: {out.stderr[-3000:]}")
     return dict(line.split("=", 1) for line in out.stdout.split("\n") if "=" in line)
@@ -159,6 +162,8 @@ def _setup_warmup():
     from solution import fused_ce, swiglu, warmup  # noqa: F401 - what apply() has imported
 
     warmup.training_half_dtype = lambda: torch.float16
+    if os.environ.get("BENCH_WARMUP_WORKERS"):  # report_workers
+        warmup.WORKERS = int(os.environ["BENCH_WARMUP_WORKERS"])
     return warmup
 
 
@@ -356,6 +361,65 @@ def child_apply(mode):
           f"after_apply_s={done - apply_end:.3f}")
 
 
+MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+LOAD_IMPORTS = ("trl", "datasets")  # what Soup imports later and loading the model does not need
+
+
+def _load_model():
+    """The model as Soup's `_setup_transformers` builds it: 4-bit NF4 with double quant and fp16
+    compute, `prepare_model_for_kbit_training`, LoRA r=16 on q_proj / v_proj."""
+    import torch
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                               bnb_4bit_compute_dtype=torch.float16, bnb_4bit_use_double_quant=True)
+    model = AutoModelForCausalLM.from_pretrained(MODEL, quantization_config=quant,
+                                                 dtype=torch.float16, device_map={"": 0})
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    return get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                            target_modules=["q_proj", "v_proj"],
+                                            task_type="CAUSAL_LM"))
+
+
+def child_load(mode):
+    """Loading the real model (from the local cache) alone, with the warm-up running next to it
+    (warmup, after apply()), or with `preload_in_background(LOAD_IMPORTS)` next to it (imports,
+    without apply(), so that those modules are not imported yet; `seq` imports them first)."""
+    _prelude()
+    from triton.runtime.jit import JITFunction  # noqa: F401 - the harness imports it before apply()
+
+    import importlib
+
+    import peft  # noqa: F401 - Soup imports it at the start of _setup_transformers (sft.py:1613)
+
+    if mode in ("alone", "warmup"):
+        import solution
+
+        warmup = _setup_warmup()
+        solution.apply()
+    start = time.perf_counter()
+    if mode == "warmup":
+        warmup.start_background_warmup(log=False)
+    if mode == "imports":
+        from solution.warmup import preload_in_background
+
+        ready = preload_in_background(LOAD_IMPORTS, log=False)
+    if mode == "seq":
+        for name in LOAD_IMPORTS:
+            importlib.import_module(name)
+        print(f"imports_s={time.perf_counter() - start:.3f}")
+    _load_model()
+    print(f"load_end_s={time.perf_counter() - start:.3f}")
+    if mode == "warmup":
+        warmup.wait_for_warmup()
+        print(f"warmup_s={warmup.warmup_report()['seconds']:.3f}")
+    if mode == "imports":
+        ready.wait()
+        print(f"imports_s={sum(ready.seconds.values()):.3f}")
+    print(f"all_done_s={time.perf_counter() - start:.3f}")
+
+
 # ---------------------------------------------------------------- reports
 
 def report_imports(cache_root, repeats=3):
@@ -452,21 +516,58 @@ def report_apply(cache_root, repeats=3):
               f"{med['warmup_done_s']:.2f}, {med['after_apply_s']:.2f} after apply()")
 
 
+def report_load(cache_root, repeats=2):
+    """Needs the model in the local Hugging Face cache and about 1.5 GB of free GPU memory."""
+    modes = ("alone", "warmup", "seq", "imports")
+    runs = {mode: [] for mode in modes}
+    for _ in range(repeats):
+        for mode in modes:
+            runs[mode].append(_child(["child-load", mode], cache_root))
+
+    def med(mode, key):
+        return statistics.median(float(r[key]) for r in runs[mode])
+
+    print(f"loading {MODEL} in 4 bits + LoRA, medians of {repeats}, s from the start of the load:")
+    print(f"  after apply(), alone: load {med('alone', 'load_end_s'):.2f}")
+    print(f"  after apply(), warm-up next to it: load {med('warmup', 'load_end_s'):.2f}, warm-up "
+          f"{med('warmup', 'warmup_s'):.2f}, both done {med('warmup', 'all_done_s'):.2f}")
+    print(f"  {', '.join(LOAD_IMPORTS)} imported first ({med('seq', 'imports_s'):.2f}), then the "
+          f"load: both done {med('seq', 'all_done_s'):.2f}")
+    print(f"  {', '.join(LOAD_IMPORTS)} imported next to the load: load "
+          f"{med('imports', 'load_end_s'):.2f}, imports {med('imports', 'imports_s'):.2f}, both "
+          f"done {med('imports', 'all_done_s'):.2f}")
+
+
+def report_workers(cache_root, repeats=2):
+    """The whole warm-up with 1 to 4 worker threads, main thread waiting or spinning a counter."""
+    print(f"whole warm-up by worker threads, medians of {repeats}, s (counter rate against alone):")
+    for workers in (1, 2, 3, 4):
+        env = {"BENCH_WARMUP_WORKERS": str(workers)}
+        wait, spin, rate = [], [], []
+        for _ in range(repeats):
+            wait.append(float(_child(["child-gil", "wait"], cache_root, **env)["total"]))
+            a, b = _child(["child-gil", "spin"], cache_root, **env)["all"].split("|")
+            spin.append(float(a))
+            rate.append(float(b))
+        print(f"  {workers} worker(s): waiting {statistics.median(wait):.2f}, spinning "
+              f"{statistics.median(spin):.2f} (rate {statistics.median(rate):.2f})")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     children = {"child-import": child_import, "child-prelude": child_prelude,
                 "child-compile": child_compile, "child-gil": child_gil,
                 "child-first-call": child_first_call, "child-first-step": child_first_step,
-                "child-apply": child_apply}
+                "child-apply": child_apply, "child-load": child_load}
     if cmd in children:
         children[cmd](*sys.argv[2:])
         return
     reports = {"imports": report_imports, "compile": report_compile, "gil": report_gil,
                "first-call": report_first_call, "first-step": report_first_step,
-               "apply": report_apply}
+               "apply": report_apply, "load": report_load, "workers": report_workers}
     root = os.environ.get("TRITON_CACHE_DIR") or tempfile.mkdtemp(prefix="bench-warmup-")
     os.makedirs(root, exist_ok=True)
-    for name in (reports if cmd == "all" else [cmd]):
+    for name in ([r for r in reports if r != "load"] if cmd == "all" else [cmd]):
         print(f"== {name}")
         reports[name](root)
 

@@ -1,9 +1,12 @@
 """Triton compilation of the run's kernels in a background thread while Soup loads the model.
 
 Every measured run starts with empty compiler caches, so the first training step compiles every
-kernel it meets (Kaggle T4, commit 1274b24: step 1 took 3.45 s, the others about 0.45 s). Here a
-daemon thread compiles them ahead, during the 10 s or so the main thread spends loading and
-quantizing the model, so that the first step finds them in Triton's in-memory cache.
+kernel it meets (Kaggle T4, commit d649c7c: the first two steps took about 4.5 s against 0.9 s for
+two ordinary ones; from the end of apply() to the first step there are about 6 s: the model load,
+3.1 s, and the trainer setup, 2.9 s). Here a daemon thread compiles them ahead, so that the first
+step finds them in Triton's in-memory cache: the 11 variants a real step compiles (rms_norm_rows_fwd
+and _bwd two each, nf4_dequant_kernel, rope_qk_kernel forward and backward, fused_ce_rows_kernel two,
+the example SwiGLU forward and backward) and a rarer third one of fused_ce_rows_kernel.
 
 What makes a launch compile (triton 3.6.0, triton/runtime/jit.py)
 -----------------------------------------------------------------
@@ -58,7 +61,8 @@ does not count a warm-up of a kernel that training never launches):
         ...
         register(_warm_my_kernel, name="my_kernel")
 
-once per class the training launches can take (see above). A registration that raises is logged
+once per class the training launches can take (see above), all classes of one kernel in one
+registration (the workers run registrations side by side). A registration that raises is logged
 and skipped; the others still run. `start_background_warmup()` reads the registry when it is
 called, so `apply()` calls it after the patches.
 
@@ -72,11 +76,17 @@ Python, each retake waits up to the switch interval (5 ms by default), so the th
 """
 
 import importlib
+import os
 import sys
 import threading
 import time
 
 SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
+# threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
+# the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
+# 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
+# about 1 s of its time in every case. One core is left to the main thread.
+WORKERS = max(1, min(3, (os.cpu_count() or 2) - 1))
 VOCAB = 151936  # Qwen2.5's vocabulary: V and stride_row of the fused head (divisible by 16)
 INTERMEDIATE = 8960  # Qwen2.5-1.5B's MLP width: 16 * 560
 TOKENS = 826  # a typical packed batch; only its class matters (tokens * 8960 is always "D")
@@ -85,8 +95,14 @@ WARMUPS = []  # [(name, fn)]: run in this order by the background thread
 COMPILES = []  # every compile seen by `watch_compiles`, as dicts (see there)
 
 _LOCK = threading.Lock()
-_STATE = {"thread": None, "ident": None, "begin": None, "seconds": None, "results": {},
-          "errors": {}}
+
+
+def _new_state():
+    return {"thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
+            "errors": {}}
+
+
+_STATE = _new_state()
 _DONE = threading.Event()
 _HOOKS = {"installed": False}
 
@@ -225,11 +241,12 @@ def _rope(backward):
                    num_warps=NUM_WARPS)
 
 
-@register(name="rope_qk_kernel forward")
-def warm_rope_fwd():
+@register(name="rope_qk_kernel")
+def warm_rope():
     if not _switched_on("SOUP_SOLUTION_ROPE"):
         return SKIPPED
     _rope(backward=False)
+    _rope(backward=True)
 
 
 @register(name="example_swiglu_fwd_kernel")
@@ -246,13 +263,14 @@ def warm_fused_ce():
     # logits half, stride_row = V = 151936 ("D"), targets int64, loss / entropy fp32, correct int32
     # (all chunk slices start at a multiple of the 512-row chunk: aligned), grad_scale float.
     # n_grad_rows: 387 stands for a count that is not a multiple of 16 (most chunks), 512 for one
-    # that is (0 too: a chunk without labelled rows)
+    # that is (0 too: a chunk without labelled rows), 1 is a constant of its own
     import torch
 
     from .fused_ce import BLOCK_V, IGNORE_INDEX, fused_ce_rows_kernel
 
     half = training_half_dtype()
-    for n_grad in (387, 512):
+    # 1 last: a chunk that ends one labelled row past its start is rare
+    for n_grad in (387, 512, 1):
         compile_kernel(fused_ce_rows_kernel, half, VOCAB, torch.int64, torch.float32,
                        torch.float32, torch.int32, 1.0, n_grad, VOCAB,
                        IGNORE=IGNORE_INDEX, BLOCK=BLOCK_V, num_warps=8)
@@ -287,54 +305,76 @@ def warm_rmsnorm_bwd():
                        num_warps=BWD_WARPS)
 
 
-@register(name="rope_qk_kernel backward")
-def warm_rope_bwd():
-    if not _switched_on("SOUP_SOLUTION_ROPE"):
-        return SKIPPED
-    _rope(backward=True)
+def _prepare_triton():
+    """What the first compile of the process does once, done before the workers start so that they
+    do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
+    the C compiler, triton/backends/nvidia/driver.py:61-64) and the hash of triton's own files
+    (`triton_key`, triton/runtime/cache.py:272)."""
+    from triton.runtime.driver import driver
 
+    driver.active.get_current_device()
+    try:
+        from triton.runtime.cache import triton_key
 
-@register(name="fused_ce_rows_kernel n_grad_rows=1")
-def warm_fused_ce_one():
-    # a chunk that ends one labelled row past its start: rare, so it goes last
-    import torch
-
-    from .fused_ce import BLOCK_V, IGNORE_INDEX, fused_ce_rows_kernel
-
-    compile_kernel(fused_ce_rows_kernel, training_half_dtype(), VOCAB, torch.int64, torch.float32,
-                   torch.float32, torch.int32, 1.0, 1, VOCAB,
-                   IGNORE=IGNORE_INDEX, BLOCK=BLOCK_V, num_warps=8)
+        triton_key()
+    except Exception:  # noqa: BLE001 - another triton layout; the first compile does it then
+        pass
 
 
 def _run(jobs, device, log):
-    _STATE["ident"] = threading.get_ident()
     begin = time.perf_counter()
     # The compile drops and retakes the GIL many times; while the main thread runs Python, every
-    # retake waits for the switch interval (5 ms by default). RTX 3050 Ti, all registrations, medians
-    # of 3 (bench_warmup.py gil): 3.1 s with the main thread waiting; with it spinning a Python
-    # counter, 15.3 s at 5 ms (counter at 100% of its rate alone), 5.5 s at 1 ms (89%), 4.0 s at
-    # 0.2 ms (79%). 1 ms keeps the warm-up well inside the model load and costs the main thread at
-    # most 11% while it runs.
+    # retake waits for the switch interval (5 ms by default). RTX 3050 Ti, one worker, medians of 3
+    # (bench_warmup.py gil, before rmsnorm / nf4 / rope): 3.1 s with the main thread waiting; with
+    # it spinning a Python counter, 15.3 s at 5 ms (counter at 100% of its rate alone), 5.5 s at
+    # 1 ms (89%), 4.0 s at 0.2 ms (79%). 1 ms keeps the warm-up short and costs the main thread at
+    # most about 11% while it runs.
     previous = sys.getswitchinterval()
     sys.setswitchinterval(min(previous, SWITCH_INTERVAL))
     ours = sys.getswitchinterval()  # read back: CPython stores it in microseconds
+    pending = list(jobs)
+    take = threading.Lock()
+
+    def worker():
+        # about two thirds of a registration is the launcher's C build and the cubin load, outside
+        # the GIL: several workers overlap them. Triton compiles from several threads by design
+        # (its AsyncCompileMode takes any Executor, triton/runtime/_async_compile.py). One
+        # registration per kernel, so that two workers never fill the same kernel's cache.
+        import torch
+
+        _STATE["idents"].add(threading.get_ident())
+        torch.cuda.set_device(device)
+        while True:
+            with take:
+                if not pending:
+                    return
+                name, fn = pending.pop(0)
+            start = time.perf_counter()
+            try:
+                # a registration that does launch something stays off the main thread's stream
+                with torch.cuda.stream(stream):
+                    skipped = fn() == SKIPPED
+                _STATE["results"][name] = (SKIPPED if skipped
+                                           else round(time.perf_counter() - start, 3))
+            except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
+                _STATE["errors"][name] = repr(exc)
+                if log:
+                    print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
+
     try:
         import torch
 
+        _STATE["idents"].add(threading.get_ident())
         torch.cuda.set_device(device)
         stream = torch.cuda.Stream(device)
-        # a registration that does launch something stays off the main thread's stream
-        with torch.cuda.stream(stream):
-            for name, fn in jobs:
-                start = time.perf_counter()
-                try:
-                    skipped = fn() == SKIPPED
-                    _STATE["results"][name] = (SKIPPED if skipped
-                                               else round(time.perf_counter() - start, 3))
-                except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
-                    _STATE["errors"][name] = repr(exc)
-                    if log:
-                        print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
+        _prepare_triton()
+        helpers = [threading.Thread(target=worker, name=f"solution-warmup-{i}", daemon=True)
+                   for i in range(1, min(WORKERS, len(pending)))]
+        for helper in helpers:
+            helper.start()
+        worker()
+        for helper in helpers:
+            helper.join()
         stream.synchronize()
     except Exception as exc:  # noqa: BLE001
         _STATE["errors"]["(thread)"] = repr(exc)
@@ -354,9 +394,10 @@ def _run(jobs, device, log):
 
 
 def start_background_warmup(log=True):
-    """Starts the daemon thread that runs every registered warm-up once, on the caller's CUDA
-    device and on a stream of its own. Returns the thread (the same one on later calls), or None
-    without CUDA. The registry is read now: register before calling this."""
+    """Starts the daemon thread that runs every registered warm-up once (with up to WORKERS - 1
+    daemon helpers), on the caller's CUDA device and on a stream of its own. Returns the thread
+    (the same one on later calls), or None without CUDA. The registry is read now: register before
+    calling this."""
     with _LOCK:
         if _STATE["thread"] is not None:
             return _STATE["thread"]
@@ -389,16 +430,16 @@ def wait_for_warmup(timeout=None):
 
 def warmup_report():
     """Diagnostics: per-registration seconds, errors, total seconds, and the compiles seen by
-    `watch_compiles` inside and outside the warm-up thread."""
-    ident = _STATE["ident"]
+    `watch_compiles` inside and outside the warm-up threads."""
+    idents = _STATE["idents"]
     return {
         "started": _STATE["thread"] is not None,
         "done": _DONE.is_set(),
         "seconds": _STATE["seconds"],
         "results": dict(_STATE["results"]),
         "errors": dict(_STATE["errors"]),
-        "compiles_in_warmup": sum(1 for c in COMPILES if c["thread"] == ident),
-        "compiles_outside": [c for c in COMPILES if c["thread"] != ident],
+        "compiles_in_warmup": sum(1 for c in COMPILES if c["thread"] in idents),
+        "compiles_outside": [c for c in COMPILES if c["thread"] not in idents],
     }
 
 
@@ -452,7 +493,7 @@ def watch_compiles(log=True):
                     "is_warmup": bool(kwargs.get("is_manual_warmup")),
                 }
                 COMPILES.append(record)
-                if log and record["thread"] != _STATE["ident"]:
+                if log and record["thread"] not in _STATE["idents"]:
                     print(f"[solution] triton compile outside warmup: {record['kernel']} "
                           f"{record['seconds']:.2f} s ({record['spec']}; num_warps="
                           f"{record['num_warps']})", flush=True)

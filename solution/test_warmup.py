@@ -28,8 +28,7 @@ def fresh(monkeypatch):
     monkeypatch.setattr(warmup, "BUILTIN", list(warmup.WARMUPS), raising=False)
     monkeypatch.setattr(warmup, "WARMUPS", [])
     monkeypatch.setattr(warmup, "COMPILES", [])
-    monkeypatch.setattr(warmup, "_STATE", {"thread": None, "ident": None, "begin": None,
-                                           "seconds": None, "results": {}, "errors": {}})
+    monkeypatch.setattr(warmup, "_STATE", warmup._new_state())
     monkeypatch.setattr(warmup, "_DONE", threading.Event())
     monkeypatch.setattr(warmup, "_HOOKS", {"installed": False})
     monkeypatch.setattr(knobs.runtime, "jit_cache_hook", None)
@@ -56,12 +55,11 @@ def test_register_forms_and_replace(fresh):
 
 def test_thread_runs_all_and_survives_errors(fresh):
     seen = []
-
     interval = sys.getswitchinterval()
 
     @fresh.register(name="a")
     def a():
-        seen.append(("a", threading.current_thread().name,
+        seen.append(("a", threading.current_thread().name.startswith("solution-warmup"),
                      torch.cuda.current_stream() != torch.cuda.default_stream()))
         seen.append(("switch", sys.getswitchinterval(), None))
 
@@ -79,9 +77,10 @@ def test_thread_runs_all_and_survives_errors(fresh):
     assert fresh.start_background_warmup(log=False) is thread  # once per process
     assert fresh.wait_for_warmup(30)
     report = fresh.warmup_report()
-    assert seen == [("a", "solution-warmup", True),
-                    ("switch", pytest.approx(min(interval, fresh.SWITCH_INTERVAL)), None),
-                    ("c", 1024.0, None)]
+    assert sorted(seen, key=str) == sorted([("a", True, True), ("c", 1024.0, None),
+                                            ("switch", pytest.approx(min(interval,
+                                                                         fresh.SWITCH_INTERVAL)),
+                                             None)], key=str)
     assert sys.getswitchinterval() == interval  # restored
     assert set(report["results"]) == {"a", "c"}
     assert "broken warm-up" in report["errors"]["boom"]
@@ -203,7 +202,7 @@ def test_switched_off_patches_warm_nothing(fresh, monkeypatch):
     fresh.start_background_warmup(log=False)
     assert fresh.wait_for_warmup(60)
     results = fresh.warmup_report()["results"]
-    assert len(results) == 5 and set(results.values()) == {fresh.SKIPPED}
+    assert len(results) == 4 and set(results.values()) == {fresh.SKIPPED}
     assert compiles == []
 
 
