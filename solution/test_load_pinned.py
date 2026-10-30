@@ -403,8 +403,7 @@ def test_switch_and_hook(monkeypatch):
 # ---- CUDA: the loads ---------------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def tiny_dir(tmp_path_factory):
+def _tiny_checkpoint(path, edge_values):
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     torch.manual_seed(0)
@@ -414,11 +413,22 @@ def tiny_dir(tmp_path_factory):
     model = Qwen2ForCausalLM(config)
     with torch.no_grad():
         model.get_input_embeddings().weight.mul_(4.0)
-        model.model.layers[1].mlp.down_proj.weight[0, :8] = torch.tensor(
-            [1e5, -7e4, 65520.0, 1e-8, 2.0 ** -25, 3 * 2.0 ** -26, -0.0, 1.0 + 2.0 ** -7])  # fp16 edge cases
-    path = tmp_path_factory.mktemp("tiny_qwen2_load_pinned")
+        if edge_values:  # values fp16 overflows (inf), flushes and rounds: the load must keep their bits too
+            model.model.layers[1].mlp.down_proj.weight[0, :8] = torch.tensor(
+                [1e5, -7e4, 65520.0, 1e-8, 2.0 ** -25, 3 * 2.0 ** -26, -0.0, 1.0 + 2.0 ** -7])
     model.to(torch.bfloat16).save_pretrained(path)  # bf16 on disk, loaded in fp16, as the task's checkpoint
     return path
+
+
+@pytest.fixture(scope="module")
+def tiny_dir(tmp_path_factory):
+    return _tiny_checkpoint(tmp_path_factory.mktemp("tiny_qwen2_load_pinned"), edge_values=True)
+
+
+@pytest.fixture(scope="module")
+def tiny_train_dir(tmp_path_factory):
+    """Without the overflowing values (an inf weight makes every step NaN)."""
+    return _tiny_checkpoint(tmp_path_factory.mktemp("tiny_qwen2_load_pinned_train"), edge_values=False)
 
 
 @pytest.fixture
@@ -603,7 +613,7 @@ def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window, ca
 
 @cuda
 @pytest.mark.parametrize("cast", ["cpu", "gpu"])
-def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch, cast):
+def test_tiny_training_step_is_the_same(patched, tiny_train_dir, monkeypatch, cast):
     """The whole setup (load with the copies, kbit preparation, peft, the streamers adopting the
     loaded weights) gives the same training step bit for bit as without the copies."""
     import peft
@@ -615,7 +625,7 @@ def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch, cast):
 
     def setup():
         def fake_setup(self):
-            model = peft.prepare_model_for_kbit_training(_load(tiny_dir), use_gradient_checkpointing=False)
+            model = peft.prepare_model_for_kbit_training(_load(tiny_train_dir), use_gradient_checkpointing=False)
             torch.manual_seed(1)
             model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.0,
                                                      target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"))
@@ -666,7 +676,8 @@ def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch, cast):
     reference = setup()
     theirs = step(reference)
     cleanup(reference)
-    assert len(ours) == len(theirs) and all(torch.equal(a, b) for a, b in zip(ours, theirs))
+    assert torch.isfinite(ours[0]) and len(ours) == len(theirs)
+    assert all(torch.equal(a, b) for a, b in zip(ours, theirs))
 
 
 @cuda
