@@ -355,7 +355,7 @@ def _install_early(wrapper, args, kwargs, rows=True, probes=False):
     except Exception:  # noqa: BLE001
         return None
     dataset = args[0] if args else kwargs.get("dataset")
-    rows = dataset.get("train") if isinstance(dataset, dict) else None
+    train_rows = dataset.get("train") if isinstance(dataset, dict) else None
     auto = getattr(transformers, "AutoTokenizer", None)
     loader = getattr(auto, "__dict__", {}).get("from_pretrained")
     build, map_rows = getattr(sft_format, "build_format_row", None), getattr(soup_sft, "_map_text_sft_rows", None)
@@ -364,7 +364,7 @@ def _install_early(wrapper, args, kwargs, rows=True, probes=False):
             or not callable(masks) or any(getattr(f, "_soup_original", None) is not None
                                           for f in (build, map_rows, masks))):
         return None
-    early = _Early(wrapper, rows, build, map_rows, masks)
+    early = _Early(wrapper, train_rows, build, map_rows, masks)
 
     def from_pretrained(cls, *a, **k):
         tokenizer = loader.__func__(cls, *a, **k)

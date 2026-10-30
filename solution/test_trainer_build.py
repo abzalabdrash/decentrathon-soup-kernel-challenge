@@ -334,3 +334,24 @@ def test_cheap_fingerprint_deterministic(tokenizer, monkeypatch):
     finally:
         undo()
     assert getattr(fingerprint.update_fingerprint, "_soup_original", None) is None
+
+
+def test_probes_alone_do_not_tokenize_early(tokenizer, tmp_path):
+    """SOUP_SOLUTION_EARLY_PROBES without SOUP_SOLUTION_EARLY_ROWS: the tokenizer load starts no
+    early tokenization (a list of rows once shadowed the flag)."""
+    from soup_cli.config.loader import load_config_from_string
+
+    tokenizer.save_pretrained(tmp_path)
+    cfg = load_config_from_string(TASK_YAML)
+
+    class Wrapper:
+        config = cfg
+
+    undo = trainer_build._install_early(Wrapper(), ({"train": [{"messages": list(ROWS[0])}]},), {},
+                                        rows=False, probes=False)
+    try:
+        early = trainer_build._EARLY["current"]
+        transformers.AutoTokenizer.from_pretrained(tmp_path)
+        assert early.thread is None
+    finally:
+        undo()
