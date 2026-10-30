@@ -68,17 +68,22 @@ def _reference(hidden, weight, targets, num_items):
     return total, torch.cat(token_loss), torch.cat(entropy), torch.cat(correct), grad
 
 
-def _chunked_statistics(hidden, weight, targets, rows):
-    """Per-token loss, entropy and correctness in fp32 from the logits the streamed head computes:
-    the same rows (labelled first), the same GEMM per vocabulary chunk, hence the same fp16 bits."""
+def _chunked_logits(hidden, weight, targets, rows):
+    """The fp16 logits the streamed head computes: the same rows (labelled first), the same GEMM per
+    vocabulary chunk, hence the same bits. Returned with the sorted targets and the row order."""
     labelled = targets != -100
     order = torch.argsort(labelled.to(torch.int8), descending=True, stable=True)
     h16, t = hidden.detach()[order].half(), targets[order]
     logits = torch.empty(h16.shape[0], V, dtype=torch.float16, device="cuda")
     for c0 in range(0, V, rows):
         logits[:, c0:c0 + rows] = torch.mm(h16, weight[c0:c0 + rows].t())
+    return logits, t, order
+
+
+def _chunked_statistics(logits, t, order):
+    """Per-token loss, entropy and correctness in fp32 from those logits, in the original row order."""
     token_loss, entropy, correct = [], [], []
-    for start in range(0, h16.shape[0], 256):
+    for start in range(0, logits.shape[0], 256):
         block, tb = logits[start:start + 256].float(), t[start:start + 256]
         token_loss.append(F.cross_entropy(block, tb, ignore_index=-100, reduction="none"))
         logp = F.log_softmax(block, dim=-1)
@@ -89,12 +94,10 @@ def _chunked_statistics(hidden, weight, targets, rows):
     return tuple(torch.cat(x)[inverse] for x in (token_loss, entropy, correct))
 
 
-def _exact_grad(hidden, weight, targets, rows, denom):
-    """dL/dh in fp64 from the fp16 logits, for the given rows."""
-    h16 = hidden[rows].detach().half()
-    logits = (h16 @ weight.t()).double()
-    p = torch.softmax(logits, dim=-1)
-    p[torch.arange(len(rows)), targets[rows]] -= 1.0
+def _exact_grad(logits16, weight, targets, denom):
+    """dL/dh in fp64 from given fp16 logits of some rows and their targets."""
+    p = torch.softmax(logits16.double(), dim=-1)
+    p[torch.arange(len(targets)), targets] -= 1.0
     return (p @ weight.double()) / denom
 
 
@@ -122,7 +125,8 @@ def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items
         hidden, weight, targets, num_items)
 
     # statistics from the same fp16 logits: fp32 both ways, only the summation order differs
-    chunk_loss, chunk_entropy, chunk_correct = _chunked_statistics(hidden, weight, targets, rows)
+    chunk_logits, sorted_targets, order = _chunked_logits(hidden, weight, targets, rows)
+    chunk_loss, chunk_entropy, chunk_correct = _chunked_statistics(chunk_logits, sorted_targets, order)
     torch.testing.assert_close(token_loss, chunk_loss, rtol=1e-5, atol=2e-5)
     torch.testing.assert_close(entropy, chunk_entropy, rtol=1e-5, atol=5e-5)
     assert torch.equal(correct, chunk_correct)
@@ -139,15 +143,19 @@ def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items
         return
     assert torch.all(grad[~labelled] == 0)
     # dL/dh: the base rounds the gradient of the logits and the GEMM's output to fp16; ours rounds
-    # P to fp16 and accumulates in fp32. Both within fp16 rounding of the exact value, ours closer.
+    # P to fp16 and accumulates in fp32. Each against the exact gradient of its own fp16 logits:
+    # ours within fp16 rounding, no worse than the base; between the two, also the logits' last bits
     top = ref_grad.abs().max()
-    assert (grad - ref_grad).abs().max() / top < 4e-3
-    rows_checked = labelled.nonzero().squeeze(1)[:48]
+    assert (grad - ref_grad).abs().max() / top < 1e-2
     denom = float(num_items) if num_items is not None else int(labelled.sum())
-    exact = _exact_grad(hidden, weight, targets, rows_checked, denom)
-    ours_err = (grad[rows_checked].double() - exact).abs().max()
-    base_err = (ref_grad[rows_checked].double() - exact).abs().max()
-    assert ours_err <= max(base_err * 1.5, 1e-3 * top)
+    k = min(48, int(labelled.sum()))
+    first = order[:k]  # labelled rows (sorted first), as positions in the original order
+    ours_exact = _exact_grad(chunk_logits[:k], weight, sorted_targets[:k], denom)
+    ours_err = (grad[first].double() - ours_exact).abs().max()
+    base_logits = hidden.detach()[first].half() @ weight.t()
+    base_exact = _exact_grad(base_logits, weight, targets[first], denom)
+    base_err = (ref_grad[first].double() - base_exact).abs().max()
+    assert ours_err <= max(base_err * 1.5, 1e-3 * top), (float(ours_err / top), float(base_err / top))
 
 
 def test_streamed_head_counts_and_ring(streamed):
