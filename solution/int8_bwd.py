@@ -222,8 +222,9 @@ def usable(plan, tokens):
     _STATE["calls"] += 1
     if not _READY.is_set():
         _start_compile()
-        if _STATE["calls"] <= START_CALLS:
-            return False
+    if _STATE["calls"] <= START_CALLS:
+        return False  # fp16 for the first START_CALLS, compiled or not: the switch point is fixed
+    if not _READY.is_set():
         _STATE["thread"].join()
     return _READY.is_set()
 
