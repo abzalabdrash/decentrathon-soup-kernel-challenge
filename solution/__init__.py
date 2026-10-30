@@ -89,6 +89,11 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    from .startup import patch_soup_first_step_mark, patch_soup_startup_profile
+
+    patch_soup_first_step_mark()
+    if os.environ.get("SOUP_SOLUTION_PROFILE_STARTUP", "0") not in ("0", "false", "no", ""):
+        patch_soup_startup_profile()  # off by default: cProfile of the trainer build, see startup.py
     if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):
         from .diag import patch_soup_diag
 
