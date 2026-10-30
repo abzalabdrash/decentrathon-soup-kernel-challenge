@@ -25,6 +25,7 @@ def fresh(monkeypatch):
 
     from solution import warmup
 
+    monkeypatch.setattr(warmup, "BUILTIN", list(warmup.WARMUPS), raising=False)
     monkeypatch.setattr(warmup, "WARMUPS", [])
     monkeypatch.setattr(warmup, "COMPILES", [])
     monkeypatch.setattr(warmup, "_STATE", {"thread": None, "ident": None, "begin": None,
@@ -100,29 +101,35 @@ def _training_calls():
         swiglu_call(tokens)
 
 
-def _forget_compiled():
-    """Empties triton's in-memory kernel cache of these kernels (the disk cache stays)."""
-    from solution.fused_ce import fused_ce_rows_kernel
-    from solution.swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
+OUR_KERNELS = {"fused_ce_rows_kernel", "example_swiglu_fwd_kernel", "example_swiglu_bwd_kernel",
+               "rms_norm_rows_fwd", "rms_norm_rows_bwd", "nf4_dequant_kernel", "rope_qk_kernel"}
 
-    for kernel in (fused_ce_rows_kernel, example_swiglu_fwd_kernel, example_swiglu_bwd_kernel):
-        kernel.device_caches.clear()
+
+def _forget_compiled():
+    """Empties triton's in-memory kernel cache of every kernel in solution/ (the disk cache stays)."""
+    from triton.runtime.jit import JITFunction
+
+    from solution import fused_ce, nf4, rmsnorm, rope, swiglu
+
+    for module in (fused_ce, swiglu, rmsnorm, nf4, rope):
+        for kernel in vars(module).values():
+            if isinstance(kernel, JITFunction):
+                kernel.device_caches.clear()
 
 
 def _keys(compiles):
     return {(c["kernel"], c["spec"], c["num_warps"], c["num_stages"]) for c in compiles}
 
 
-def test_training_launches_compile_nothing_after_warmup(fresh, monkeypatch):
-    import solution.warmup as module
-
-    # the T4 computes in fp16 (this card would pick bf16)
-    monkeypatch.setattr(module, "training_half_dtype", lambda: torch.float16)
-    for name, fn in [("example_swiglu_fwd_kernel", module.warm_swiglu_fwd),
-                     ("fused_ce_rows_kernel", module.warm_fused_ce),
-                     ("example_swiglu_bwd_kernel", module.warm_swiglu_bwd),
-                     ("fused_ce_rows_kernel n_grad_rows=1", module.warm_fused_ce_one)]:
+def _builtin_warmups(fresh, monkeypatch):
+    """The warm-ups warmup.py registers, for the T4's fp16 (this card would pick bf16)."""
+    monkeypatch.setattr(fresh, "training_half_dtype", lambda: torch.float16)
+    for name, fn in fresh.BUILTIN:
         fresh.register(fn, name=name)
+
+
+def test_training_launches_compile_nothing_after_warmup(fresh, monkeypatch):
+    _builtin_warmups(fresh, monkeypatch)
     compiles = fresh.watch_compiles(log=False)
 
     # without a warm-up the training launches compile, and the hook sees it
@@ -148,6 +155,55 @@ def test_training_launches_compile_nothing_after_warmup(fresh, monkeypatch):
     # ... and the same training launches then compile nothing
     compiles.clear()
     _training_calls()
+    assert compiles == []
+
+
+def test_model_step_compiles_nothing_after_warmup(fresh, monkeypatch):
+    """apply() and the training step of one decoder layer with the run's shapes, 4-bit weights and
+    LoRA (bench_warmup.one_layer_model): every kernel the step compiles, the warm-up has compiled."""
+    import solution
+    from solution.bench_warmup import STEP_LENGTHS, model_step, one_layer_model
+
+    _builtin_warmups(fresh, monkeypatch)
+    for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE",
+                   "SOUP_SOLUTION_UNPAD", "SOUP_SOLUTION_MLP16"):
+        monkeypatch.delenv(switch, raising=False)
+    solution.apply()
+    model = one_layer_model()
+    compiles = fresh.watch_compiles(log=False)
+
+    _forget_compiled()
+    for lengths in STEP_LENGTHS:
+        model_step(model, lengths)
+    needed = _keys(compiles)
+    assert {k[0] for k in needed} == OUR_KERNELS
+
+    _forget_compiled()
+    compiles.clear()
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(300)
+    report = fresh.warmup_report()
+    assert not report["errors"], report["errors"]
+    missing = needed - _keys(compiles)
+    assert not missing, missing
+
+    compiles.clear()
+    for lengths in STEP_LENGTHS:
+        model_step(model, lengths)
+    assert compiles == []
+
+
+def test_switched_off_patches_warm_nothing(fresh, monkeypatch):
+    for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE"):
+        monkeypatch.setenv(switch, "0")
+    for name, fn in fresh.BUILTIN:
+        if name.startswith(("rms_norm", "nf4", "rope")):
+            fresh.register(fn, name=name)
+    compiles = fresh.watch_compiles(log=False)
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(60)
+    results = fresh.warmup_report()["results"]
+    assert len(results) == 5 and set(results.values()) == {fresh.SKIPPED}
     assert compiles == []
 
 

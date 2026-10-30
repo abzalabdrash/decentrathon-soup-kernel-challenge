@@ -5,6 +5,8 @@
     python -m solution.bench_warmup compile     # compile time of every registered warm-up
     python -m solution.bench_warmup gil         # how much of the main thread the compiling thread takes
     python -m solution.bench_warmup first-call  # first training-shape launch, without / with warm-up
+    python -m solution.bench_warmup first-step  # first steps of a one-layer 4-bit model after apply()
+    python -m solution.bench_warmup apply       # warm-up started before / after apply()
     python -m solution.bench_warmup all
 
 Kernels are compiled for fp16, the T4's dtype, on any card.
@@ -59,6 +61,69 @@ def swiglu_call(tokens):
     swiglu(gate, up).float().sum().backward()
     torch.cuda.synchronize()
     return time.perf_counter() - start
+
+
+def one_layer_model(vocab=640, seed=0):
+    """One decoder layer with Qwen2.5-1.5B's shapes (hidden 1536, MLP 8960, 12 / 2 heads of 128),
+    a small vocabulary, random weights, built the way Soup's model ends up: 4-bit NF4 linear layers
+    with double quant and fp16 compute, `prepare_model_for_kbit_training`, LoRA r=16 on q_proj and
+    v_proj. The kernels see the same dtypes, strides and constants as in the real run."""
+    import bitsandbytes as bnb
+    import torch
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(seed)
+    config = Qwen2Config(vocab_size=vocab, hidden_size=1536, intermediate_size=8960,
+                         num_hidden_layers=1, num_attention_heads=12, num_key_value_heads=2,
+                         max_position_embeddings=4096, tie_word_embeddings=True,
+                         attn_implementation="sdpa")
+    model = Qwen2ForCausalLM(config).half()
+    for layer in model.model.layers:
+        for parent in (layer.self_attn, layer.mlp):
+            for name, child in list(parent.named_children()):
+                if not isinstance(child, torch.nn.Linear):
+                    continue
+                q = bnb.nn.Linear4bit(child.in_features, child.out_features,
+                                      bias=child.bias is not None, compute_dtype=torch.float16,
+                                      compress_statistics=True, quant_type="nf4")
+                q.weight = bnb.nn.Params4bit(child.weight.data, requires_grad=False,
+                                             compress_statistics=True, quant_type="nf4")
+                if child.bias is not None:
+                    q.bias = torch.nn.Parameter(child.bias.data, requires_grad=False)
+                setattr(parent, name, q)
+    model = model.cuda()  # quantizes the Params4bit
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                             target_modules=["q_proj", "v_proj"],
+                                             task_type="CAUSAL_LM"))
+    model.train()
+    return model
+
+
+def model_step(model, lengths, seed=1):
+    """One forward and backward under fp16 autocast on a right-padded batch with these row lengths,
+    labels on the last two thirds of every row (the prompt part has none). Returns seconds."""
+    import torch
+
+    torch.manual_seed(seed)
+    b, t = len(lengths), max(lengths)
+    ids = torch.randint(0, model.config.vocab_size, (b, t), device="cuda")
+    mask = (torch.arange(t, device="cuda")[None, :]
+            < torch.tensor(lengths, device="cuda")[:, None]).long()
+    labels = ids.clone()
+    labels[mask == 0] = -100
+    labels[:, : t // 3] = -100
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss = model(input_ids=ids, attention_mask=mask, labels=labels).loss
+    loss.backward()
+    torch.cuda.synchronize()
+    return time.perf_counter() - start
+
+
+STEP_LENGTHS = ((300, 212, 190, 124), (512, 77, 40, 9))  # 826 and 638 real tokens
 
 
 # ---------------------------------------------------------------- child processes
@@ -246,6 +311,51 @@ def child_first_call(mode):
     print(f"swiglu_second={swiglu_call(826):.4f}")
 
 
+def child_first_step(mode):
+    """The one-layer model's first and second training steps after apply(), after a warm-up (warm)
+    or without one (cold)."""
+    _prelude()
+    from triton.runtime.jit import JITFunction  # noqa: F401 - the harness imports it before apply()
+
+    import solution
+
+    warmup = _setup_warmup()
+    solution.apply()
+    model = one_layer_model()
+    if mode == "warm":
+        start = time.perf_counter()
+        warmup.start_background_warmup(log=False)
+        warmup.wait_for_warmup()
+        print(f"warmup_s={time.perf_counter() - start:.3f}")
+    print(f"step_first={model_step(model, STEP_LENGTHS[0]):.4f}")
+    print(f"step_second={model_step(model, STEP_LENGTHS[1]):.4f}")
+    print(f"step_third={model_step(model, STEP_LENGTHS[0]):.4f}")
+
+
+def child_apply(mode):
+    """apply() with the warm-up started after it (late) or before it (early), the main thread
+    then waiting: apply's own time and when the warm-up is done, from the start of apply()."""
+    _prelude()
+    from triton.runtime.jit import JITFunction  # noqa: F401 - the harness imports it before apply()
+
+    start = time.perf_counter()
+    if mode == "early":
+        from solution import warmup
+
+        warmup.start_background_warmup(log=False)
+    import solution
+
+    solution.apply()
+    apply_end = time.perf_counter()
+    from solution import warmup
+
+    warmup.start_background_warmup(log=False)
+    warmup.wait_for_warmup()
+    done = time.perf_counter()
+    print(f"apply_s={apply_end - start:.3f}\nwarmup_done_s={done - start:.3f}\n"
+          f"after_apply_s={done - apply_end:.3f}")
+
+
 # ---------------------------------------------------------------- reports
 
 def report_imports(cache_root, repeats=3):
@@ -321,16 +431,39 @@ def report_first_call(cache_root):
     print(f"cold_first_s={cold_first:.4f} warm_first_s={warm_first:.4f} steady_s={steady:.4f}")
 
 
+def report_first_step(cache_root):
+    cold = _child(["child-first-step", "cold"], cache_root)
+    warm = _child(["child-first-step", "warm"], cache_root)
+    print("one-layer 4-bit model after apply(), steps on 826 / 638 / 826 tokens, s:")
+    for label, res in (("cold", cold), ("after warm-up", warm)):
+        print(f"  {label:14s} first {float(res['step_first']):.3f}, second "
+              f"{float(res['step_second']):.3f}, third {float(res['step_third']):.3f}")
+    print(f"  warm-up thread took {float(warm['warmup_s']):.2f} s")
+
+
+def report_apply(cache_root, repeats=3):
+    runs = {mode: [_child(["child-apply", mode], cache_root) for _ in range(repeats)]
+            for mode in ("late", "early")}
+    print(f"apply() and the warm-up, main thread waiting after apply(); medians of {repeats}, s:")
+    for mode, res in runs.items():
+        med = {k: statistics.median(float(r[k]) for r in res)
+               for k in ("apply_s", "warmup_done_s", "after_apply_s")}
+        print(f"  warm-up started {mode:5s}: apply {med['apply_s']:.2f}, warm-up done at "
+              f"{med['warmup_done_s']:.2f}, {med['after_apply_s']:.2f} after apply()")
+
+
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
     children = {"child-import": child_import, "child-prelude": child_prelude,
                 "child-compile": child_compile, "child-gil": child_gil,
-                "child-first-call": child_first_call}
+                "child-first-call": child_first_call, "child-first-step": child_first_step,
+                "child-apply": child_apply}
     if cmd in children:
         children[cmd](*sys.argv[2:])
         return
     reports = {"imports": report_imports, "compile": report_compile, "gil": report_gil,
-               "first-call": report_first_call}
+               "first-call": report_first_call, "first-step": report_first_step,
+               "apply": report_apply}
     root = os.environ.get("TRITON_CACHE_DIR") or tempfile.mkdtemp(prefix="bench-warmup-")
     os.makedirs(root, exist_ok=True)
     for name in (reports if cmd == "all" else [cmd]):

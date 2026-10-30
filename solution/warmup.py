@@ -134,8 +134,23 @@ def compile_kernel(kernel, *args, **kwargs):
     return compiled
 
 
-# The kernels already in solution/ (their modules are not touched; the warm-ups live here), in the
-# order the first step meets them. Their launches: fused_ce.py `_head_chunks`, swiglu.py `SwiGLU`.
+# The kernels in solution/ (their modules are not touched; the warm-ups live here), in the order
+# the first step meets them. Each warms the classes its training launches take (checked against a
+# real step in test_warmup.py) and skips itself when apply() leaves its patch off: the switches
+# are read the way solution/__init__.py reads them, so the thread may start before the patches.
+# The launches: fused_ce.py `_head_chunks`, swiglu.py `SwiGLU`, rmsnorm.py `_forward` /
+# `_backward`, nf4.py `_launch`, rope.py `_launch`.
+
+SKIPPED = "off"  # the result of a warm-up whose patch is switched off
+HIDDEN = 1536  # Qwen2.5-1.5B: hidden size, 12 query heads and 2 key/value heads of 128
+HEAD_DIM, Q_HEADS, KV_HEADS = 128, 12, 2
+
+
+def _switched_on(name):
+    from . import _on
+
+    return _on(name)
+
 
 @register(name="cublas")
 def warm_cublas():
@@ -150,6 +165,71 @@ def warm_cublas():
     x = torch.randn(64, 64, device="cuda", dtype=half)
     F.linear(x, x, x[0]).sum().item()  # addmm with a bias: the cuBLASLt path
     (x @ x).sum().item()
+
+
+@register(name="rms_norm_rows_fwd")
+def warm_rmsnorm_fwd():
+    # rows of the fp32 residual stream (strides = 1536, "D"; n_rows is not specialized): the plain
+    # norm (input_layernorm, the final norm) and the fused add with the half attention output
+    if not _switched_on("SOUP_SOLUTION_RMSNORM"):
+        return SKIPPED
+    import torch
+    import triton
+
+    from .rmsnorm import FWD_ROWS, FWD_WARPS, rms_norm_rows_fwd
+
+    f32, block = torch.float32, triton.next_power_of_2(HIDDEN)
+    for add, add_dtype in ((False, f32), (True, training_half_dtype())):
+        compile_kernel(rms_norm_rows_fwd, f32, HIDDEN, add_dtype, HIDDEN, f32, HIDDEN, f32,
+                       f32, HIDDEN, f32, TOKENS, HIDDEN, 1e-6,
+                       ADD=add, ROWS=FWD_ROWS, BLOCK=block, num_warps=FWD_WARPS)
+
+
+@register(name="nf4_dequant_kernel")
+def warm_nf4():
+    # every 4-bit weight of the model has N * K and N * K / 64 divisible by 16: one class
+    if not _switched_on("SOUP_SOLUTION_NF4"):
+        return SKIPPED
+    import torch
+
+    from .nf4 import ABLOCK, BLOCKS_PER_PROGRAM, QBLOCK, nf4_dequant_kernel
+
+    n = HIDDEN * HIDDEN
+    f32, u8 = torch.float32, torch.uint8
+    compile_kernel(nf4_dequant_kernel, u8, u8, f32, f32, f32, f32, torch.float16, n, n // QBLOCK,
+                   QBLOCK=QBLOCK, ABLOCK=ABLOCK, BLOCKS=BLOCKS_PER_PROGRAM,
+                   num_warps=4, enable_fp_fusion=False)
+
+
+def _rope(backward):
+    # q (1, 12, N, 128) and k (1, 2, N, 128) are transposed views of the fp32 projections: strides
+    # (N * 1536, 128, 1536) and (N * 256, 128, 256), all multiples of 16 for any N; the outputs keep
+    # them; cos and sin fp32 (1, N, 128) with the batch stride passed as 0. The backward's gradients
+    # come contiguous, (12 * N * 128, N * 128, 128): also all "D". n_tokens is not specialized.
+    import torch
+
+    from .rope import BLOCK_TOKENS, NUM_WARPS, rope_qk_kernel
+
+    f32, n = torch.float32, TOKENS
+    if backward:
+        q_in = (n * Q_HEADS * HEAD_DIM, n * HEAD_DIM, HEAD_DIM)
+        k_in = (n * KV_HEADS * HEAD_DIM, n * HEAD_DIM, HEAD_DIM)
+    else:
+        q_in = (n * HIDDEN, HEAD_DIM, HIDDEN)
+        k_in = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
+    q_out = (n * HIDDEN, HEAD_DIM, HIDDEN)
+    k_out = (n * KV_HEADS * HEAD_DIM, HEAD_DIM, KV_HEADS * HEAD_DIM)
+    compile_kernel(rope_qk_kernel, f32, f32, f32, f32, f32, f32, *q_in, *k_in, *q_out, *k_out,
+                   0, HEAD_DIM, n, Q_HEADS,
+                   HALF=HEAD_DIM // 2, BLOCK_N=BLOCK_TOKENS, BACKWARD=backward,
+                   num_warps=NUM_WARPS)
+
+
+@register(name="rope_qk_kernel forward")
+def warm_rope_fwd():
+    if not _switched_on("SOUP_SOLUTION_ROPE"):
+        return SKIPPED
+    _rope(backward=False)
 
 
 @register(name="example_swiglu_fwd_kernel")
@@ -187,6 +267,33 @@ def warm_swiglu_bwd():
                    TOKENS * INTERMEDIATE, BLOCK=BLOCK)
 
 
+@register(name="rms_norm_rows_bwd")
+def warm_rmsnorm_bwd():
+    # frozen norm weights: no dweight, so the partial-sum buffer is rstd and tiles_per_program is 1
+    # (a constant). The fused add's backward adds the residual's gradient and writes dx again in
+    # the half dtype of the attention output
+    if not _switched_on("SOUP_SOLUTION_RMSNORM"):
+        return SKIPPED
+    import torch
+    import triton
+
+    from .rmsnorm import BWD_ROWS, BWD_WARPS, rms_norm_rows_bwd
+
+    f32, block = torch.float32, triton.next_power_of_2(HIDDEN)
+    for fused, dx2_dtype in ((False, f32), (True, training_half_dtype())):
+        compile_kernel(rms_norm_rows_bwd, f32, HIDDEN, f32, HIDDEN, f32, f32, f32, HIDDEN,
+                       f32, HIDDEN, dx2_dtype, HIDDEN, f32, TOKENS, HIDDEN, 1,
+                       ADD_GRAD=fused, SECOND=fused, DW=False, ROWS=BWD_ROWS, BLOCK=block,
+                       num_warps=BWD_WARPS)
+
+
+@register(name="rope_qk_kernel backward")
+def warm_rope_bwd():
+    if not _switched_on("SOUP_SOLUTION_ROPE"):
+        return SKIPPED
+    _rope(backward=True)
+
+
 @register(name="fused_ce_rows_kernel n_grad_rows=1")
 def warm_fused_ce_one():
     # a chunk that ends one labelled row past its start: rare, so it goes last
@@ -221,8 +328,9 @@ def _run(jobs, device, log):
             for name, fn in jobs:
                 start = time.perf_counter()
                 try:
-                    fn()
-                    _STATE["results"][name] = round(time.perf_counter() - start, 3)
+                    skipped = fn() == SKIPPED
+                    _STATE["results"][name] = (SKIPPED if skipped
+                                               else round(time.perf_counter() - start, 3))
                 except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
                     _STATE["errors"][name] = repr(exc)
                     if log:
@@ -238,7 +346,8 @@ def _run(jobs, device, log):
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
         _DONE.set()
         if log:
-            done = ", ".join(f"{name} {s:.2f} s" for name, s in _STATE["results"].items())
+            done = ", ".join(f"{name} {s}" if s == SKIPPED else f"{name} {s:.2f} s"
+                             for name, s in _STATE["results"].items())
             print(f"[solution] warmup done in {_STATE['seconds']:.2f} s: {done or 'nothing'}"
                   + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else ""),
                   flush=True)
