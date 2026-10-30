@@ -64,9 +64,11 @@ class _Engine:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def submit(self, out, source):
+    def submit(self, out, source, cast=None):
+        """Copies `source` into `out` (into `out` viewed as `cast`, then cast in place, as the GPU
+        does with the raw bytes)."""
         event = _Event()
-        self.queue.put((out, source, event))
+        self.queue.put((out, source, cast, event))
         return event
 
     def _run(self):
@@ -74,11 +76,14 @@ class _Engine:
             item = self.queue.get()
             if item is None:
                 return
-            out, source, event = item
+            out, source, cast, event = item
             if out is not None:
                 if self.delay:
                     time.sleep(self.delay)
-                out.copy_(source)
+                raw = out if cast is None else out.view(cast)
+                raw.copy_(source)
+                if cast is not None:
+                    out.copy_(raw)
             event.set()
 
     def drain(self):
@@ -98,7 +103,7 @@ class _Buffer:
         self.buffer = None
 
 
-def _cpu_copier(window, slots, delay=0.0003, default_stream=True, stage=None, pin=None):
+def _cpu_copier(window, slots, delay=0.0003, default_stream=True, stage=None, pin=None, cast="cpu"):
     from solution.load_pinned import PinnedCopier
 
     class CpuCopier(PinnedCopier):
@@ -118,15 +123,18 @@ def _cpu_copier(window, slots, delay=0.0003, default_stream=True, stage=None, pi
         def _on_default_stream(self):
             return default_stream
 
-        def _copy(self, entry):  # on the consumer's stream: done before the consumer goes on
+        def _submit(self, entry):
             out = torch.empty(entry.shape, dtype=entry.dtype)
-            event = self.engine.submit(out, entry.staged)
+            cast = entry.stage_dtype if entry.stage_dtype != entry.dtype else None
+            return out, self.engine.submit(out, entry.staged, cast)
+
+        def _copy(self, entry):  # on the consumer's stream: done before the consumer goes on
+            out, event = self._submit(entry)
             event.synchronize()
             return out, event
 
         def _copy_ahead(self, entry):  # in flight until the engine gets to it
-            out = torch.empty(entry.shape, dtype=entry.dtype)
-            return out, self.engine.submit(out, entry.staged)
+            return self._submit(entry)
 
         def _hand_over(self, event):
             event.synchronize()
@@ -136,7 +144,7 @@ def _cpu_copier(window, slots, delay=0.0003, default_stream=True, stage=None, pi
 
     if stage is not None:
         CpuCopier._stage = staticmethod(stage)
-    copier = CpuCopier("cpu", window=window, slots=slots, log=lambda *_: None)
+    copier = CpuCopier("cpu", window=window, slots=slots, cast=cast, log=lambda *_: None)
     copier.made, copier.engine = [], _Engine(delay)
     return copier
 
@@ -224,9 +232,12 @@ def _check(results, reference):
         assert _same(results[key], reference[key]), key
 
 
+@pytest.mark.parametrize("cast", ["cpu", "gpu"])
 @pytest.mark.parametrize("window,slots", [(0, 1), (0, 2), (0, 4), (1, 1), (1, 2), (1, 4), (2, 2), (2, 3), (2, 6)])
-def test_copies_bit_equal_to_materialize_copy(checkpoint, window, slots):
-    copier = _cpu_copier(window, slots)
+def test_copies_bit_equal_to_materialize_copy(checkpoint, window, slots, cast):
+    """(On the CPU, cast='gpu' runs the raw bytes and the in-place cast through the fake engine:
+    the protocol, not the GPU's arithmetic; that is checked on CUDA below.)"""
+    copier = _cpu_copier(window, slots, cast=cast)
     try:
         results, reference = _run(copier, checkpoint)
     finally:
@@ -241,10 +252,11 @@ def test_copies_bit_equal_to_materialize_copy(checkpoint, window, slots):
     assert copier.slot_bytes == 160 * 64 * 2
 
 
-def test_copies_made_ahead_while_the_loop_works(checkpoint):
+@pytest.mark.parametrize("cast", ["cpu", "gpu"])
+def test_copies_made_ahead_while_the_loop_works(checkpoint, cast):
     """With work between the jobs the thread stays ahead and the copies go ahead of the asks; the
     fake engine copies late, so a buffer refilled before its copy was out would corrupt a tensor."""
-    copier = _cpu_copier(window=2, slots=3, delay=0.002)
+    copier = _cpu_copier(window=2, slots=3, delay=0.002, cast=cast)
     try:
         results, reference = _run(copier, checkpoint, pause=0.004)
     finally:
@@ -489,20 +501,20 @@ def _compare(ours, theirs):
 
 
 def _release(model):
-    """Gives back what load_stream.py's moves hold for a model loaded in a fake setup."""
+    """Gives back the pinned embedding load_stream.py's moves made for a model loaded in a fake setup
+    (the layers' host buffers go with the model)."""
     from solution.head_stream import streamer_for
 
     streamer = streamer_for(model.get_input_embeddings().weight)
     if streamer is not None:
         streamer.restore()
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def _load_in_setup(cls, path, inspect):
     """Soup's setup with only the load (load_stream.py handles it): the load's GPU peak and
     `inspect(model)` of the loaded model, inside the setup."""
+    from solution import load_stream
+
     seen = {}
 
     def fake_setup(self):
@@ -516,7 +528,11 @@ def _load_in_setup(cls, path, inspect):
         seen["seconds"] = time.perf_counter() - started
         seen["peak"] = torch.cuda.max_memory_allocated() - before
         seen["result"] = inspect(model)
+        load_stream.LAST["load"] = None  # it holds the model
         _release(model)
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
         self.model = None  # nothing for the post-setup hooks of the streamers
 
     wrapper = cls.__new__(cls)
@@ -526,17 +542,43 @@ def _load_in_setup(cls, path, inspect):
 
 
 @cuda
-@pytest.mark.parametrize("window", [0, 1, 2])
-def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window):
+def test_gpu_cast_equals_cpu_cast_for_every_bf16_value():
+    """SOUP_SOLUTION_LOAD_PINNED_CAST=gpu: the raw bf16 bytes copied into the fp16 tensor's memory
+    and cast there in place on the GPU (the copier's own _copy_into) give the bytes of the CPU cast
+    the original `.to()` runs, for all 65,536 bf16 values, at several alignments on both sides (the
+    vector loops and their tails). NaN stays NaN; its payload is not compared (NaN weights do not
+    train)."""
+    from solution.load_pinned import PinnedCopier, _Entry
+
+    values = torch.arange(-32768, 32768, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
+    for offset in (0, 1, 3):
+        src = values[offset:]
+        cpu = src.to(torch.float16)
+        nan = torch.isnan(src.float())
+        for shift in (0, 1):
+            entry = _Entry(0, None, tuple(src.shape), torch.bfloat16, torch.float16, torch.bfloat16, None)
+            entry.staged = src.clone().pin_memory()
+            out = torch.empty(src.numel() + shift, dtype=torch.float16, device="cuda")[shift:]
+            PinnedCopier._copy_into(out, entry)
+            gpu = out.cpu()
+            assert torch.equal(cpu.view(torch.int16)[~nan], gpu.view(torch.int16)[~nan]), (offset, shift)
+            assert torch.isnan(gpu[nan].float()).all() and torch.isnan(cpu[nan].float()).all()
+    assert int(torch.isnan(values.float()).sum()) == 254 and int((cpu.float().isinf()).sum()) > 2
+
+
+@cuda
+@pytest.mark.parametrize("window,cast", [(0, "cpu"), (1, "cpu"), (2, "cpu"), (0, "gpu"), (1, "gpu")])
+def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window, cast):
     from solution import load_pinned
 
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_WINDOW", str(window))
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_SLOTS", "2" if window == 2 else "4")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", cast)
     ours = _load_in_setup(patched, tiny_dir, _snapshot)
     copier = load_pinned.LAST["copier"]
     planned = LAYERS * 12 + 1  # 7 weights, 3 biases and 2 norms per layer, the final norm
     assert copier is not None and (copier.planned, copier.copied, copier.fallbacks, copier.reason) == \
-        (planned, planned, 0, None)
+        (planned, planned, 0, None) and copier.cast == cast
     if window:
         assert copier.copied_ahead > 0
 
@@ -560,7 +602,8 @@ def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window):
 
 
 @cuda
-def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch):
+@pytest.mark.parametrize("cast", ["cpu", "gpu"])
+def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch, cast):
     """The whole setup (load with the copies, kbit preparation, peft, the streamers adopting the
     loaded weights) gives the same training step bit for bit as without the copies."""
     import peft
@@ -609,9 +652,11 @@ def test_tiny_training_step_is_the_same(patched, tiny_dir, monkeypatch):
         if head is not None:
             head.restore()
 
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", cast)
     model = setup()
     copier = load_pinned.LAST["copier"]
     assert copier is not None and copier.copied == copier.planned > 0 and copier.reason is None
+    assert copier.cast == cast
     assert streamer_of(model) is not None  # the weight streamer adopted the layers loaded through the copies
     ours = step(model)
     cleanup(model)
@@ -677,9 +722,11 @@ def real_dir():
 
 
 @cuda
-def test_real_checkpoint_tensor_by_tensor(real_dir):
+@pytest.mark.parametrize("cast", ["cpu", "gpu"])
+def test_real_checkpoint_tensor_by_tensor(real_dir, cast):
     """Every tensor of the real checkpoint through the copies (window 1, 4 buffers) against
-    transformers' _materialize_copy to the GPU in fp16, as the loop asks for them."""
+    transformers' _materialize_copy in fp16 as the loop asks for them: to the GPU, the embedding to
+    the host (load_stream.py's device for it: the loop's own job)."""
     from safetensors import safe_open
     from transformers import core_model_loading as cml
 
@@ -689,16 +736,18 @@ def test_real_checkpoint_tensor_by_tensor(real_dir):
     handles = [safe_open(f, framework="pt", device="cpu") for f in sorted(glob.glob(os.path.join(real_dir, "*.safetensors")))]
     slices = {k: h.get_slice(k) for h in handles for k in h.keys()}
     keys = sorted(slices, key=cml.dot_natural_key)
-    copier = PinnedCopier(device, window=1, slots=4, log=print)
+    where = {k: "cpu" if k == "model.embed_tokens.weight" else device.index for k in keys}
+    copier = PinnedCopier(device, window=1, slots=4, cast=cast, log=print)
     jobs = []
     for k in keys:
-        args = (None, slices[k], device.index, torch.float16)
+        args = (None, slices[k], where[k], torch.float16)
         jobs.append(copier.add(cml.spawn_materialize(*args), cml.spawn_materialize, args, {}))
     differ = []
+    started = time.perf_counter()
     try:
         for k, job in zip(keys, jobs):
             ours = job()
-            theirs = cml._materialize_copy(slices[k], device.index, torch.float16)
+            theirs = cml._materialize_copy(slices[k], where[k], torch.float16)
             if not _same(ours, theirs):
                 differ.append(k)
             del ours, theirs
@@ -707,20 +756,26 @@ def test_real_checkpoint_tensor_by_tensor(real_dir):
         del jobs, slices
         for h in handles:
             h.__exit__(None, None, None)
+    print(f"338 tensors through the copies (cast on the {cast}) and _materialize_copy in "
+          f"{time.perf_counter() - started:.2f} s")
     assert not differ, differ[:10]
-    assert len(keys) == 338 and copier.copied == len(keys) and copier.fallbacks == 0 and copier.reason is None
+    assert len(keys) == 338 and copier.planned == copier.copied == 337 and copier.fallbacks == 0
+    assert copier.reason is None and copier.slot_bytes == 8960 * 1536 * 2
 
 
 @cuda
-def test_real_load_bit_equal(patched, real_dir):
-    """The real model loaded in Soup's setup with load_stream.py's moves and the copies (defaults)
-    against transformers' own load: every packed weight, absmax, quant state, norm, bias and the
-    embedding bit for bit."""
+@pytest.mark.parametrize("cast", ["cpu", "gpu"])
+def test_real_load_bit_equal(patched, real_dir, monkeypatch, cast):
+    """The real model loaded in Soup's setup with load_stream.py's moves and the copies (default
+    window and buffers) against transformers' own load: every packed weight, absmax, quant state,
+    norm, bias and the embedding bit for bit."""
     from solution import load_pinned
 
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", cast)
     ours = _load_in_setup(patched, real_dir, _snapshot)
     copier = load_pinned.LAST["copier"]
     assert copier is not None and copier.copied == copier.planned == 337 and copier.reason is None
+    assert copier.cast == cast
     plain = _load(real_dir)
     started = time.perf_counter()
     theirs = _snapshot(plain)
@@ -728,5 +783,6 @@ def test_real_load_bit_equal(patched, real_dir):
     gc.collect()
     torch.cuda.empty_cache()
     _compare(ours["result"], theirs)
-    print(f"real load with the copies {ours['seconds']:.2f} s (GPU peak {ours['peak'] / 2**20:.0f} MiB); "
+    print(f"real load with the copies (cast on the {cast}) {ours['seconds']:.2f} s (GPU peak "
+          f"{ours['peak'] / 2**20:.0f} MiB); "
           f"snapshot {time.perf_counter() - started:.2f} s")

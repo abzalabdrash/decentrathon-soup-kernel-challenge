@@ -16,9 +16,15 @@ by bitsandbytes on one GPU, inside Soup's `_setup_transformers`):
   pass will ask for them (the order the first pass creates their jobs);
 - when the second pass begins, a thread fills a ring of K pinned host buffers
   (SOUP_SOLUTION_LOAD_PINNED_SLOTS, default 4, each the size of the largest tensor: 26 MiB for
-  Qwen2.5-1.5B) with the next tensors: the same `slice[...]` and the same CPU conversion (`copy_`
-  into an fp16 view of the buffer runs the kernel `.to(float16)` runs), so the bytes are the ones
-  the original path copies;
+  Qwen2.5-1.5B) with the next tensors, from the same `slice[...]`;
+- the bf16 -> fp16 cast: with SOUP_SOLUTION_LOAD_PINNED_CAST=cpu (default) the thread converts into an
+  fp16 view of the buffer with `copy_`, the kernel `.to(float16)` runs, so the bytes are the ones the
+  original path copies by construction; with =gpu the thread copies the raw bf16 bytes (one memmove
+  in one thread: about a quarter of the CPU time of torch's bf16 -> fp16 conversion per byte) and the
+  GPU converts them in place in the tensor after its copy (torch's CUDA cast; both casts are IEEE
+  round-to-nearest-even, the tests check all 65,536 bf16 values and every tensor of the real
+  checkpoint bit for bit). The CPU time matters: on the T4 the first training step waits for the
+  kernels the warm-up thread compiles meanwhile, and the load competes with it for the 4 CPUs;
 - the job of a tensor allocates its GPU tensor where `.to()` does (current stream, same shape and
   dtype) and copies the buffer into it with `non_blocking=True`; an event after each copy tells the
   thread when the buffer may be refilled (no record_stream). With SOUP_SOLUTION_LOAD_PINNED_WINDOW=W
@@ -37,6 +43,7 @@ planned, an error) takes the original job for that tensor, and for every later o
 that tensor's staging failed. Switch: SOUP_SOLUTION_LOAD_PINNED=1 (default off).
 """
 
+import ctypes
 import functools
 import inspect
 import os
@@ -69,8 +76,10 @@ def new_copier(device, log=print):
     if not enabled():
         return None
     try:
+        cast = os.environ.get("SOUP_SOLUTION_LOAD_PINNED_CAST", "cpu").strip().lower()
         return PinnedCopier(device, window=_env_int("SOUP_SOLUTION_LOAD_PINNED_WINDOW", 1, 0, 2),
-                            slots=_env_int("SOUP_SOLUTION_LOAD_PINNED_SLOTS", 4, 2, 16), log=log)
+                            slots=_env_int("SOUP_SOLUTION_LOAD_PINNED_SLOTS", 4, 2, 16),
+                            cast="gpu" if cast == "gpu" else "cpu", log=log)
     except Exception as exc:  # noqa: BLE001 - load as usual
         log(f"[solution] pinned load copies skipped: {exc!r}")
         return None
@@ -91,16 +100,17 @@ def _as_device(value):
 class _Entry:
     """One checkpoint tensor of the plan and where it is: staged in a buffer, copied (ahead) to the GPU."""
 
-    __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "nbytes", "job", "ready", "released",
-                 "staged", "error", "out", "event")
+    __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "stage_dtype", "nbytes", "job", "ready",
+                 "released", "staged", "error", "out", "event")
 
-    def __init__(self, index, source, shape, src_dtype, dtype, job):
+    def __init__(self, index, source, shape, src_dtype, dtype, stage_dtype, job):
         self.index, self.source, self.shape = index, source, shape
         self.src_dtype, self.dtype, self.job = src_dtype, dtype, job
+        self.stage_dtype = stage_dtype  # in the buffer and copied: `dtype`, or `src_dtype` cast on the GPU
         numel = 1
         for size in shape:
             numel *= size
-        self.nbytes = numel * dtype.itemsize
+        self.nbytes = numel * stage_dtype.itemsize
         self.ready = threading.Event()  # staged in its buffer (or staging gave up on it)
         self.released = threading.Event()  # its copy out of the buffer is issued (event set) or skipped
         self.staged = self.error = self.out = self.event = None
@@ -112,9 +122,10 @@ class PinnedCopier:
     the loop's first pass and returns the job the second pass calls; `close` ends it when the load
     returns or raises. Device operations are small methods, so that the CPU tests can replace them."""
 
-    def __init__(self, device, window=1, slots=4, log=print):
+    def __init__(self, device, window=1, slots=4, cast="cpu", log=print):
         self.device = torch.device(device)
         self.window, self.slots, self.log = max(0, int(window)), max(1, int(slots)), log
+        self.cast = cast
         self._owner = threading.get_ident()
         self._entries = []
         self._next = 0  # index of the entry the loop must ask for next
@@ -154,8 +165,8 @@ class PinnedCopier:
         stream; returns it and an event recorded after the copy."""
         stream = torch.cuda.current_stream(self.device)
         out = torch.empty(entry.shape, dtype=entry.dtype, device=self.device)
-        out.copy_(entry.staged, non_blocking=True)
-        event = torch.cuda.Event()
+        self._copy_into(out, entry)
+        event = torch.cuda.Event(blocking=True)  # the thread sleeps in synchronize() instead of spinning
         event.record(stream)
         return out, event
 
@@ -167,10 +178,21 @@ class PinnedCopier:
         allocated.record(torch.cuda.current_stream(self.device))
         self._side.wait_event(allocated)
         with torch.cuda.stream(self._side):
-            out.copy_(entry.staged, non_blocking=True)
-        event = torch.cuda.Event()
+            self._copy_into(out, entry)
+        event = torch.cuda.Event(blocking=True)
         event.record(self._side)
         return out, event
+
+    @staticmethod
+    def _copy_into(out, entry):
+        """The staged bytes into `out` on the current stream; staged in the checkpoint's dtype, they
+        land in `out`'s own memory and are cast there in place (same element size, full overlap)."""
+        if entry.stage_dtype == entry.dtype:
+            out.copy_(entry.staged, non_blocking=True)
+        else:
+            raw = out.view(entry.stage_dtype)
+            raw.copy_(entry.staged, non_blocking=True)
+            out.copy_(raw)
 
     def _hand_over(self, event):
         """The default stream waits for a copy made ahead before the tensor is used (and freed) on it."""
@@ -212,8 +234,9 @@ class PinnedCopier:
         target = src_dtype if dtype is None else dtype
         if src_dtype is None or target not in _FLOATS:
             return None
+        stage = src_dtype if self.cast == "gpu" and src_dtype.itemsize == target.itemsize else target
         entry = _Entry(len(self._entries), source, tuple(int(size) for size in source.get_shape()),
-                       src_dtype, target, job)
+                       src_dtype, target, stage, job)
         return entry if 0 < entry.nbytes <= MAX_TENSOR_BYTES else None
 
     # --- the jobs (second pass) ---------------------------------------------------------------------
@@ -333,15 +356,19 @@ class PinnedCopier:
 
     @staticmethod
     def _stage(entry, buffer):
-        """The checkpoint slice in the buffer, converted as `_materialize_copy`'s `.to(device, dtype)`
-        converts it on the CPU before its copy to the GPU (the same `slice[...]`, the same kernel)."""
+        """The checkpoint slice (the same `slice[...]` as `_materialize_copy`) in the buffer: converted
+        as its `.to(device, dtype)` converts it on the CPU before the copy to the GPU (the same
+        kernel), or its raw bytes when the GPU casts them (or when there is nothing to cast)."""
         source = entry.source[...]
         if (not torch.is_tensor(source) or source.device.type != "cpu" or source.dtype != entry.src_dtype
                 or tuple(source.shape) != entry.shape):
             raise ValueError(f"unexpected slice: {type(source).__name__} {getattr(source, 'dtype', None)} "
                              f"{tuple(getattr(source, 'shape', ()))}")
-        staged = buffer[:entry.nbytes].view(entry.dtype).view(entry.shape)
-        staged.copy_(source)
+        staged = buffer[:entry.nbytes].view(entry.stage_dtype).view(entry.shape)
+        if entry.stage_dtype == source.dtype and source.is_contiguous():
+            ctypes.memmove(staged.data_ptr(), source.data_ptr(), entry.nbytes)  # one thread, no GIL
+        else:
+            staged.copy_(source)
         return staged
 
     # --- the end ------------------------------------------------------------------------------------
@@ -396,7 +423,7 @@ class PinnedCopier:
         if self.planned:
             self.log(f"[solution] pinned load copies: {self.copied} of {self.planned} checkpoint tensors "
                      f"({self.copied_bytes / 2**20:.0f} MiB, {self.copied_ahead} copied ahead on a side stream, "
-                     f"window {self.window}) through {len(buffers)} pinned buffers of "
+                     f"window {self.window}, cast on the {self.cast.upper()}) through {len(buffers)} pinned buffers of "
                      f"{self.slot_bytes / 2**20:.1f} MiB; staging {self.fill_seconds:.2f} s in a thread "
                      f"(+{self.slot_wait_seconds:.2f} s waiting for buffers), the loop waited "
                      f"{self.wait_seconds:.2f} s for staging; {self.fallbacks} tensors the original way"
