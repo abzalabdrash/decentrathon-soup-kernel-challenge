@@ -31,6 +31,7 @@ def test_same_bits_and_off_the_gpu_between_steps(monkeypatch):
     ref_p, ref_m, ref_between = _train(False, monkeypatch)
     got_p, got_m, got_between = _train(True, monkeypatch)
     assert not any(ref_between) and all(got_between)
+    # one flat host buffer behind all moments
     assert all(torch.equal(a, b) for a, b in zip(got_p, ref_p))
     assert all(m.is_cuda for m in got_m)  # put back on the GPU when the training returns
     assert all(torch.equal(a, b) for a, b in zip(got_m, ref_m))
