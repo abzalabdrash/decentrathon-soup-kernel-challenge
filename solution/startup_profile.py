@@ -8,6 +8,8 @@ What it prints to the training log (lines start with `[solution] startup-profile
 - extra marks from the end of Soup's model setup to the end of the first step (`install_marks`):
   the tokenization of the training rows, TRL's SFTTrainer and transformers' Trainer __init__, the end
   of Soup's setup, the Trainer's train() and its inner loop up to on_train_begin, the first step;
+- the os.stat cost of each sys.path entry, and the import system's stat calls per sys.path entry
+  (count, time) from `apply begin` to the first step;
 - a sampling profile from `apply begin` to the end of the first step: a daemon thread reads
   sys._current_frames() every INTERVAL s and charges the time since its previous tick to the Python
   stack of the main thread and of every other thread. At the end of training it prints, per window
@@ -149,6 +151,86 @@ def _name(code):
     return f"{path}:{code.co_firstlineno}({getattr(code, 'co_qualname', code.co_name)})"
 
 
+# ---------------------------------------------------------------- the import system's stat calls
+
+_STATS = {"installed": False, "calls": {}, "original": None, "active": True}
+
+
+def _stat_root(path):
+    """The sys.path entry (or other top directory) a stat'ed path belongs to."""
+    best = ""
+    for entry in sys.path:
+        if entry and path.startswith(entry) and len(entry) > len(best):
+            best = entry
+    return best or "/".join(path.split("/")[:3])
+
+
+def _install_stat_counter():
+    """Counts and times importlib's `_path_stat` (the os.stat behind every module lookup) per
+    sys.path entry, from `apply begin` to the end of the first step."""
+    try:
+        from importlib import _bootstrap_external as external
+    except Exception:  # noqa: BLE001
+        return
+    original = getattr(external, "_path_stat", None)
+    if original is None or _STATS["installed"]:
+        return
+    calls = _STATS["calls"]
+    clock = time.perf_counter
+
+    def count(path, ok, elapsed):
+        key = (_stat_root(str(path)), ok)
+        found = calls.get(key)
+        calls[key] = (1, elapsed) if found is None else (found[0] + 1, found[1] + elapsed)
+
+    def _path_stat(path):
+        if not _STATS["active"]:
+            return original(path)
+        start = clock()
+        try:
+            result = original(path)
+        except OSError:
+            count(path, False, clock() - start)
+            raise
+        count(path, True, clock() - start)
+        return result
+
+    external._path_stat = _path_stat
+    _STATS.update(installed=True, original=original)
+
+
+def _path_entry_timings():
+    """os.stat of each sys.path entry and of a missing name in it, 50 times each (microseconds)."""
+    out = []
+    for entry in sys.path:
+        if not entry:
+            continue
+        timings = []
+        for target in (entry, os.path.join(entry, "__soup_missing__")):
+            start = time.perf_counter()
+            for _ in range(50):
+                try:
+                    os.stat(target)
+                except OSError:
+                    pass
+            timings.append(1e6 * (time.perf_counter() - start) / 50)
+        out.append(f"{entry} {timings[0]:.0f}/{timings[1]:.0f}")
+    return out
+
+
+def _report_stats():
+    calls = _STATS["calls"]
+    if not calls:
+        return
+    total_n = sum(n for n, _ in calls.values())
+    total_s = sum(t for _, t in calls.values())
+    _log(f"import system os.stat calls from apply begin to the first step: {total_n} calls, {total_s:.3f} s "
+         f"(in the stat call itself, the GIL released)")
+    for (root, ok), (n, seconds) in sorted(calls.items(), key=lambda kv: -kv[1][1])[:12]:
+        _log(f"  stat {'found' if ok else 'missing'} under {root or '?'}: {n} calls, {seconds:.3f} s, "
+             f"{1e6 * seconds / n:.0f} us each")
+
+
 def on_mark(name):
     """Called by phases.mark for every mark: starts the sampler at `apply begin`, prints the CPU
     split since the previous mark, and the report at `train end` (or `exit`)."""
@@ -171,6 +253,12 @@ def _on_mark(name):
         _log(f"sampling every {INTERVAL * 1000:.0f} ms from `{name}`; cpus {os.cpu_count()}, "
              f"affinity {len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else '?'}, "
              f"switch interval {sys.getswitchinterval() * 1000:.1f} ms")
+        try:
+            _log("os.stat of each sys.path entry / of a missing name in it, us: "
+                 + "; ".join(_path_entry_timings()))
+            _install_stat_counter()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"stat diagnostics failed: {exc!r}")
     record = {"name": name, "t": now, "main_cpu": _cpu_of(main), "proc_cpu": time.process_time(),
               "threads": {t.name: _cpu_of(t.ident) for t in threading.enumerate()
                           if t.ident != main and not t.name.startswith("solution-startup-profile")}}
@@ -199,6 +287,7 @@ def _on_mark(name):
         sampler = _STATE["sampler"]
         if sampler is not None:
             sampler.halt.set()
+        _STATS["active"] = False
     if name in ("train end", "exit") and not _STATE["reported"]:
         _STATE["reported"] = True
         report()
@@ -230,6 +319,11 @@ def report():
     if sampler is None:
         return
     sampler.halt.set()
+    _STATS["active"] = False
+    try:
+        _report_stats()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"stat report failed: {exc!r}")
     t0 = _STATE["t0"]
     times = {}
     for record in _STATE["marks"]:
