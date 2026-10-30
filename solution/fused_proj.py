@@ -908,7 +908,9 @@ def _fused_attention(attn, x, position_embeddings, plan):
 # MLP
 
 
-_MLP_MEMORY = {"recompute": False}
+_MLP_MEMORY = {"recompute": False,
+               "inplace": os.environ.get("SOUP_SOLUTION_MLP_BWD_INPLACE", "0").strip().lower()
+               not in ("0", "false", "no", "")}
 
 
 def set_mlp_recompute(on):
@@ -1060,7 +1062,11 @@ class _MLP(torch.autograd.Function):
             grad_x = _recompute_backward(plan, saved, grad_hidden, padded)
         else:
             gate_up = saved
-            grad_gate_up = torch.empty_like(gate_up)
+            # in place (SOUP_SOLUTION_MLP_BWD_INPLACE=1): the saved (gate|up) has no other reader
+            # after this backward (offload.py's unpack hands over a fresh copy and drops its own
+            # reference), and _swiglu_bwd loads every element before storing what it computes
+            # from it: one (2I, N) half buffer less at the start of the backward (36 KB per token)
+            grad_gate_up = gate_up if _MLP_MEMORY["inplace"] else torch.empty_like(gate_up)
             _swiglu_bwd(grad_hidden, gate_up, grad_gate_up, inter, padded)
             del grad_hidden
             grad_x = _gate_up_matmul(plan, grad_gate_up.t(), None, grad_gate_up)

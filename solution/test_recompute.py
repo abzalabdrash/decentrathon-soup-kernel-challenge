@@ -282,3 +282,30 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
     assert saved_split > 0.8 * 2 * 1536
     # the recompute keeps neither the branch nor q, k, v, the output and lse: > 10 KB per token less
     assert saved_recompute > 10_000
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_mlp_backward_in_place_is_bitwise(monkeypatch, split):
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    from solution import fused_proj
+
+    monkeypatch.setenv("SOUP_SOLUTION_FUSED_GU_SPLIT", "1" if split else "0")
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=20).cuda().train()
+    g = torch.Generator("cuda").manual_seed(7)
+    x = torch.randn(1, 826, 1536, device="cuda", generator=g)
+    grad = torch.randn(1, 826, 1536, device="cuda", generator=g).half()
+    saved = dict(fused_proj._MLP_MEMORY)
+    results = []
+    try:
+        for inplace in (False, True):
+            fused_proj._MLP_MEMORY.update(recompute=False, inplace=inplace)
+            xg = x.clone().requires_grad_(True)
+            with torch.autocast("cuda", dtype=torch.float16):
+                out = mlp(xg)
+            out.backward(grad.to(out.dtype))
+            results.append((out.detach(), xg.grad))
+    finally:
+        fused_proj._MLP_MEMORY.clear()
+        fused_proj._MLP_MEMORY.update(saved)
+    assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
