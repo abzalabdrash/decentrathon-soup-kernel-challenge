@@ -78,12 +78,13 @@ def apply():
 
         patch_qwen2_attention_fused()  # after unpad's attention patch and rope: it falls back to them
         patch_qwen2_mlp_fused()  # after mlp16's patch: it falls back to it
-    mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "offload").strip().lower()
-    if mode == "recompute" and _on("SOUP_SOLUTION_FUSED_PROJ"):
-        mode = "offload"  # recompute replaces the MLP forward; with the fused MLP use the offload
     from .offload import patch_mlp_memory
 
-    patch_mlp_memory(mode)
+    patch_mlp_memory()  # SOUP_SOLUTION_MLP_MEMORY=recompute (default)|offload|none, after the MLP patches
+    if _on("SOUP_SOLUTION_ALLOC_WATCH"):
+        from .alloc_watch import patch_soup_alloc_watch
+
+        patch_soup_alloc_watch()  # SOUP_SOLUTION_ALLOC_GUARD=0: log only
     if _on("SOUP_SOLUTION_WEIGHT_STREAM"):
         from .weight_stream import patch_weight_stream
 
