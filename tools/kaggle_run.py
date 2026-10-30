@@ -12,8 +12,15 @@ What it does:
 4. downloads the log and the json results into runs_kaggle/<timestamp>/ and prints the summary.
 
 Needs the Kaggle CLI (`pip install kaggle`) and a token: KAGGLE_API_TOKEN in the environment or
-~/.kaggle/kaggle.json. A private GitHub repository also needs the Kaggle secret GITHUB_TOKEN
-(added once per Kaggle account in the web UI, Add-ons -> Secrets); the notebook reads it itself.
+~/.kaggle/kaggle.json. A private GitHub repository needs a GitHub token on Kaggle. Kaggle secrets
+added in the notebook editor are not attached to notebooks pushed through the API, so the token
+goes into a private Kaggle dataset of the same account instead:
+
+    python tools/kaggle_run.py --user <kaggle_user> --setup-secrets --github-token-file <file>
+
+creates (or updates) the private dataset <kaggle_user>/soup-secrets with github_token.txt; every
+later push attaches it and the notebook reads the token from /kaggle/input/soup-secrets/ when the
+GITHUB_TOKEN secret is missing. Pass --no-secrets-dataset for a public repository.
 
 Modes:
   full      harness/run_task.py (base + solution), then check_rules.py and score.py   ~10-12 min
@@ -50,7 +57,25 @@ CHECK_CELLS = {
 }
 
 
-def build_notebook(repo_url, commit, mode):
+SECRET_MARKER = '    print("No GITHUB_TOKEN secret, cloning without it:", type(exc).__name__)\n'
+SECRET_FALLBACK = [
+    'if not token and os.path.exists("/kaggle/input/soup-secrets/github_token.txt"):\n',
+    '    # private dataset of this Kaggle account (secrets are not attached to API-pushed notebooks)\n',
+    '    token = open("/kaggle/input/soup-secrets/github_token.txt", encoding="utf-8").read().strip()\n',
+    '    print("GitHub token read from the private dataset soup-secrets")\n',
+]
+
+
+def inject_token_fallback(cell):
+    lines = cell["source"]
+    for i, line in enumerate(lines):
+        if line == SECRET_MARKER:
+            cell["source"] = lines[: i + 1] + SECRET_FALLBACK + lines[i + 1:]
+            return True
+    return False
+
+
+def build_notebook(repo_url, commit, mode, secrets_dataset=None):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -64,6 +89,8 @@ def build_notebook(repo_url, commit, mode):
             cell["source"] = RUN_CELLS[mode]
         elif "harness/check_rules.py" in text:
             cell["source"] = CHECK_CELLS[mode]
+        elif secrets_dataset and "GITHUB_TOKEN" in text and not inject_token_fallback(cell):
+            sys.exit("the clone cell of the template changed: cannot inject the token fallback")
     for cell in cells:
         cell["outputs"] = [] if cell["cell_type"] == "code" else cell.get("outputs", [])
         if cell["cell_type"] == "code":
@@ -139,10 +166,33 @@ def summarize(out_dir, mode):
         break
 
 
+def setup_secrets(user, token_file, out):
+    """Create or update the private dataset <user>/soup-secrets holding github_token.txt."""
+    token = Path(token_file).read_text(encoding="utf-8").strip()
+    if not token:
+        sys.exit(f"{token_file} is empty")
+    folder = Path(out) / f"secrets-{user}"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "github_token.txt").write_text(token + "\n", encoding="utf-8")
+    (folder / "dataset-metadata.json").write_text(json.dumps({
+        "title": "soup-secrets", "id": f"{user}/soup-secrets",
+        "licenses": [{"name": "CC0-1.0"}]}, indent=2), encoding="utf-8")
+    out_text = kaggle("datasets", "create", "-p", str(folder), check=False)
+    if "already" in out_text.lower() or "exists" in out_text.lower() or "409" in out_text:
+        out_text = kaggle("datasets", "version", "-p", str(folder), "-m", "update", check=False)
+    print(out_text.strip())
+    print(f"private dataset {user}/soup-secrets ready (processing can take a minute)")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--user", default=os.environ.get("KAGGLE_USERNAME"), help="Kaggle username")
-    parser.add_argument("--repo", required=True, help="git URL of the team repository")
+    parser.add_argument("--repo", help="git URL of the team repository")
+    parser.add_argument("--setup-secrets", action="store_true",
+                        help="create/update the private dataset <user>/soup-secrets and exit")
+    parser.add_argument("--github-token-file", help="file with the GitHub token (with --setup-secrets)")
+    parser.add_argument("--no-secrets-dataset", action="store_true",
+                        help="do not attach <user>/soup-secrets (public repository)")
     parser.add_argument("--commit", default="", help="commit sha to check out; empty = default branch")
     parser.add_argument("--mode", choices=sorted(RUN_CELLS), default="full")
     parser.add_argument("--slug", default="soup-kernel-run", help="kernel slug (one per purpose)")
@@ -156,6 +206,14 @@ def main():
     args = parser.parse_args()
     if not args.user:
         sys.exit("--user or KAGGLE_USERNAME is required")
+    if args.setup_secrets:
+        if not args.github_token_file:
+            sys.exit("--setup-secrets needs --github-token-file")
+        setup_secrets(args.user, args.github_token_file, args.out)
+        return
+    if not args.repo:
+        sys.exit("--repo is required")
+    secrets_dataset = None if args.no_secrets_dataset else f"{args.user}/soup-secrets"
     if args.commit == "HEAD":
         args.commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True,
                                      text=True, check=True).stdout.strip()
@@ -164,14 +222,16 @@ def main():
     push_dir = Path(args.out) / f"{stamp}-{args.mode}-{args.slug}"
     push_dir.mkdir(parents=True, exist_ok=True)
     nb_name = f"{args.slug}.ipynb"
-    (push_dir / nb_name).write_text(json.dumps(build_notebook(args.repo, args.commit, args.mode),
-                                               ensure_ascii=False, indent=1), encoding="utf-8")
+    (push_dir / nb_name).write_text(
+        json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset),
+                   ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
             "language": "python", "kernel_type": "notebook",
             "is_private": "false" if args.public else "true",
             "enable_gpu": "true", "enable_internet": "true", "machine_shape": args.accelerator,
-            "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": []}
+            "dataset_sources": [secrets_dataset] if secrets_dataset else [],
+            "competition_sources": [], "kernel_sources": [], "model_sources": []}
     (push_dir / "kernel-metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     print(f"pushing {kernel} ({args.mode}, commit {args.commit or 'default branch'}) ...", flush=True)
