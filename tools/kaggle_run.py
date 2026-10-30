@@ -26,6 +26,8 @@ Modes:
   full      harness/run_task.py (base + solution), then check_rules.py and score.py   ~10-12 min
   solution  harness/run_task.py --only solution --out runs_try (quick: checks 1,5-8 will fail)
   profile   harness/run_task.py --profile (full run plus a profiled solution run)
+  diag      import times, then --only solution with SOUP_SOLUTION_DIAG=1 (solution/diag.py): memory
+            at the phases, PCIe probe, allocation snapshot of one step, chrome trace of two steps
 """
 
 import argparse
@@ -47,6 +49,10 @@ RUN_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/run_task.py\n"],
     "solution": ["!cd /kaggle/working/repo && python harness/run_task.py --only solution --out runs_try\n"],
     "profile": ["!cd /kaggle/working/repo && python harness/run_task.py --profile\n"],
+    # diag: import times of apply()'s stack, then a solution-only run with solution/diag.py on
+    # (memory at the phases, PCIe probe, allocation snapshot of one step, chrome trace of two)
+    "diag": ["!cd /kaggle/working/repo && mkdir -p runs_diag && SOUP_SOLUTION_WARMUP=0 python -X importtime -c \"import torch; torch.empty(1, device='cuda'); import transformers; import sys; sys.path.insert(0, '.'); import solution; solution.apply(); import soup_cli.cli\" 2> runs_diag/importtime.log; wc -l runs_diag/importtime.log\n",
+             "!cd /kaggle/working/repo && SOUP_SOLUTION_DIAG=1 python harness/run_task.py --only solution --out runs_diag\n"],
 }
 CHECK_CELLS = {
     "full": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
@@ -54,6 +60,8 @@ CHECK_CELLS = {
     "solution": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_try/result.json --skip-tests\n"],
     "profile": ["!cd /kaggle/working/repo && python harness/check_rules.py\n",
                 "!cd /kaggle/working/repo && python harness/score.py runs/result.json\n"],
+    "diag": ["!cd /kaggle/working/repo && python harness/check_rules.py --result runs_diag/result.json --skip-tests\n",
+             "!cd /kaggle/working/repo && ls -la runs_diag/solution_1/ && head -c 300 runs_diag/importtime.log\n"],
 }
 
 
@@ -137,7 +145,7 @@ def wait_for(kernel, poll_s):
 
 
 def summarize(out_dir, mode):
-    sub = "runs_try" if mode == "solution" else "runs"
+    sub = {"solution": "runs_try", "diag": "runs_diag"}.get(mode, "runs")
     result = None
     for path in out_dir.rglob("result.json"):
         if sub in path.parts:
@@ -241,7 +249,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         status = wait_for(kernel, args.poll)
         print(kaggle("kernels", "output", kernel, "-p", str(out_dir), "-o", "-q",
-                     "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$",
+                     "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
                      check=False).strip())
         print(f"\n=== {status}: outputs in {out_dir} ===")
         summarize(out_dir, args.mode)
@@ -282,7 +290,7 @@ def main():
     out_dir = push_dir / "output"
     out_dir.mkdir(exist_ok=True)
     print(kaggle("kernels", "output", kernel, "-p", str(out_dir), "-o", "-q",
-                 "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$",
+                 "--file-pattern", r"(result|checks|metrics|profile)\.json$|\.log$|trainer_state\.json$|\.pickle$|\.json\.gz$",
                  check=False).strip())
     print(f"\n=== {status}: outputs in {out_dir} ===")
     summarize(out_dir, args.mode)

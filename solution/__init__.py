@@ -21,7 +21,9 @@ Modules:
 - offload.py: the MLP's saved gate/up to pinned host memory (or recomputed) during the backward;
 - weight_stream.py: the layers' 4-bit weights in pinned host memory, a ring of K layers on the GPU;
 - warmup.py: the kernels compiled by a background thread while Soup loads the model;
-- phases.py: wall-clock marks of the run's phases in the log.
+- phases.py: wall-clock marks of the run's phases in the log;
+- diag.py: diagnostics of a run (SOUP_SOLUTION_DIAG=1 only): memory at the marks, a PCIe probe,
+  an allocation snapshot of one step, a chrome trace of two steps.
 
 Switches (environment, for experiments): SOUP_SOLUTION_CE_CHUNK (rows of logits per chunk, default
 512), SOUP_SOLUTION_UNPAD=0, SOUP_SOLUTION_MLP16=0, SOUP_SOLUTION_EMBED16=0, SOUP_SOLUTION_RMSNORM=0,
@@ -87,6 +89,10 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):
+        from .diag import patch_soup_diag
+
+        patch_soup_diag()  # off by default: memory marks, PCIe probe, one step's allocation history, a trace
     if _on("SOUP_SOLUTION_WARMUP"):
         from .warmup import patch_soup_warmup, start_background_warmup
 

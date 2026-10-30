@@ -26,7 +26,16 @@ def mark(name):
     global _START
     if _START is None:
         _START = _process_start() or time.time()
-    print(f"[solution] phase {name} +{time.time() - _START:.2f} s", flush=True)
+    memory = ""
+    if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):
+        try:
+            from .diag import memory_line
+
+            memory = memory_line()
+        except Exception:  # noqa: BLE001 - diagnostics only
+            memory = ""
+    print(f"[solution] phase {name} +{time.time() - _START:.2f} s" + (f"  {memory}" if memory else ""),
+          flush=True)
 
 
 def patch_soup_phases():
