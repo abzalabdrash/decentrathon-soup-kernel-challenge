@@ -1,5 +1,5 @@
 """offload._gc_paused (SOUP_SOLUTION_GC_PAUSE): the collector's state inside Soup's training and
-after it."""
+after it (startup.py may have frozen objects before: the counts only grow)."""
 
 import gc
 
@@ -11,11 +11,15 @@ def test_gc_state_inside_and_after(monkeypatch, mode):
     from solution import offload
 
     monkeypatch.setattr(offload, "GC_PAUSE", mode)
-    assert gc.isenabled() and gc.get_freeze_count() == 0
+    assert gc.isenabled()
+    before = gc.get_freeze_count()
+    keep = [[] for _ in range(100)]  # objects made after the last freeze
     with offload._gc_paused():
         assert gc.isenabled() == (mode != "off")
-        assert (gc.get_freeze_count() > 0) == (mode != "0")
-    assert gc.isenabled() and gc.get_freeze_count() == 0
+        inside = gc.get_freeze_count()
+        assert inside >= before + (100 if mode != "0" else 0)
+    assert gc.isenabled() and gc.get_freeze_count() == inside
+    del keep
 
 
 def test_gc_enabled_again_after_an_error(monkeypatch):
@@ -24,4 +28,4 @@ def test_gc_enabled_again_after_an_error(monkeypatch):
     monkeypatch.setattr(offload, "GC_PAUSE", "off")
     with pytest.raises(RuntimeError), offload._gc_paused():
         raise RuntimeError("training failed")
-    assert gc.isenabled() and gc.get_freeze_count() == 0
+    assert gc.isenabled()

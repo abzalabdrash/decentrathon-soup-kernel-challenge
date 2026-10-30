@@ -517,7 +517,9 @@ def _real_cuda_trainer(trainer):
 # included): "freeze" moves every object made before (the model, the libraries: millions) to the
 # permanent generation, so the collections in the loop only walk what the loop makes; "off" also
 # disables the automatic collections until the training returns; "0" leaves the collector alone.
-# Afterwards the collector is enabled again (if it was) and the frozen objects unfrozen.
+# Afterwards the collector is enabled again (if it was); frozen objects stay frozen (startup.py
+# freezes the imports' objects at the end of apply() the same way, and a training's objects are
+# freed by reference counting).
 GC_PAUSE = os.environ.get("SOUP_SOLUTION_GC_PAUSE", "0").strip().lower()
 
 
@@ -537,7 +539,6 @@ def _gc_paused():
     finally:
         if enabled:
             gc.enable()
-        gc.unfreeze()
 
 
 def patch_soup_train_offload():
