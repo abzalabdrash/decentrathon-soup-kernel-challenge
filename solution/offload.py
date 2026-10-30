@@ -561,6 +561,12 @@ def patch_soup_train_offload():
             # longer used; the training threads make theirs again at their next GEMM
             torch.cuda.synchronize()
             torch._C._cuda_clearCublasWorkspaces()
+        from .cuda_limits import lower_stack_limit
+
+        changed = lower_stack_limit()  # SOUP_SOLUTION_STACK_LIMIT (cuda_limits.py)
+        if changed is not None:
+            print(f"[solution] CUDA stack limit {changed[0]} -> {changed[1]} bytes per thread",
+                  flush=True)
         with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
                 _gc_paused():
             result = original(self, *args, **kwargs)
