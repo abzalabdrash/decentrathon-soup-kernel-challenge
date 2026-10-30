@@ -15,6 +15,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 MIB = 2 ** 20
 HARNESS_ALLOC_CONF = "expandable_segments:True"  # harness/common.py ALLOC_CONF
 EXPANDABLE = os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == HARNESS_ALLOC_CONF
+# the pool tests read process-wide counters (reserved, its peak) that any other thread of a pytest
+# process moves (an earlier test's background warm-up, a prepin): they run in a fresh subprocess
+in_clean_process = pytest.mark.skipif(
+    not EXPANDABLE, reason="runs in a fresh process: test_under_the_harness_allocator_setting")
 
 
 def _spike_and_release(mib):
@@ -34,6 +38,7 @@ def _spike_and_release(mib):
     return peak
 
 
+@in_clean_process
 def test_refill_maps_the_pool_back_to_its_peak():
     from solution.alloc_watch import refill_to_peak
 
@@ -45,12 +50,11 @@ def test_refill_maps_the_pool_back_to_its_peak():
     assert peak - 2 * MIB <= reserved <= peak + 2 * MIB
     assert torch.cuda.max_memory_reserved() <= peak + 2 * MIB  # no new peak of its own
     assert torch.cuda.memory_allocated() == allocated  # the chunks are freed, the pool keeps them
-    if EXPANDABLE:
-        # the freed chunks merge in the expandable segment and serve a larger request without
-        # mapping anything (with plain segments each chunk is a segment of its own)
-        x = torch.empty(200 * MIB, dtype=torch.uint8, device="cuda")
-        assert torch.cuda.memory_reserved() == reserved
-        del x
+    # the freed chunks merge in the expandable segment and serve a larger request without mapping
+    # anything (with plain segments each chunk would be a segment of its own)
+    x = torch.empty(200 * MIB, dtype=torch.uint8, device="cuda")
+    assert torch.cuda.memory_reserved() == reserved
+    del x
     assert refill_to_peak() == 0  # nothing to do at the peak
     torch.cuda.empty_cache()
 
@@ -68,6 +72,7 @@ def test_under_the_harness_allocator_setting():
     assert proc.returncode == 0 and "3 passed" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-2000:]
 
 
+@in_clean_process
 @pytest.mark.parametrize("guard", [True, False])
 def test_callback_logs_and_guards(guard):
     from solution.alloc_watch import make_callback
