@@ -372,8 +372,15 @@ def test_tiny_qwen2_streamed_step(tiny_dir, tmp_path):
         for hook in hooks:
             hook.remove()
     assert seen == [0]  # nothing of the weight's size on the GPU at the end of the forward
-    # the first chunks start at the embedding lookup: the ring exists through the layers
-    assert ring[0] is not None and ring[1] is ring[0]
+    import os
+
+    from solution import head_stream
+
+    if os.environ.get("SOUP_SOLUTION_HEAD_PREFETCH", head_stream.DEFAULT_PREFETCH) == "embedding":
+        # the first chunks start at the embedding lookup: the ring exists through the layers
+        assert ring[0] is not None and ring[1] is ring[0]
+    else:  # "norm": no ring through the layers, made at the final norm
+        assert ring[0] is None and ring[1] is not None
     assert streamer.late_loads == 0 and streamer.heads == 1 and streamer.loads == streamer.n_chunks
 
     torch.testing.assert_close(loss, ref_loss, rtol=1e-4, atol=1e-5)
