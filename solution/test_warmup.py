@@ -310,14 +310,18 @@ def test_skip_switch_leaves_registrations_out(fresh, monkeypatch):
 def test_switched_off_patches_warm_nothing(fresh, monkeypatch):
     for switch in ("SOUP_SOLUTION_RMSNORM", "SOUP_SOLUTION_NF4", "SOUP_SOLUTION_ROPE"):
         monkeypatch.setenv(switch, "0")
+    # the four of warmup.py, and those patches registered earlier in this process (rmsnorm.py's
+    # split backward when the split sum is on)
+    names = [name for name, _ in fresh.BUILTIN if name.startswith(("rms_norm", "nf4", "rope"))]
     for name, fn in fresh.BUILTIN:
-        if name.startswith(("rms_norm", "nf4", "rope")):
+        if name in names:
             fresh.register(fn, name=name)
     compiles = fresh.watch_compiles(log=False)
     fresh.start_background_warmup(log=False)
     assert fresh.wait_for_warmup(60)
     results = fresh.warmup_report()["results"]
-    assert len(results) == 4 and set(results.values()) == {fresh.SKIPPED}
+    assert len(names) >= 4 and set(results) == set(names)
+    assert set(results.values()) == {fresh.SKIPPED}
     assert compiles == []
 
 

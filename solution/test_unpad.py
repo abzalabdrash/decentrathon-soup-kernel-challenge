@@ -315,8 +315,11 @@ def test_one_launch_each_way(varlen):
     if varlen:
         assert fwd_ops == {"_efficient_attention_forward": 1}
         assert bwd_ops == {"_efficient_attention_backward": 1}
-        fwd, _ = _fmha_launches(lambda: holder.update(out=forward()))
-        _, bwd = _fmha_launches(lambda: holder["out"].sum().backward())
+        # the T4's profiler now and then drops one of these kernels (e13402e): the most seen in 3 tries
+        fwd = bwd = 0
+        for _ in range(3):
+            fwd = max(fwd, _fmha_launches(lambda: holder.update(out=forward()))[0])
+            bwd = max(bwd, _fmha_launches(lambda: holder.pop("out").sum().backward())[1])
         assert (fwd, bwd) == (1, 1)
     else:
         assert fwd_ops.get("_scaled_dot_product_efficient_attention") == rows

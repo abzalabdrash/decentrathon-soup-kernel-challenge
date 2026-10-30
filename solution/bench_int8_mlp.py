@@ -55,6 +55,8 @@ def main():
         configs += [(True, tuple(int(v) for v in t.split("x"))) for t in args.tiles]
         for on, tiles in configs:
             int8_bwd._STATE["on"] = on
+            if on:
+                int8_bwd.compile_now()
             if tiles is not None:
                 int8_bwd.TILE_I, int8_bwd.TILE_M, int8_bwd.GROUPS = tiles
             for _ in range(3):

@@ -1148,10 +1148,6 @@ def patch_qwen2_mlp_fused():
     cls = mq.Qwen2MLP
     if getattr(cls, "_soup_fused_proj", False):
         return
-    if int8_bwd._STATE["on"]:
-        from .warmup import register
-
-        register(int8_bwd._warm, name="int8_bwd_kernels")
     previous = cls.forward
 
     def forward(self, x):

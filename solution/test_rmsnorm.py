@@ -188,9 +188,9 @@ def test_patched_decoder_layer_matches_original(autocast, train_norms, monkeypat
     calls = {"norm": 0, "add_norm": 0}
 
     def counted(name, fn):
-        def wrapper(*args):
+        def wrapper(*args, **kwargs):
             calls[name] += 1
-            return fn(*args)
+            return fn(*args, **kwargs)
         return wrapper
 
     monkeypatch.setattr(rn, "rmsnorm", counted("norm", rn.rmsnorm))

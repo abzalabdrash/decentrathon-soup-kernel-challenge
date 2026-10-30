@@ -261,7 +261,9 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
         torch.manual_seed(7)
         (mlp_out, residual), (hidden, branch_in) = _layer_forward(layer, rotary, lengths)
         s_next, y_next = add_rmsnorm(residual, mlp_out, next_norm, 1e-6)  # the next input norm
-        out = (mlp_out.detach(), residual.detach())
+        # compared on the host: no run's outputs or gradients stay on the GPU during the next runs,
+        # and the layer's output (the sum) is not held past the next norm, whose input it is
+        out = (mlp_out.detach().cpu(), residual.detach().cpu())
         del mlp_out, residual
         torch.cuda.synchronize()
         held = torch.cuda.memory_allocated()
@@ -271,7 +273,8 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
         torch.autograd.backward([s_next, y_next], grads)
         del s_next, y_next
         return {"held": held, "out": out,
-                "grads": [hidden.grad, branch_in.grad] + [p.grad.clone() for p in _lora_params(layer)]}
+                "grads": [t.cpu() for t in [hidden.grad, branch_in.grad]
+                          + [p.grad for p in _lora_params(layer)]]}
 
     run(None, False)  # first call: buffers, caches, the allocator's pool
     results = {name: run(mode, split) for name, mode, split in
