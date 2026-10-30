@@ -112,6 +112,14 @@ def fused_ce_rows_kernel(
             tl.store(base + offs, g.to(logits_ptr.dtype.element_ty), mask=mask)
 
 
+def compute_dtype():
+    """The dtype the base's lm_head GEMM runs in: autocast's (fp16 on a T4, bf16 where Soup picks
+    bf16), else fp16."""
+    if torch.is_autocast_enabled("cuda"):
+        return torch.get_autocast_dtype("cuda")
+    return torch.float16
+
+
 def _head_chunks(hidden16, weight16, targets, n_labelled, grad_scale, chunk):
     """Runs the chunk loop on rows already ordered labelled-first. Returns per-row loss, entropy,
     correctness and dL/dh for the labelled rows (zeros elsewhere)."""
@@ -120,10 +128,11 @@ def _head_chunks(hidden16, weight16, targets, n_labelled, grad_scale, chunk):
     loss = torch.empty(n, dtype=torch.float32, device=hidden16.device)
     entropy = torch.empty(n, dtype=torch.float32, device=hidden16.device)
     correct = torch.empty(n, dtype=torch.int32, device=hidden16.device)
-    dh = torch.zeros(n, d, dtype=torch.float16, device=hidden16.device)
+    dh = torch.zeros(n, d, dtype=hidden16.dtype, device=hidden16.device)
     for start in range(0, n, chunk):
         end = min(start + chunk, n)
-        logits = torch.matmul(hidden16[start:end], weight16.t())  # (rows, V) fp16, cuBLAS
+        with torch.autocast("cuda", enabled=False):
+            logits = torch.matmul(hidden16[start:end], weight16.t())  # (rows, V) half, cuBLAS
         n_grad = max(0, min(end, n_labelled) - start)
         fused_ce_rows_kernel[(end - start,)](
             logits, logits.stride(0), targets[start:end],
@@ -132,7 +141,8 @@ def _head_chunks(hidden16, weight16, targets, n_labelled, grad_scale, chunk):
             IGNORE=IGNORE_INDEX, BLOCK=BLOCK_V, num_warps=8,
         )
         if n_grad > 0:
-            torch.matmul(logits[:n_grad], weight16, out=dh[start:start + n_grad])
+            with torch.autocast("cuda", enabled=False):
+                torch.matmul(logits[:n_grad], weight16, out=dh[start:start + n_grad])
         del logits
     return loss, entropy, correct, dh
 
@@ -152,8 +162,9 @@ class FusedLMHeadLoss(torch.autograd.Function):
             grad_scale = 1.0 / max(n_labelled, 1)
         else:
             grad_scale = 1.0 / float(num_items)
-        hidden16 = hidden2d[order].to(torch.float16)
-        weight16 = weight if weight.dtype == torch.float16 else weight.to(torch.float16)
+        dtype = compute_dtype()
+        hidden16 = hidden2d[order].to(dtype)
+        weight16 = weight if weight.dtype == dtype else weight.to(dtype)
         targets_sorted = targets[order].contiguous()
         loss_rows, entropy_rows, correct_rows, dh_sorted = _head_chunks(
             hidden16, weight16, targets_sorted, n_labelled, grad_scale, chunk)
@@ -184,8 +195,9 @@ def fused_lm_head_loss(hidden2d, weight, targets, num_items=None, chunk=DEFAULT_
 
 
 def reference_lm_head_loss(hidden2d, weight, targets, num_items=None):
-    """What the base does, for tests: fp16 logits, fp32 cross-entropy, TRL entropy, TRL accuracy."""
-    logits = torch.matmul(hidden2d.to(torch.float16), weight.to(torch.float16).t())
+    """What the base does, for tests: half logits, fp32 cross-entropy, TRL entropy, TRL accuracy."""
+    dtype = compute_dtype()
+    logits = torch.matmul(hidden2d.to(dtype), weight.to(dtype).t())
     logits32 = logits.float()
     token_loss = F.cross_entropy(logits32, targets, ignore_index=IGNORE_INDEX, reduction="none")
     labelled = targets != IGNORE_INDEX
@@ -203,12 +215,19 @@ def shift_labels(labels):
     return F.pad(labels, (0, 1), value=IGNORE_INDEX)[..., 1:]
 
 
-def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK):
-    """Qwen2ForCausalLM.forward: in training with labels, skip the logits and return the fused loss.
-    Everything else (eval, generation, no labels, CPU) keeps the original forward."""
+UNPAD = {"enabled": True}  # pack the real tokens of the batch (unpad.py) before the layers
+
+
+def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK, unpad_enabled=True):
+    """Qwen2ForCausalLM.forward: in training with labels, skip the logits and return the fused loss;
+    with `unpad_enabled`, also run the layers on the packed real tokens. Everything else (eval,
+    generation, no labels, CPU) keeps the original forward."""
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2
 
+    from . import unpad
+
+    UNPAD["enabled"] = unpad_enabled
     cls = modeling_qwen2.Qwen2ForCausalLM
     if getattr(cls, "_soup_fused_ce", False):
         return
@@ -217,30 +236,48 @@ def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK):
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                 inputs_embeds=None, labels=None, use_cache=None, logits_to_keep=0, **kwargs):
         weight = getattr(getattr(self, "lm_head", None), "weight", None)
+        # the fused head gives no gradient for the head weight: a trainable head keeps the original
+        # path (on this task the tied embedding / lm_head is frozen)
         if (labels is None or not self.training or not torch.is_tensor(labels) or weight is None
-                or not weight.is_cuda or labels.dim() != 2):
+                or not weight.is_cuda or weight.requires_grad or labels.dim() != 2):
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
         num_items = kwargs.pop("num_items_in_batch", None)
         kwargs.pop("return_dict", None)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                             position_ids=position_ids, past_key_values=past_key_values,
-                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        hidden = outputs.last_hidden_state
-        b, t, d = hidden.shape
-        targets = shift_labels(labels.to(hidden.device))
+        b, t = labels.shape
+        targets_full = shift_labels(labels.to(weight.device))
+        mask2d = attention_mask if (torch.is_tensor(attention_mask) and attention_mask.dim() == 2
+                                    and tuple(attention_mask.shape) == (b, t)) else None
+        packed = (UNPAD["enabled"] and mask2d is not None and input_ids is not None
+                  and inputs_embeds is None and position_ids is None and past_key_values is None
+                  and not use_cache and tuple(input_ids.shape) == (b, t))
+        if packed:
+            ids, pos, idx, spans = unpad.pack_batch(input_ids, mask2d)
+            hidden = unpad.varlen_model_forward(self.model, ids, pos, spans)  # (1, N, D)
+            targets = targets_full.flatten()[idx]
+            past = None
+        else:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                 position_ids=position_ids, past_key_values=past_key_values,
+                                 inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+            hidden = outputs.last_hidden_state
+            targets = targets_full.reshape(-1)
+            past = outputs.past_key_values
+        d = hidden.shape[-1]
         loss, token_loss, token_entropy, correct = fused_lm_head_loss(
-            hidden.reshape(-1, d), weight, targets.reshape(-1).contiguous(), num_items, chunk)
-        LAST_STEP["step"] = HeadStep(token_entropy=token_entropy.view(b, t),
-                                     token_loss=token_loss.view(b, t),
-                                     correct=correct.view(b, t),
-                                     labelled=targets != IGNORE_INDEX)
-        return CausalLMOutputWithPast(loss=loss, logits=None,
-                                      past_key_values=outputs.past_key_values,
-                                      hidden_states=outputs.hidden_states,
-                                      attentions=outputs.attentions)
+            hidden.reshape(-1, d), weight, targets.contiguous(), num_items, chunk)
+        if packed:
+            token_loss = unpad.scatter_rows(token_loss, idx, (b, t))
+            token_entropy = unpad.scatter_rows(token_entropy, idx, (b, t))
+            correct = unpad.scatter_rows(correct, idx, (b, t))
+        else:
+            token_loss, token_entropy, correct = (x.view(b, t) for x in (token_loss, token_entropy, correct))
+        LAST_STEP["step"] = HeadStep(token_entropy=token_entropy, token_loss=token_loss,
+                                     correct=correct, labelled=targets_full != IGNORE_INDEX)
+        return CausalLMOutputWithPast(loss=loss, logits=None, past_key_values=past)
 
     cls.forward = forward
+    cls._soup_original_forward = original
     cls._soup_fused_ce = True
