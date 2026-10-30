@@ -193,6 +193,10 @@ def _num_warps(block):
     # a row's chunk lives in registers: 16 values per thread from 4096 on keeps two programs of 16
     # warps per T4 SM (1024 threads); 32 values per thread halved the occupancy (4.7 ms per step
     # for the chunk kernel on the T4 with 8 warps against 2.2 ms for the resident head's two passes)
+    # SOUP_SOLUTION_HEAD_WARPS overrides it (a measurement switch; the warm-up reads it too)
+    forced = _env_int("SOUP_SOLUTION_HEAD_WARPS", 0)
+    if forced in (1, 2, 4, 8, 16, 32):
+        return forced
     return 4 if block <= 2048 else (8 if block <= 4096 else 16)
 
 
