@@ -5,7 +5,7 @@ guesses are hit from the second step on, and the slot rule keeps prefetches insi
 import pytest
 import torch
 
-from solution.test_fused_proj import _lora_params, _tiny_peft_model, _tiny_step, patched  # noqa: F401
+from solution.test_fused_proj import _tiny_peft_model, _tiny_step, patched  # noqa: F401
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
@@ -56,16 +56,23 @@ def test_slot_rule_blocks_other_layers(pipe, monkeypatch):
     # every layer in a "slot" of its own: prefetches must never cross from one layer to the next
     monkeypatch.setattr(weight_stream, "slot_of", lambda t: ("fake", owner.get(t.data_ptr())))
     pipe._PIPE.on = True
-    crossed = []
+    events = []  # (stream is the side stream, layer of the weights) of every dequantization
     original = pipe._dequant_into
 
     def watch(bases, dtype, w):
-        layers_of = {owner.get(b.weight.data.data_ptr()) for b in bases}
-        crossed.append(len(layers_of))
+        side = torch.cuda.current_stream() != torch.cuda.default_stream()
+        events.append((side, owner.get(bases[0].weight.data.data_ptr())))
         return original(bases, dtype, w)
 
     monkeypatch.setattr(pipe, "_dequant_into", watch)
     for _ in range(2):
         _tiny_step(model, ids, LENGTHS)
-    assert crossed and max(crossed) == 1  # no single dequantization spans two layers
+    # a prefetch (side stream) is issued right after a call of the compute stream that missed, or
+    # after a hit (no dequantization on the compute stream): either way it must target the layer
+    # of the latest compute-side weight, which a prefetch of the same layer keeps
+    current = None
+    for side, layer in events:
+        if side:
+            assert current is None or layer == current, events
+        current = layer
     assert pipe._PIPE.stats["prefetches"] > 0
