@@ -778,8 +778,11 @@ def start_background_warmup(log=True):
             _DONE.set()
             return None
         _STATE["begin"] = time.perf_counter()
-        _send_late_registrations(list(WARMUPS))
-        thread = threading.Thread(target=_run, args=(list(WARMUPS), device, log),
+        # SOUP_SOLUTION_WARMUP_SKIP=name,...: registrations left out (for measuring what each saves)
+        skip = set(filter(None, os.environ.get("SOUP_SOLUTION_WARMUP_SKIP", "").split(",")))
+        jobs = [(name, fn) for name, fn in WARMUPS if name not in skip]
+        _send_late_registrations(jobs)
+        thread = threading.Thread(target=_run, args=(jobs, device, log),
                                   name="solution-warmup", daemon=True)
         _STATE["thread"] = thread
         _register_shutdown()

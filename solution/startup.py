@@ -357,7 +357,8 @@ def patch_soup_startup_profile():
         return
     original_setup = cls._setup_transformers
     original_train = cls.train
-    state = {"profile": None}
+    # from here (the end of apply()) to the model setup: Soup's command line, config and data
+    state = {"profile": _Profile("after apply() up to the model setup")}
 
     class FirstStep(transformers.TrainerCallback):
         def on_step_begin(self, args, train_state, control, **kwargs):
@@ -375,6 +376,9 @@ def patch_soup_startup_profile():
                 state["profile"] = None
 
     def _setup_transformers(self, *args, **kwargs):
+        if state.get("profile") is not None and state["profile"].label.startswith("after apply"):
+            state["profile"].report()
+            state["profile"] = None
         profile = _Profile("model setup") if state["profile"] is None else None
         result = original_setup(self, *args, **kwargs)
         if profile is not None:
