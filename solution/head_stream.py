@@ -253,7 +253,10 @@ class HeadStreamer:
         self.host.copy_(data)
         torch.cuda.synchronize(self.device)
         self.fp32_out = None  # probed at the first head: the probe is the process's first cuBLAS call
-        self._copy_stream = torch.cuda.Stream(device=self.device)
+        # SOUP_SOLUTION_HEAD_COPY_PRIORITY=high: the chunk copies on a high-priority stream (to measure
+        # whether it helps against the other streams moving data at the end of the forward)
+        high = os.environ.get("SOUP_SOLUTION_HEAD_COPY_PRIORITY", "").strip().lower() == "high"
+        self._copy_stream = torch.cuda.Stream(device=self.device, priority=-1 if high else 0)
         self._staging, self._staging_done = None, None
         self._spans = collections.deque()
         self._spare_events = []
