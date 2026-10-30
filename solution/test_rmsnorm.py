@@ -279,3 +279,50 @@ def test_patches_fall_back_to_the_original(only_norm_patches):
     layer(h.cuda(), position_embeddings=tuple(t.cuda() for t in emb), position_ids=pos.cuda())
     handle.remove()
     assert seen == [1]
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.float16])
+def test_rebuild_matches_the_forward_bit_for_bit(fused, source_dtype):
+    """rmsnorm.rebuild recomputes a norm's output from what its node saved (input or sum, rstd,
+    weight) exactly as the forward rounded it, for a consumer that drops its own copy."""
+    from solution import rmsnorm as rn
+
+    norm = _norm_module(1536, train_weight=False)
+    g = torch.Generator("cuda").manual_seed(4)
+    x = torch.randn(1, 838, 1536, device="cuda", generator=g).to(source_dtype).requires_grad_(True)
+    if fused:
+        branch = torch.randn(1, 838, 1536, device="cuda", generator=g).half()
+        s, y = rn.add_rmsnorm(x, branch, norm.weight, EPS)
+        assert rn.norm_source(s) is None  # the sum, not the normed output
+    else:
+        y = rn.rmsnorm(x, norm.weight, EPS)
+    node = rn.norm_source(y)
+    assert node is not None and y.dtype == torch.float32
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        rebuilt = rn.rebuild(node, dtype)
+        assert rebuilt.dtype == dtype and rebuilt.shape == (838, 1536)
+        assert torch.equal(rebuilt, y.detach().reshape(838, 1536).to(dtype))
+    assert rn.norm_source(y * 1.0) is None and rn.norm_source(x) is None
+    assert rn.norm_source(y.detach()) is None
+
+
+def test_rebuild_kernel_is_warmed_up():
+    """warm_rebuild (registered with warmup.py by fused_proj's attention patch) compiles the class
+    that rebuild launches in training: fp32 rows of 1536, out in the run's half dtype."""
+    from solution import rmsnorm as rn
+    from solution import warmup
+
+    compiles = warmup.watch_compiles(log=False)
+    rn.rms_norm_rows_rebuild.device_caches.clear()
+    compiles.clear()
+    assert rn.warm_rebuild() is None
+    assert [c["kernel"] for c in compiles] == ["rms_norm_rows_rebuild"]
+    compiles.clear()
+    norm = _norm_module(1536, train_weight=False)
+    for n in (838, 1427):
+        x = torch.randn(1, n, 1536, device="cuda", requires_grad=True)
+        branch = torch.randn(1, n, 1536, device="cuda").half()
+        _, y = rn.add_rmsnorm(x, branch, norm.weight, EPS)
+        rn.rebuild(rn.norm_source(y), warmup.training_half_dtype())
+    assert [c["kernel"] for c in compiles if c["kernel"] == "rms_norm_rows_rebuild"] == []

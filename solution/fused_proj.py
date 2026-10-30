@@ -21,9 +21,11 @@ Attention here (inside `unpad.varlen`, the packed training step):
 - q, k, v leave the function as (B, H, N, D) token-major views; attention is unpad.attention, one
   variable-length launch for all rows (and the alignment tail) with the kv heads expanded inside it
   and not saved, its token-major output goes straight to o_proj (dequant + GEMM).
-Only x16, h (N x 32), the half adapter weights and the CUDA RNG state are kept for the backward; the
-dropout masks are drawn again from that state in the backward (the same kernel on the same input
-gives the same masks), so no mask and no fp32 q/k/v is stored. The backward rebuilds the weights,
+Only h (N x 32), the half adapter weights and the CUDA RNG state are kept for the backward; x16 is
+rebuilt in the backward, bit for bit, from the input and rstd that the input norm (rmsnorm.py) keeps
+for its own backward (`rmsnorm.rebuild`; kept as before when the input is not such a norm's
+output), and the dropout masks are drawn again from that state (the same kernel on the same input
+gives the same masks), so no mask, no x16 and no fp32 q/k/v is stored. The backward rebuilds the weights,
 writes dq and dk through the rope kernel and dv straight into one (N, 2048) gradient, computes the
 adapters' share of the input gradient in half (one bmm, then the two masks applied by one mul and
 one addcmul into fp32), and adds the three projections' share to it with one in-place addmm in fp32
@@ -69,6 +71,7 @@ from . import rope
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
+from .rmsnorm import norm_source, rebuild
 from .unpad import _CTX, sequences
 from .unpad import attention as packed_attention
 
@@ -329,6 +332,12 @@ def _last_dim_contiguous(t):
     return t if t.stride(-1) == 1 else t.contiguous()
 
 
+# SOUP_SOLUTION_REBUILD_X16=0: _QKVRope keeps its half input for the backward instead of rebuilding
+# it from the input norm's saved tensors
+_ATTN = {"rebuild_x16": os.environ.get("SOUP_SOLUTION_REBUILD_X16", "1").strip().lower()
+         not in ("0", "false", "no", "")}
+
+
 def _scaled_mm(a, b, alpha, out):
     """out = alpha * (a @ b), in out's dtype (fp32 out from half a and b accumulates in fp32)."""
     if out.dtype == a.dtype:
@@ -380,7 +389,15 @@ class _QKVRope(torch.autograd.Function):
                      backward=False)
         v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
 
-        ctx.save_for_backward(x16, h, a16, b16, cos, sin)
+        # x16 is x rounded to half, and x is the output of the input norm (rmsnorm.py), which keeps
+        # its own input and rstd for its backward anyway: the backward rebuilds x16 from those, bit
+        # for bit, instead of keeping it (N x D halves per layer)
+        source = norm_source(x) if _ATTN["rebuild_x16"] and x.dtype != half else None
+        if source is None:
+            ctx.save_for_backward(h, a16, b16, cos, sin, x16)
+        else:
+            ctx.save_for_backward(h, a16, b16, cos, sin)
+        ctx.source = source
         ctx.plan, ctx.rng, ctx.x_shape, ctx.x_dtype = plan, rng, x.shape, x.dtype
         ctx.dims = (n, d, nq, nk, nv, r)
         return q4, k4, v4
@@ -388,10 +405,12 @@ class _QKVRope(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad_q, grad_k, grad_v):
-        x16, h, a16, b16, cos, sin = ctx.saved_tensors
+        h, a16, b16, cos, sin, *kept = ctx.saved_tensors
         plan = ctx.plan
         n, d, nq, nk, nv, r = ctx.dims
         half, s, p = plan.half, plan.scaling, plan.p
+        x16 = kept[0] if kept else rebuild(ctx.source, half).view(n, d)
+        ctx.source = None
         device = x16.device
 
         g = torch.empty((n, nq + nk + nv), dtype=half, device=device)
@@ -664,6 +683,7 @@ def patch_qwen2_attention_fused():
     from transformers.models.qwen2 import modeling_qwen2 as mq
 
     cls = mq.Qwen2Attention
+    _register_rebuild_warmup()
     if getattr(cls, "_soup_fused_proj", False):
         return
     previous = cls.forward
@@ -682,6 +702,16 @@ def patch_qwen2_attention_fused():
     cls._soup_fused_proj_previous = previous
     cls.forward = forward
     cls._soup_fused_proj = True
+
+
+def _register_rebuild_warmup():
+    """The x16 rebuild's kernel (rmsnorm.rms_norm_rows_rebuild) into warmup.py's registry; by name,
+    so registering again replaces the entry."""
+    if _ATTN["rebuild_x16"]:
+        from .rmsnorm import warm_rebuild
+        from .warmup import register
+
+        register(warm_rebuild, name="fused_proj_x16_rebuild")
 
 
 def patch_qwen2_mlp_fused():

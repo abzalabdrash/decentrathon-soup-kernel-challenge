@@ -502,6 +502,61 @@ def test_qkv_with_dropout_against_explicit_masks(layer_1p5b):
             proj.lora_dropout["default"] = torch.nn.Identity()
 
 
+
+@pytest.mark.parametrize("fused_norm", [False, True])
+def test_qkv_rebuilds_x16_from_the_input_norm(layer_1p5b, fused_norm):
+    """x straight out of rmsnorm.py's input norm (plain, or fused with the carried residual add):
+    _QKVRope keeps no x16 and rebuilds it in the backward from the norm's saved input and rstd; q,
+    k, v and every gradient are bitwise those of keeping it, LoRA dropout redrawn included. (The
+    function alone: the attention backward after it is not bit-reproducible run to run, dq sums
+    key blocks in any order, per-row SDPA's as well.)"""
+    from solution import fused_proj, rmsnorm
+    from solution.unpad import varlen
+
+    p = 0.05
+    _, attn, _, rotary = layer_1p5b
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(p).train()
+    g = torch.Generator("cuda").manual_seed(12)
+    weight = 1.0 + 0.3 * torch.randn(1536, device="cuda", generator=g)
+    branch = torch.randn(1, 826, 1536, device="cuda", generator=g).half()
+    grads_out = [torch.randn(1, heads, 826, 128, device="cuda", generator=g, dtype=torch.float16)
+                 for heads in (12, 2, 2)]
+    h, (cos, sin), _ = _attention_inputs(rotary, seed=13)
+    a_q, b_q = attn.q_proj.lora_A["default"].weight, attn.q_proj.lora_B["default"].weight
+    a_v, b_v = attn.v_proj.lora_A["default"].weight, attn.v_proj.lora_B["default"].weight
+    results = []
+    try:
+        for rebuild in (False, True):
+            fused_proj._ATTN["rebuild_x16"] = rebuild
+            hg = h.detach().requires_grad_(True)
+            saved = []
+
+            def pack(t):
+                saved.append(t.numel() * t.element_size())
+                return t
+
+            torch.cuda.manual_seed(21)  # the same dropout masks in both runs
+            with torch.autocast("cuda", dtype=torch.float16), varlen(_spans(LENGTHS)):
+                if fused_norm:
+                    _, x = rmsnorm.add_rmsnorm(hg, branch, weight, 1e-6)
+                else:
+                    x = rmsnorm.rmsnorm(hg, weight, 1e-6)
+                plan = fused_proj._attention_plan(attn, x, (cos, sin), None, None)
+                assert plan is not None and plan.p == p
+                with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+                    qkv = fused_proj._QKVRope.apply(x, a_q, b_q, a_v, b_v, cos, sin, plan)
+            grads = torch.autograd.grad(qkv, [hg, a_q, b_q, a_v, b_v], grads_out)
+            results.append(([t.detach() for t in qkv], grads, sum(saved)))
+    finally:
+        fused_proj._ATTN["rebuild_x16"] = True
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
+    (outs0, grads0, saved0), (outs1, grads1, saved1) = results
+    for a, b in zip(outs1 + list(grads1), outs0 + list(grads0)):
+        assert torch.equal(a, b)
+    assert saved0 - saved1 == 826 * 1536 * 2  # exactly x16 less
+
 # ------------------------------------------------------------------------------------------------
 # guards
 
