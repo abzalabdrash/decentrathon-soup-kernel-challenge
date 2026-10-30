@@ -272,6 +272,41 @@ def test_prefetched_tensor_waits_for_its_copy():
     scenario(SLEEP)
 
 
+def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkeypatch):
+    """Forward and backward on one stream (the training run): every copy, drop and prefetch is
+    ordered by stream waits on events; no record_stream for the allocator to track, no CPU-side
+    wait (the CPU keeps running ahead of the GPU). The values still come back exactly."""
+    from solution.offload import Offloader
+
+    calls = []
+
+    def record_stream(self, stream):
+        calls.append("record_stream")
+
+    def synchronize(self):
+        calls.append("synchronize")
+
+    n, k = 1 << 20, 6
+    values = [torch.randn(n, device="cuda").half() for _ in range(k)]
+    xs = [leaf(n) for _ in range(k)]
+    off = Offloader(min_numel=1000, max_inflight=1, prefetch=1)
+    torch.cuda.synchronize()
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+    monkeypatch.setattr(torch.cuda.Event, "synchronize", synchronize)
+    with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
+        ys = [Keep.apply(x, activation(v)) for x, v in zip(xs, values)]
+        torch.cuda._sleep(SLEEP)  # the copies are still queued when the backward starts
+        sum(y.float().sum() for y in ys).backward()
+    assert calls == []
+    monkeypatch.undo()
+    off.close()
+    torch.cuda.synchronize()
+    s = off.stats
+    assert s["offloaded"] == k and s["waited"] == k - 1 and s["prefetch_hits"] == k - 1, off.summary()
+    for x, v in zip(xs, values):
+        assert torch.equal(x.grad, v)
+
+
 def test_prepinned_slab_is_used():
     from solution import offload
 
