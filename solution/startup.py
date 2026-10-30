@@ -70,9 +70,10 @@ files only for datasets backed by files, and this one is built in memory.
 
 Diagnostics (off by default)
 ----------------------------
-SOUP_SOLUTION_PROFILE_STARTUP=1: cProfile from the end of Soup's model setup
-(SFTTrainerWrapper._setup_transformers) to the end of the first training step, in three parts (the
-rest of `setup`, where Soup builds TRL's SFTTrainer; `train` up to the first step; the first step),
+SOUP_SOLUTION_PROFILE_STARTUP=1: cProfile of Soup's model setup (SFTTrainerWrapper.
+_setup_transformers) and from there to the end of the first training step, in four parts (the
+model setup; the rest of `setup`, where Soup builds TRL's SFTTrainer; `train` up to the first step;
+the first step),
 each printed as the 40 most expensive calls by cumulative time, with the packages imported
 meanwhile. cProfile makes Python code about twice as slow: the shares count, not the seconds.
 """
@@ -354,8 +355,10 @@ def patch_soup_startup_profile():
                 state["profile"] = None
 
     def _setup_transformers(self, *args, **kwargs):
+        profile = _Profile("model setup") if state["profile"] is None else None
         result = original_setup(self, *args, **kwargs)
-        if state["profile"] is None:
+        if profile is not None:
+            profile.report(limit=60)
             state["profile"] = _Profile("setup after the model (trainer build)")
         return result
 
