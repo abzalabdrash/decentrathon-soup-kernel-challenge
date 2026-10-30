@@ -68,6 +68,27 @@ def _reference(hidden, weight, targets, num_items):
     return total, torch.cat(token_loss), torch.cat(entropy), torch.cat(correct), grad
 
 
+def _chunked_statistics(hidden, weight, targets, rows):
+    """Per-token loss, entropy and correctness in fp32 from the logits the streamed head computes:
+    the same rows (labelled first), the same GEMM per vocabulary chunk, hence the same fp16 bits."""
+    labelled = targets != -100
+    order = torch.argsort(labelled.to(torch.int8), descending=True, stable=True)
+    h16, t = hidden.detach()[order].half(), targets[order]
+    logits = torch.empty(h16.shape[0], V, dtype=torch.float16, device="cuda")
+    for c0 in range(0, V, rows):
+        logits[:, c0:c0 + rows] = torch.mm(h16, weight[c0:c0 + rows].t())
+    token_loss, entropy, correct = [], [], []
+    for start in range(0, h16.shape[0], 256):
+        block, tb = logits[start:start + 256].float(), t[start:start + 256]
+        token_loss.append(F.cross_entropy(block, tb, ignore_index=-100, reduction="none"))
+        logp = F.log_softmax(block, dim=-1)
+        entropy.append(-(logp.exp() * logp).sum(-1))
+        correct.append(((block.argmax(-1) == tb) & (tb != -100)).to(torch.int32))
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(order.numel(), device=order.device)
+    return tuple(torch.cat(x)[inverse] for x in (token_loss, entropy, correct))
+
+
 def _exact_grad(hidden, weight, targets, rows, denom):
     """dL/dh in fp64 from the fp16 logits, for the given rows."""
     h16 = hidden[rows].detach().half()
@@ -100,13 +121,18 @@ def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items
     ref_loss, ref_token_loss, ref_entropy, ref_correct, ref_grad = _reference(
         hidden, weight, targets, num_items)
 
-    # statistics: fp32 both ways from the same fp16 logits, up to the GEMM: cuBLAS may pick another
-    # kernel for a chunk of the vocabulary than for all of it (the T4 does), so a few fp16 logits
-    # differ in their last bit (0.06 at |x| = 87): per-token values agree to about 1e-4 relative
-    assert abs(loss.item() - ref_loss) <= 1e-4 * max(abs(ref_loss), 1.0)
-    torch.testing.assert_close(token_loss, ref_token_loss, rtol=5e-4, atol=2e-3)
+    # statistics from the same fp16 logits: fp32 both ways, only the summation order differs
+    chunk_loss, chunk_entropy, chunk_correct = _chunked_statistics(hidden, weight, targets, rows)
+    torch.testing.assert_close(token_loss, chunk_loss, rtol=1e-5, atol=2e-5)
+    torch.testing.assert_close(entropy, chunk_entropy, rtol=1e-5, atol=5e-5)
+    assert torch.equal(correct, chunk_correct)
     assert torch.all(token_loss[~labelled] == 0)
-    torch.testing.assert_close(entropy, ref_entropy, rtol=5e-4, atol=2e-3)
+    # against the base's head over all of V at once: cuBLAS may pick another GEMM kernel for a
+    # chunk of the vocabulary (the T4 does), so a few fp16 logits differ in their last bit (0.06 at
+    # |x| = 87, 0.125 at 150): the loss agrees to 1e-4, per-token values to that rounding
+    assert abs(loss.item() - ref_loss) <= 1e-4 * max(abs(ref_loss), 1.0)
+    torch.testing.assert_close(token_loss, ref_token_loss, rtol=1e-3, atol=5e-2)
+    torch.testing.assert_close(entropy, ref_entropy, rtol=1e-3, atol=5e-2)
     assert int((correct != ref_correct).sum()) <= 1  # a near-tie of fp16 logits may flip
     if not labelled.any():
         assert torch.all(hidden.grad == 0)
