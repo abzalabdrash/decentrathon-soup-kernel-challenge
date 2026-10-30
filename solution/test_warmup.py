@@ -56,10 +56,13 @@ def test_register_forms_and_replace(fresh):
 def test_thread_runs_all_and_survives_errors(fresh):
     seen = []
 
+    interval = sys.getswitchinterval()
+
     @fresh.register(name="a")
     def a():
         seen.append(("a", threading.current_thread().name,
                      torch.cuda.current_stream() != torch.cuda.default_stream()))
+        seen.append(("switch", sys.getswitchinterval(), None))
 
     @fresh.register(name="boom")
     def boom():
@@ -75,7 +78,10 @@ def test_thread_runs_all_and_survives_errors(fresh):
     assert fresh.start_background_warmup(log=False) is thread  # once per process
     assert fresh.wait_for_warmup(30)
     report = fresh.warmup_report()
-    assert seen == [("a", "solution-warmup", True), ("c", 1024.0, None)]
+    assert seen == [("a", "solution-warmup", True),
+                    ("switch", pytest.approx(min(interval, fresh.SWITCH_INTERVAL)), None),
+                    ("c", 1024.0, None)]
+    assert sys.getswitchinterval() == interval  # restored
     assert set(report["results"]) == {"a", "c"}
     assert "broken warm-up" in report["errors"]["boom"]
     assert report["done"] and report["seconds"] is not None

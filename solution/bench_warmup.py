@@ -11,6 +11,7 @@ Kernels are compiled for fp16, the T4's dtype, on any card.
 """
 
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -61,6 +62,11 @@ def swiglu_call(tokens):
 
 
 # ---------------------------------------------------------------- child processes
+
+def _key(name):
+    """A registration name as a key=value key."""
+    return re.sub(r"\W", "_", name)
+
 
 def _child_env(cache_root):
     return dict(os.environ, TRITON_CACHE_DIR=tempfile.mkdtemp(prefix="triton-", dir=cache_root))
@@ -151,8 +157,8 @@ def child_compile():
         start = time.perf_counter()
         fn()
         total = time.perf_counter() - start
-        print(f"{name.replace(' ', '_')}={total:.3f}|{len(parts['compile'])}|"
-              f"{sum(parts['compile']):.3f}|{sum(parts['launcher']):.3f}")
+        print(f"{_key(name)}={total:.3f}|{len(parts.get('compile', []))}|"
+              f"{sum(parts.get('compile', [])):.3f}|{sum(parts.get('launcher', [])):.3f}")
     warmup.compile_kernel = original
 
 
@@ -176,12 +182,15 @@ def _rate(samples, t0, t1):
 
 
 def child_gil(mode):
-    """The warm-up thread while the main thread spins a Python counter (mode spin) or just waits
-    (mode wait). Per registration: its wall time and the counter's rate against the rate alone."""
+    """The warm-up thread while the main thread just waits (mode wait) or spins a Python counter,
+    with the warm-up's own GIL switch interval (spin) or another one (spin-<ms>). Per
+    registration: its wall time and, when spinning, the counter's rate against the counter alone."""
     _prelude()
     import triton  # noqa: F401
 
     warmup = _setup_warmup()
+    if mode.startswith("spin-"):  # spin-<ms>: that switch interval instead of the warm-up's
+        warmup.SWITCH_INTERVAL = float(mode[5:]) / 1000
     windows = {}
 
     def wrap(name, fn):
@@ -194,25 +203,26 @@ def child_gil(mode):
         return run
 
     warmup.WARMUPS[:] = [(name, wrap(name, fn)) for name, fn in warmup.WARMUPS]
+    spinning = mode != "wait"
     samples = []
-    if mode == "spin":
+    if spinning:
         t_end = time.perf_counter() + 1.0
         _spin(lambda t: t >= t_end, samples)
         base = _rate(samples, samples[0][0], samples[-1][0])
         samples.clear()
     start = time.perf_counter()
     warmup.start_background_warmup(log=False)
-    if mode == "spin":
+    if spinning:
         _spin(lambda t: warmup._DONE.is_set(), samples)
     warmup.wait_for_warmup()
     print(f"total={time.perf_counter() - start:.3f}")
     for name, (t0, t1) in windows.items():
-        line = f"{name.replace(' ', '_')}={t1 - t0:.3f}"
-        if mode == "spin":
+        line = f"{_key(name)}={t1 - t0:.3f}"
+        if spinning:
             rate = _rate(samples, t0, t1)
             line += f"|{rate / base:.3f}" if rate else "|nan"
         print(line)
-    if mode == "spin":
+    if spinning:
         t0 = min(t for t, _ in windows.values())
         t1 = max(t for _, t in windows.values())
         print(f"all={t1 - t0:.3f}|{_rate(samples, t0, t1) / base:.3f}")
@@ -265,20 +275,36 @@ def report_compile(cache_root):
         print(f"{name:38s} {float(total):9.2f} {count:>9s} {float(comp):12.2f} {float(launch):17.2f}")
 
 
-def report_gil(cache_root):
-    wait = _child(["child-gil", "wait"], cache_root)
-    spin = _child(["child-gil", "spin"], cache_root)
-    print("warm-up thread: wall time with the main thread waiting / spinning a Python counter, and "
-          "the counter's rate during it against the counter alone")
-    print(f"{'warm-up':38s} {'waiting, s':>11s} {'spinning, s':>12s} {'counter rate':>13s}")
-    for name in wait:
-        if name == "total":
-            continue
-        w = float(wait[name])
-        s, rate = spin[name].split("|")
-        print(f"{name:38s} {w:11.2f} {float(s):12.2f} {float(rate):13.2f}")
-    s, rate = spin["all"].split("|")
-    print(f"{'all':38s} {float(wait['total']):11.2f} {float(s):12.2f} {float(rate):13.2f}")
+def report_gil(cache_root, repeats=3):
+    """Every mode `repeats` times, interleaved (the machine's other load drifts); medians."""
+    modes = {"waiting": "wait", "spin 5 ms": "spin-5", "spin 1 ms": "spin-1",
+             "spin 0.2 ms": "spin-0.2"}
+    runs = {label: [] for label in modes}
+    for _ in range(repeats):
+        for label, mode in modes.items():
+            runs[label].append(_child(["child-gil", mode], cache_root))
+    print(f"warm-up thread wall time, s, while the main thread waits or spins a Python counter "
+          f"with that GIL switch interval; rate: the counter's rate during it against the counter "
+          f"alone (medians of {repeats}; every run of the whole warm-up below)")
+    names = [name for name in runs["waiting"][0] if name != "total"] + ["all"]
+    print(f"{'warm-up':36s} {'waiting':>8s}" + "".join(f" {label:>12s} {'rate':>5s}"
+                                                      for label in modes if label != "waiting"))
+    for name in names:
+        key = "total" if name == "all" else name
+        waits = sorted(float(r[key]) for r in runs["waiting"])
+        line = f"{name:36s} {statistics.median(waits):8.2f}"
+        for label in modes:
+            if label == "waiting":
+                continue
+            pairs = [r[name].split("|") for r in runs[label]]
+            secs = sorted(float(a) for a, _ in pairs)
+            rates = [float(b) for _, b in pairs if b != "nan"]
+            line += f" {statistics.median(secs):12.2f} {statistics.median(rates):5.2f}"
+        print(line)
+    for label in modes:
+        key = "total" if label == "waiting" else "all"
+        secs = sorted(float(r[key].split("|")[0]) for r in runs[label])
+        print(f"  {label}: all {', '.join(f'{x:.2f}' for x in secs)} s")
 
 
 def report_first_call(cache_root):

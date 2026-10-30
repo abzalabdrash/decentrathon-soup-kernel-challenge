@@ -45,24 +45,38 @@ calls with `warmup=True`; it still counts them as launches in `triton_launches`)
 
 Adding a kernel
 ---------------
-In your module, at import time:
+In your module's patch function (so that a patch switched off warms nothing up, and the harness
+does not count a warm-up of a kernel that training never launches):
 
     from .warmup import compile_kernel, register, training_half_dtype
 
-    @register
     def _warm_my_kernel():
         half = training_half_dtype()
         compile_kernel(my_kernel, half, torch.float32, 1536, 826, BLOCK=1024, num_warps=4)
 
+    def patch_something():
+        ...
+        register(_warm_my_kernel, name="my_kernel")
+
 once per class the training launches can take (see above). A registration that raises is logged
-and skipped; the others still run. `apply()` imports the patch modules before it calls
-`start_background_warmup()`, so their registrations are in place.
+and skipped; the others still run. `start_background_warmup()` reads the registry when it is
+called, so `apply()` calls it after the patches.
+
+The thread and the GIL
+----------------------
+The first compile of the process hashes triton's own files, libtriton.so (415 MB) in 1 MB reads
+(`triton_key`, triton/runtime/cache.py:272-298), and the compile, the ptxas and C compiler
+subprocesses and the cubin load drop and retake the GIL many times. While the main thread runs
+Python, each retake waits up to the switch interval (5 ms by default), so the thread lowers it to
+1 ms while it runs and puts it back after (see `_run` for the numbers).
 """
 
 import importlib
+import sys
 import threading
 import time
 
+SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
 VOCAB = 151936  # Qwen2.5's vocabulary: V and stride_row of the fused head (divisible by 16)
 INTERMEDIATE = 8960  # Qwen2.5-1.5B's MLP width: 16 * 560
 TOKENS = 826  # a typical packed batch; only its class matters (tokens * 8960 is always "D")
@@ -188,6 +202,15 @@ def warm_fused_ce_one():
 def _run(jobs, device, log):
     _STATE["ident"] = threading.get_ident()
     begin = time.perf_counter()
+    # The compile drops and retakes the GIL many times; while the main thread runs Python, every
+    # retake waits for the switch interval (5 ms by default). RTX 3050 Ti, all registrations, medians
+    # of 3 (bench_warmup.py gil): 3.1 s with the main thread waiting; with it spinning a Python
+    # counter, 15.3 s at 5 ms (counter at 100% of its rate alone), 5.5 s at 1 ms (89%), 4.0 s at
+    # 0.2 ms (79%). 1 ms keeps the warm-up well inside the model load and costs the main thread at
+    # most 11% while it runs.
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(min(previous, SWITCH_INTERVAL))
+    ours = sys.getswitchinterval()  # read back: CPython stores it in microseconds
     try:
         import torch
 
@@ -210,6 +233,8 @@ def _run(jobs, device, log):
         if log:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
+        if sys.getswitchinterval() == ours:  # unless someone changed it meanwhile
+            sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
         _DONE.set()
         if log:
@@ -339,7 +364,12 @@ def preload_in_background(modules, log=True):
     A patch that needs one of them can wait on the event, or simply import it: Python's import lock
     is per module, so an import of a module the thread is still importing waits for that import to
     finish instead of running it a second time. The thread holds the GIL while it runs module code,
-    so this overlaps imports only with the main thread's waits (file reads, CUDA, subprocesses)."""
+    so this overlaps imports only with the main thread's waits (file reads, CUDA, subprocesses).
+
+    Not used by default: `import triton` costs 0.07 s after the harness's prelude (RTX 3050 Ti box,
+    bench_warmup.py imports); what makes apply() long are trl, peft (which pulls bitsandbytes and
+    torch._dynamo) and transformers' trainer modules, and Soup imports those itself in
+    `_setup_transformers` and `train` (soup_cli/trainer/sft.py:1613, :734, :1594)."""
     ready = threading.Event()
     ready.errors = {}
     ready.seconds = {}
