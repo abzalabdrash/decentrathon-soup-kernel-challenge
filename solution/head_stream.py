@@ -23,9 +23,10 @@ removed. The saved adapter holds only the LoRA tensors, as before.
 Embedding lookup: the ids come to the host (one synchronization; the packed path synchronizes right
 before anyway), the rows are gathered from the host copy into a pinned staging buffer and copied to
 the GPU (2.5 MB for 826 tokens), then cast to fp32: the base's lookup in its fp32 weight gives the
-same values bit for bit (the fp16 -> fp32 round trip is exact). A training forward also starts the
-copies of the first K chunks of the head here, on the copy stream, so that they run during the first
-layers while the PCIe bus is idle.
+same values bit for bit (the fp16 -> fp32 round trip is exact). A training forward starts the copies
+of the first K chunks of the head at the final norm (a pre-hook), after the last layer: its MLP sets
+the forward's peak, and a ring allocated at the embedding lookup (more overlap, about 2 ms per 24 MiB
+chunk) was alive there (Kaggle T4, step 6: +48 MiB on the step's peak).
 
 The head, for N hidden rows (labelled rows first, as in fused_ce.py) and chunk c of W:
     L_c = h16 @ W_c^T                               fp16 cuBLAS GEMM, (N, R), in a reused buffer
@@ -51,7 +52,8 @@ Guards: only a CUDA Qwen2ForCausalLM with the fused head patched, a tied plain n
 pair without bias, an fp16 or bf16 weight, and peft about to cast it (not GPTQ and the like), inside
 Soup's setup. Eval and generation (the original forward) run through the lm_head override: logits in
 full, chunk by chunk, with the base's dtypes. Switches (environment): SOUP_SOLUTION_HEAD_STREAM=0,
-SOUP_SOLUTION_HEAD_ROWS (vocabulary rows per chunk), SOUP_SOLUTION_HEAD_SLOTS (ring slots, >= 2).
+SOUP_SOLUTION_HEAD_ROWS (vocabulary rows per chunk), SOUP_SOLUTION_HEAD_SLOTS (ring slots, >= 2),
+SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head (where the first chunks start).
 """
 
 import atexit
@@ -71,6 +73,10 @@ from .fused_ce import IGNORE_INDEX, compute_dtype
 
 DEFAULT_ROWS = 8192  # vocabulary rows per chunk: 8192 x 1536 x 2 bytes = 24 MiB per slot
 DEFAULT_SLOTS = 2
+# where a training forward starts copying the head's first chunks: "norm" (the final norm, after the
+# last layer, whose MLP sets the forward's peak: the ring is not alive then), "embedding" (the start
+# of the forward: more overlap, the ring alive through the forward), "head" (no early copies)
+DEFAULT_PREFETCH = "norm"
 MAX_ROWS = 32768  # one Triton block holds a row's whole chunk
 BLOCK_D = 512
 STAGING_ROWS = 4096  # pinned staging rows of the embedding lookup (grows on demand)
@@ -184,7 +190,10 @@ def head_finish_kernel(
 
 
 def _num_warps(block):
-    return 4 if block <= 2048 else (8 if block <= 8192 else 16)
+    # a row's chunk lives in registers: 16 values per thread from 4096 on keeps two programs of 16
+    # warps per T4 SM (1024 threads); 32 values per thread halved the occupancy (4.7 ms per step
+    # for the chunk kernel on the T4 with 8 warps against 2.2 ms for the resident head's two passes)
+    return 4 if block <= 2048 else (8 if block <= 4096 else 16)
 
 
 def _fp32_out_gemm_works(device):
@@ -212,7 +221,7 @@ class HeadStreamer:
     prefetched), copy time, and the time the compute stream waited for copies in the head."""
 
     def __init__(self, param, embedding=None, lm_head=None, rows=DEFAULT_ROWS, slots=DEFAULT_SLOTS,
-                 virtual_dtype=torch.float32):
+                 virtual_dtype=torch.float32, prefetch_at=DEFAULT_PREFETCH, norm=None):
         data = param.data
         if not torch.cuda.is_available() or not data.is_cuda:
             raise HeadSkip("the weight is not on a CUDA device")
@@ -252,6 +261,12 @@ class HeadStreamer:
         for module, fn in ((embedding, _embedding_forward), (lm_head, _lm_head_forward)):
             if module is not None:
                 module.forward = functools.partial(fn, ref, module)
+        self.prefetch_at = prefetch_at if prefetch_at in ("norm", "embedding", "head") else DEFAULT_PREFETCH
+        if self.prefetch_at == "norm" and norm is None:
+            self.prefetch_at = "head"
+        self._hook = None
+        if self.prefetch_at == "norm":
+            self._hook = norm.register_forward_pre_hook(functools.partial(_prefetch_hook, ref))
         _STREAMERS[id(param)] = self
         weakref.finalize(param, _forget, id(param), ref)
         self.setup_seconds = time.perf_counter() - started
@@ -381,7 +396,7 @@ class HeadStreamer:
         idx = torch.empty(n, dtype=torch.int32, device=dev)
         wt = torch.empty(max(n_lab, 1), d, dtype=dtype, device=dev)
         buffer = torch.empty(n * self.rows, dtype=dtype, device=dev)
-        self.prefetch()  # a no-op for the chunks the embedding lookup prefetched
+        self.prefetch()  # a no-op for the chunks prefetched at the final norm (or the embedding)
         with torch.autocast("cuda", enabled=False):
             for c in range(self.n_chunks):
                 c0, vc = self._chunk(c)
@@ -471,6 +486,9 @@ class HeadStreamer:
         for module in (self.embedding, self.lm_head):
             if module is not None and isinstance(module.__dict__.get("forward"), functools.partial):
                 del module.forward
+        if self._hook is not None:
+            self._hook.remove()
+            self._hook = None
         self.embedding = self.lm_head = None
         self._ring = self._staging = None
         torch.cuda.synchronize(self.device)
@@ -501,9 +519,19 @@ def _embedding_forward(streamer_ref, module, input):
     if streamer is None or not streamer.owns(module.weight):
         return torch.nn.Embedding.forward(module, input)
     out = streamer.lookup(input)
-    if module.training and torch.is_grad_enabled():
+    if streamer.prefetch_at == "embedding" and module.training and torch.is_grad_enabled():
         streamer.prefetch()  # a training forward ends in the fused head: start its first chunks
     return out
+
+
+def _prefetch_hook(streamer_ref, module, args):
+    """Forward pre-hook on the decoder's final norm: the last layer is done, the head comes next."""
+    streamer = streamer_ref()
+    if streamer is None or not (module.training and torch.is_grad_enabled()):
+        return
+    param = streamer.param_ref()
+    if param is not None and streamer.owns(param):
+        streamer.prefetch()
 
 
 def _lm_head_forward(streamer_ref, module, input):
@@ -627,6 +655,7 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
     is about to cast it). Returns the HeadStreamer, or None with the model untouched."""
     rows = rows or _env_int("SOUP_SOLUTION_HEAD_ROWS", DEFAULT_ROWS)
     slots = slots or _env_int("SOUP_SOLUTION_HEAD_SLOTS", DEFAULT_SLOTS)
+    prefetch_at = os.environ.get("SOUP_SOLUTION_HEAD_PREFETCH", DEFAULT_PREFETCH).strip().lower()
     try:
         if not isinstance(model, torch.nn.Module) or not torch.cuda.is_available():
             raise HeadSkip("not a CUDA model")
@@ -634,7 +663,9 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
             raise HeadSkip("peft does not cast this model's parameters")
         param, embedding, lm_head = _tied_pair(model)
         before = torch.cuda.memory_allocated()
-        streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots)
+        norm = getattr(getattr(_base_model(model), "model", None), "norm", None)
+        streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, prefetch_at=prefetch_at,
+                                norm=norm if isinstance(norm, torch.nn.Module) else None)
     except HeadSkip as exc:
         log(f"[solution] head streaming skipped: {exc}")
         return None
@@ -643,7 +674,8 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
         f"in pinned host memory: {streamer.host_bytes / 2**20:.0f} MiB, {freed / 2**20:.0f} MiB freed on "
         f"the GPU, {streamer.setup_seconds:.2f} s; head in chunks of {streamer.rows} rows through "
         f"{streamer.slots} GPU slots ({streamer.slots * streamer.rows * streamer.hidden * 2 / 2**20:.0f} "
-        f"MiB){'' if streamer.fp32_out else ', fp16 gradient GEMM output'}")
+        f"MiB), first chunks copied from the {streamer.prefetch_at}"
+        f"{'' if streamer.fp32_out else ', fp16 gradient GEMM output'}")
     atexit.register(_report, weakref.ref(streamer), log)
     return streamer
 
