@@ -567,10 +567,15 @@ def patch_soup_train_offload():
         if changed is not None:
             print(f"[solution] CUDA stack limit {changed[0]} -> {changed[1]} bytes per thread",
                   flush=True)
+        from .adam_host import moments_on_host
+
         with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
-                _gc_paused():
+                _gc_paused(), moments_on_host() as moments:
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
+        if moments is not None:
+            print(f"[solution] AdamW moments on the host between {moments.steps} steps "
+                  f"({moments.moved / 2**20:.1f} MiB each way per step)", flush=True)
         return result
 
     cls.train = train
