@@ -42,6 +42,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[832, 1440])
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--tiles", nargs="*", default=[],
+                        help="SwiGLU-backward tile configs TIxTMxGROUPS to time (int8 only)")
     args = parser.parse_args()
     _patch()
     mlp = _mlp()
@@ -49,8 +51,12 @@ def main():
         gen = torch.Generator("cuda").manual_seed(m)
         x = torch.randn(1, m, 1536, device="cuda", generator=gen)
         grad = (torch.randn(1, m, 1536, device="cuda", generator=gen) * 1e-2).half()
-        for on in (False, True, False, True):
+        configs = [(False, None), (True, None), (False, None), (True, None)]
+        configs += [(True, tuple(int(v) for v in t.split("x"))) for t in args.tiles]
+        for on, tiles in configs:
             int8_bwd._STATE["on"] = on
+            if tiles is not None:
+                int8_bwd.TILE_I, int8_bwd.TILE_M, int8_bwd.GROUPS = tiles
             for _ in range(3):
                 _step(mlp, x, grad)
             torch.cuda.synchronize()
@@ -72,7 +78,8 @@ def main():
                 if evt.device_type.name == "CUDA":
                     kernels[evt.name[:70]] += evt.device_time_total / 1000.0
             total = sum(kernels.values())
-            print(f"M={m} {'int8' if on else 'fp16'}: fwd+bwd {statistics.median(times):.3f} ms per call "
+            label = ("int8" if on else "fp16") + (f" tiles {tiles}" if tiles else "")
+            print(f"M={m} {label}: fwd+bwd {statistics.median(times):.3f} ms per call "
                   f"(GPU kernels {total:.3f} ms)", flush=True)
             for name, ms in kernels.most_common(12):
                 print(f"    {ms:7.3f} ms  {name}", flush=True)
