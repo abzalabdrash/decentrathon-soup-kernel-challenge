@@ -294,3 +294,43 @@ def test_early_probes_serve_same_answers(monkeypatch):
         metadata.entry_points = saved_ep
         accelerate_state.check_cuda_p2p_ib_support = saved_p2p
         trainer_build._PROBES["patched"] = saved_flag
+
+
+def test_cheap_fingerprint_deterministic(tokenizer, monkeypatch):
+    """SOUP_SOLUTION_CHEAP_FINGERPRINT: the map's rows are the same, its fingerprint is the same for
+    the same inputs (no RNG), differs for another function, and datasets' own hashing is not used."""
+    datasets = pytest.importorskip("datasets")
+    import random
+
+    import datasets.fingerprint as fingerprint
+
+    rows = [{"messages": list(row)} for row in ROWS]
+
+    def first(example, index):
+        return {"n": len(example["messages"]) + index}
+
+    def second(example, index):
+        return {"n": len(example["messages"]) * 2 + index}
+
+    plain = datasets.Dataset.from_list(rows).map(first, with_indices=True, remove_columns=["messages"])
+    monkeypatch.setenv("SOUP_SOLUTION_CHEAP_FINGERPRINT", "1")
+    undo = trainer_build.install()
+    try:
+        import dill.detect
+
+        calls = []
+        globalvars = dill.detect.globalvars
+        monkeypatch.setattr(dill.detect, "globalvars", lambda *a, **k: calls.append(a) or globalvars(*a, **k))
+        state = random.getstate()
+        a = datasets.Dataset.from_list(rows)
+        a = a.map(first, with_indices=True, remove_columns=["messages"])
+        b = datasets.Dataset.from_list(rows).map(first, with_indices=True, remove_columns=["messages"])
+        c = datasets.Dataset.from_list(rows).map(second, with_indices=True, remove_columns=["messages"])
+        assert random.getstate() == state
+        assert a.to_list() == plain.to_list()
+        assert a._fingerprint == b._fingerprint != c._fingerprint
+        # the map functions were not pickled with their globals (datasets still hashes its tables)
+        assert not [c for c in calls if c and getattr(c[0], "__name__", "") in ("first", "second")]
+    finally:
+        undo()
+    assert getattr(fingerprint.update_fingerprint, "_soup_original", None) is None

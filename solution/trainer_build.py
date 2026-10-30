@@ -30,6 +30,17 @@ the same names that can be globals (dill's text parsing also returns quoted stri
 contain "_GLOBAL", which no module has as a global), so the same fingerprint (checked against dill
 over the functions of soup_cli, trl, transformers and datasets in test_trainer_build.py), cheaper.
 
+SOUP_SOLUTION_CHEAP_FINGERPRINT=1: the organizers allow a random `new_fingerprint` for Soup's
+`Dataset.map` if the global RNG is untouched; this one is not random but cheaper still: datasets'
+`update_fingerprint` (datasets/fingerprint.py, also bound in arrow_dataset.py) hashes, for an argument
+that is a Python function, its module, qualified name and code object (bytecode, constants, names)
+instead of dill-pickling it with its closure and every global it reaches (the tokenizer among them:
+0.16 s of the map's 0.6 s on the RTX 3050 Ti box with SOUP_SOLUTION_FAST_FINGERPRINT, ~0.3 s on the
+T4); every other argument and the previous fingerprint are hashed as datasets hashes them. The same
+inputs give the same fingerprint in every run (no RNG); it names cache files only for datasets backed
+by files, and Soup's are built in memory. Anything that does not hash this way takes datasets' own
+function.
+
 SOUP_SOLUTION_EARLY_ROWS=1: the tokenization of the training rows needs only the tokenizer and the
 rows, and the tokenizer is ready before the model load starts (soup_cli/trainer/sft.py:1661-1666,
 then from_pretrained at :1719). So when Soup's setup has loaded the tokenizer, a thread of this
@@ -479,11 +490,45 @@ def _start_probes(tokenizer):
     probes.thread.start()
 
 
+# ---------------------------------------------------------------- SOUP_SOLUTION_CHEAP_FINGERPRINT
+
+def _cheap_update_fingerprint(original):
+    def update_fingerprint(fingerprint, transform, transform_args):
+        try:
+            from datasets.fingerprint import Hasher
+
+            hasher = Hasher()
+            hasher.update(fingerprint)
+            hasher.update(transform)  # a "module.qualname[@version]" string (format_transform_for_fingerprint)
+            for key in sorted(transform_args):
+                hasher.update(key)
+                value = transform_args[key]
+                if isinstance(value, types.FunctionType):
+                    value = ("function", value.__module__, value.__qualname__, value.__code__)
+                hasher.update(value)
+            return hasher.hexdigest()
+        except Exception:  # noqa: BLE001 - datasets' own hashing (or its random fallback) then
+            return original(fingerprint, transform, transform_args)
+
+    update_fingerprint._soup_original = original
+    return update_fingerprint
+
+
 # ---------------------------------------------------------------- scoping
 
 def _replacements():
     """[(owner, attribute, factory)] for the switches that are on."""
     out = []
+    if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT"):
+        try:
+            import datasets.arrow_dataset
+            import datasets.fingerprint
+
+            out.append((datasets.fingerprint, "update_fingerprint", _cheap_update_fingerprint))
+            if hasattr(datasets.arrow_dataset, "update_fingerprint"):
+                out.append((datasets.arrow_dataset, "update_fingerprint", _cheap_update_fingerprint))
+        except Exception:  # noqa: BLE001
+            pass
     if _flag("SOUP_SOLUTION_FAST_ROWS"):
         try:
             from soup_cli.data import loss_mask
