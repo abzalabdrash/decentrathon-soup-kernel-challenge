@@ -372,8 +372,8 @@ def test_tiny_qwen2_streamed_step(tiny_dir, tmp_path):
         for hook in hooks:
             hook.remove()
     assert seen == [0]  # nothing of the weight's size on the GPU at the end of the forward
-    # the first chunks start at the final norm: no ring through the layers (the last MLP's peak)
-    assert ring[0] is None and ring[1] is not None
+    # the first chunks start at the embedding lookup: the ring exists through the layers
+    assert ring[0] is not None and ring[1] is ring[0]
     assert streamer.late_loads == 0 and streamer.heads == 1 and streamer.loads == streamer.n_chunks
 
     torch.testing.assert_close(loss, ref_loss, rtol=1e-4, atol=1e-5)
@@ -410,21 +410,23 @@ def test_tiny_qwen2_streamed_step(tiny_dir, tmp_path):
     assert torch.equal(param, reference.get_base_model().get_input_embeddings().weight)
 
 
-@pytest.mark.parametrize("where", ["embedding", "head"])
+@pytest.mark.parametrize("where", ["norm", "head"])
 def test_prefetch_points(tiny_dir, monkeypatch, where):
-    """SOUP_SOLUTION_HEAD_PREFETCH=embedding: the ring exists through the layers; =head: the head
-    copies its first chunks itself. The step is the same."""
+    """SOUP_SOLUTION_HEAD_PREFETCH=norm: the first chunks start at the final norm (no ring through
+    the layers); =head: the head copies its first chunks itself. The step is the same."""
     monkeypatch.setenv("SOUP_SOLUTION_HEAD_PREFETCH", where)
     model, streamer = _soup_like(tiny_dir, stream=True)
-    assert streamer.prefetch_at == where and streamer._hook is None
+    assert streamer.prefetch_at == where and (streamer._hook is not None) == (where == "norm")
     ring = []
-    hook = model.get_base_model().model.layers[-1].register_forward_hook(
-        lambda *_: ring.append(streamer._ring is not None))
+    base = model.get_base_model().model
+    hooks = [base.layers[-1].register_forward_hook(lambda *_: ring.append(streamer._ring is not None)),
+             base.norm.register_forward_hook(lambda *_: ring.append(streamer._ring is not None))]
     try:
         _train_step(model)
     finally:
-        hook.remove()
-    assert ring == [where == "embedding"]
+        for hook in hooks:
+            hook.remove()
+    assert ring == [False, where == "norm"]
     assert streamer.late_loads == 0 and streamer.loads == streamer.n_chunks
     streamer.restore()
 
