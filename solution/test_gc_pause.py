@@ -18,7 +18,8 @@ def test_gc_state_inside_and_after(monkeypatch, mode):
         assert gc.isenabled() == (mode != "off")
         inside = gc.get_freeze_count()
         assert inside >= before + (100 if mode != "0" else 0)
-    assert gc.isenabled() and gc.get_freeze_count() == inside
+    # nothing is unfrozen (frozen objects can still die by reference counting: the context's own)
+    assert gc.isenabled() and before <= gc.get_freeze_count() <= inside
     del keep
 
 
