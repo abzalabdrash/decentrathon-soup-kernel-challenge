@@ -62,13 +62,14 @@ forward from `_soup_original_forward` and drop this one.
 """
 
 import os
+import weakref
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import rope
+from . import nf4, rope
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -112,12 +113,123 @@ def _weights(bases, dtype, device, offset=0):
     rows = sum(b.out_features for b in bases)
     flat = _buffer(device, dtype, offset + rows * k)
     w = flat[offset:offset + rows * k].view(rows, k)
+    if _CPU["diet"]:
+        packed = [_nf4_packed(base, dtype) for base in bases]
+        if all(p is not None for p in packed):
+            if len(packed) == 3:
+                _dequant3(packed, w)
+            else:
+                row = 0
+                for base, (plain, state) in zip(bases, packed):
+                    n = base.out_features
+                    nf4._launch(plain, state, dtype, w[row:row + n])
+                    row += n
+            return w
     row = 0
     for base in bases:
         n = base.out_features
         dequantize_nf4(base.weight, base.weight.quant_state, dtype, out=w[row:row + n])
         row += n
     return w
+
+
+# CPU side of the step (SOUP_SOLUTION_CPU_DIET=0: every launch as before). Every Triton launch of
+# solution/ costs about 50 us of CPU on the training path (Triton's launcher plus the harness's
+# timing events), nf4._fast_path's checks 13 us more, and a layer makes 14 dequantizations: the
+# q/k/v ones go in one launch, the checks' verdict is kept per packed weight
+_CPU = {"diet": os.environ.get("SOUP_SOLUTION_CPU_DIET", "1").strip().lower()
+        not in ("0", "false", "no", "")}
+
+
+def _nf4_packed(base, dtype):
+    """(plain packed weight, quant state) of a 4-bit layer when nf4.py's kernel takes it, else None.
+    nf4._fast_path's verdict is kept on the layer for its packed weight's storage, quant state,
+    dtype and device (weight_stream.py moves a layer's packed weight into its slot, a new storage)."""
+    weight = base.weight
+    state = weight.quant_state
+    plain = weight.data  # a Params4bit answers attributes through __torch_function__: read once
+    key = (plain.data_ptr(), id(state), dtype, torch.cuda.current_device())
+    cached = base.__dict__.get("_soup_nf4_packed")
+    if cached is None or cached[0] != key:
+        cached = (key, nf4._fast_path(plain, state, dtype))
+        base.__dict__["_soup_nf4_packed"] = cached
+    return (plain, state) if cached[1] else None
+
+
+@triton.jit
+def _nf4_blocks(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr, out_ptr,
+                n_blocks, program, QBLOCK: tl.constexpr, ABLOCK: tl.constexpr,
+                BLOCKS: tl.constexpr):
+    # nf4.nf4_dequant_kernel's body for one weight, its programs numbered from 0 (same loads,
+    # same products in the same order: the same values)
+    blk = program * BLOCKS + tl.arange(0, BLOCKS)
+    live = blk < n_blocks
+    q = tl.load(qabsmax_ptr + blk, mask=live, other=0).to(tl.int32)
+    scale = tl.load(absmax2_ptr + blk // ABLOCK, mask=live, other=0.0)
+    absmax = tl.load(code2_ptr + q) * scale
+    absmax = absmax + tl.load(offset_ptr)
+    words: tl.constexpr = QBLOCK // 8
+    w = tl.load(words_ptr + blk[:, None] * words + tl.arange(0, words)[None, :], mask=live[:, None],
+                other=0)
+    j = tl.arange(0, 8)
+    codes = (w[:, :, None] >> ((j // 2) * 8 + (1 - j % 2) * 4)[None, None, :]) & 15
+    levels = tl.reshape(tl.load(nf4_ptr + codes), (BLOCKS, QBLOCK))
+    vals = levels * absmax[:, None]
+    elem = blk[:, None] * QBLOCK + tl.arange(0, QBLOCK)[None, :]
+    tl.store(out_ptr + elem, vals.to(out_ptr.dtype.element_ty), mask=live[:, None])
+
+
+@triton.jit
+def nf4_dequant3_kernel(
+    w0, qa0, c0, s0, o0, l0, n0,  # weight 0: packed words, absmax codes, state2.code, state2.absmax,
+    w1, qa1, c1, s1, o1, l1, n1,  # offset, NF4 levels, number of blocks (as nf4_dequant_kernel)
+    w2, qa2, c2, s2, o2, l2, n2,
+    out_ptr,  # the three weights stacked by rows, contiguous
+    QBLOCK: tl.constexpr, ABLOCK: tl.constexpr, BLOCKS: tl.constexpr,
+):
+    # three weights in one launch: the first programs dequantize weight 0, the next weight 1, the
+    # last weight 2, each into its rows of the output
+    pid = tl.program_id(0)
+    p0 = tl.cdiv(n0, BLOCKS)
+    p1 = tl.cdiv(n1, BLOCKS)
+    if pid < p0:
+        _nf4_blocks(w0, qa0, c0, s0, o0, l0, out_ptr, n0, pid, QBLOCK, ABLOCK, BLOCKS)
+    elif pid < p0 + p1:
+        _nf4_blocks(w1, qa1, c1, s1, o1, l1, out_ptr + n0.to(tl.int64) * QBLOCK, n1, pid - p0,
+                    QBLOCK, ABLOCK, BLOCKS)
+    else:
+        _nf4_blocks(w2, qa2, c2, s2, o2, l2, out_ptr + (n0 + n1).to(tl.int64) * QBLOCK, n2,
+                    pid - p0 - p1, QBLOCK, ABLOCK, BLOCKS)
+
+
+def _dequant3_args(plain, state):
+    state2 = state.state2
+    return (plain.view(-1).view(torch.int32), state.absmax, state2.code, state2.absmax,
+            state.offset, state.code, state.absmax.numel())
+
+
+def _dequant3(packed, out):
+    """The three weights of `packed` ((plain, quant state) each, nf4.py's fast path) into the
+    contiguous rows of `out`, bit for bit nf4.dequantize_nf4 of each, in one launch."""
+    args = [a for plain, state in packed for a in _dequant3_args(plain, state)]
+    blocks = nf4.BLOCKS_PER_PROGRAM
+    programs = sum(triton.cdiv(state.absmax.numel(), blocks) for _, state in packed)
+    nf4_dequant3_kernel[(programs,)](*args, out, QBLOCK=nf4.QBLOCK, ABLOCK=nf4.ABLOCK, BLOCKS=blocks,
+                                     num_warps=4, enable_fp_fusion=False)
+
+
+def _warm_dequant3():
+    """warmup.py registration of nf4_dequant3_kernel: q, k and v of the run (every block count
+    divisible by 16, so one class), in the run's half dtype."""
+    from .warmup import HIDDEN, KV_HEADS, Q_HEADS, HEAD_DIM, compile_kernel, training_half_dtype
+
+    per = []
+    for rows in (Q_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM, KV_HEADS * HEAD_DIM):
+        per += [torch.int32, torch.uint8, torch.float32, torch.float32, torch.float32, torch.float32,
+                rows * HIDDEN // nf4.QBLOCK]
+    compile_kernel(nf4_dequant3_kernel, *per, training_half_dtype(), QBLOCK=nf4.QBLOCK,
+                   ABLOCK=nf4.ABLOCK, BLOCKS=nf4.BLOCKS_PER_PROGRAM, num_warps=4,
+                   enable_fp_fusion=False)
 
 
 def _cached_bias(owner, bases, dtype):
@@ -386,6 +498,58 @@ def _scaled_mm(a, b, alpha, out):
     return torch.addmm(out, a, b, beta=0.0, alpha=alpha, out_dtype=out.dtype, out=out)
 
 
+class _AdapterHalves:
+    """Half copies of the four LoRA matrices (A_q, A_v stacked; B_q, B_v stacked) of every fused
+    attention layer. The optimizer steps all of them between two forwards; the first layer that
+    finds its matrices changed (a parameter's version or storage) refreshes every changed layer in
+    one multi-tensor copy, the other layers find theirs current: one launch per step instead of
+    one per layer, the same casts. A step's backward reads these buffers before the optimizer
+    changes the parameters and the next forward refreshes them; anything that keeps a graph across
+    that point gets autograd's in-place error (the buffers' version), not stale values."""
+
+    def __init__(self):
+        self._layers = weakref.WeakKeyDictionary()  # a layer's lora_A module of q -> entry
+
+    @staticmethod
+    def _stamp(params):
+        return tuple((p.data_ptr(), p._version) for p in params)
+
+    def halves(self, owner, params, half):
+        """(a16, b16) for the layer `owner` with params (A_q, A_v, B_q, B_v)."""
+        entry = self._layers.get(owner)
+        shapes = tuple(tuple(p.shape) for p in params)
+        if (entry is None or entry["shapes"] != shapes or entry["dtype"] != half
+                or entry["device"] != params[0].device or any(
+                    a is not b for a, b in zip(entry["params"], params))):
+            (r, d), (nq, _), (nv, _) = shapes[0], shapes[2], shapes[3]
+            a16 = torch.empty((2 * r, d), dtype=half, device=params[0].device)
+            b16 = torch.empty((nq + nv, r), dtype=half, device=params[0].device)
+            entry = {"params": params, "shapes": shapes, "dtype": half, "device": params[0].device,
+                     "a16": a16, "b16": b16, "views": [a16[:r], a16[r:], b16[:nq], b16[nq:]],
+                     "stamp": None}
+            self._layers[owner] = entry
+        if entry["stamp"] != self._stamp(params):
+            self._refresh(entry)
+        return entry["a16"], entry["b16"]
+
+    def _refresh(self, first):
+        dst, src, done = [], [], []
+        for entry in [first] + [e for e in self._layers.values() if e is not first]:
+            if entry["dtype"] != first["dtype"] or entry["device"] != first["device"]:
+                continue
+            stamp = self._stamp(entry["params"])
+            if entry["stamp"] != stamp:
+                dst += entry["views"]
+                src += entry["params"]
+                done.append((entry, stamp))
+        torch._foreach_copy_(dst, src)
+        for entry, stamp in done:
+            entry["stamp"] = stamp
+
+
+_ADAPTERS = _AdapterHalves()
+
+
 class _QKVRope(torch.autograd.Function):
     """x (1, N, D) -> q, k, v (1, H, N, Dh) in half: q and k rotated, LoRA added to q and v."""
 
@@ -401,10 +565,14 @@ class _QKVRope(torch.autograd.Function):
         w = _weights(plan.bases, half, x.device)
         qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
 
-        # the four adapter matrices cast to half in one multi-tensor launch
-        a16 = torch.empty((2 * r, d), dtype=half, device=x.device)
-        b16 = torch.empty((nq + nv, r), dtype=half, device=x.device)
-        torch._foreach_copy_([a16[:r], a16[r:], b16[:nq], b16[nq:]], [a_q, a_v, b_q, b_v])
+        # the four adapter matrices in half: kept per layer and refreshed for every layer in one
+        # multi-tensor launch after the optimizer step (else one launch per layer, as before)
+        if _CPU["diet"]:
+            a16, b16 = _ADAPTERS.halves(plan.lora_q[0], (a_q, a_v, b_q, b_v), half)
+        else:
+            a16 = torch.empty((2 * r, d), dtype=half, device=x.device)
+            b16 = torch.empty((nq + nv, r), dtype=half, device=x.device)
+            torch._foreach_copy_([a16[:r], a16[r:], b16[:nq], b16[nq:]], [a_q, a_v, b_q, b_v])
         rng = None
         if plan.p > 0.0:
             rng = torch.cuda.get_rng_state(x.device)
@@ -756,6 +924,8 @@ def _register_warmups():
 
         register(warm_rebuild, name="fused_proj_x16_rebuild")
     register(_warm_masked_pair_sum, name="fused_proj_masked_pair_sum")
+    if _CPU["diet"]:
+        register(_warm_dequant3, name="fused_proj_nf4_dequant3")
 
 
 def patch_qwen2_mlp_fused():

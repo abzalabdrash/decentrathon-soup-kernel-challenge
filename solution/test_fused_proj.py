@@ -790,3 +790,126 @@ def test_attention_kernels_are_warmed_up():
     assert [c for c in compiles if c["kernel"] == "masked_pair_sum_kernel"] == []
     names = [name for name, _ in warmup.WARMUPS]
     assert "fused_proj_masked_pair_sum" in names and "fused_proj_x16_rebuild" in names
+
+
+# ------------------------------------------------------------------------------------------------
+# CPU side: q/k/v dequantized in one launch, nf4's checks kept per packed weight, the adapters'
+# half copies refreshed for every layer in one launch per step
+
+
+@pytest.fixture
+def cpu_diet():
+    from solution import fused_proj
+
+    before = fused_proj._CPU["diet"]
+    yield fused_proj._CPU
+    fused_proj._CPU["diet"] = before
+
+
+def test_dequant3_matches_three_dequantizations():
+    from solution import fused_proj
+    from solution.nf4 import dequantize_nf4
+
+    layers = [_linear4bit(1536, rows, seed) for rows, seed in ((1536, 60), (256, 61), (256, 62))]
+    packed = [(layer.weight.data, layer.weight.quant_state) for layer in layers]
+    out = torch.empty(2048, 1536, dtype=torch.float16, device="cuda")
+    fused_proj._dequant3(packed, out)
+    ref = torch.cat([dequantize_nf4(layer.weight, layer.weight.quant_state, torch.float16)
+                     for layer in layers])
+    assert torch.equal(out, ref)
+
+
+def test_weights_are_the_same_with_the_cpu_diet(layer_1p5b, cpu_diet):
+    from solution import fused_proj
+
+    _, attn, mlp, _ = layer_1p5b
+    groups = [(attn.q_proj.base_layer, attn.k_proj, attn.v_proj.base_layer), (attn.o_proj,),
+              (mlp.gate_proj, mlp.up_proj), (mlp.down_proj,)]
+    for bases in groups:
+        cpu_diet["diet"] = False
+        ref = fused_proj._weights(bases, torch.float16, torch.device("cuda")).clone()
+        cpu_diet["diet"] = True
+        got = fused_proj._weights(bases, torch.float16, torch.device("cuda"))
+        assert torch.equal(got, ref), [b.out_features for b in bases]
+        assert all("_soup_nf4_packed" in vars(b) and vars(b)["_soup_nf4_packed"][1] for b in bases)
+
+
+def test_adapter_halves_refresh_every_layer_in_one_copy(monkeypatch):
+    from solution import fused_proj
+
+    cache = fused_proj._AdapterHalves()
+    owners = [torch.nn.Linear(1, 1) for _ in range(3)]
+    params = [tuple(torch.randn(shape, device="cuda", requires_grad=True)
+                    for shape in ((16, 64), (16, 64), (96, 16), (32, 16))) for _ in owners]
+    copies = []
+    foreach = torch._foreach_copy_
+    monkeypatch.setattr(torch, "_foreach_copy_", lambda dst, src: (copies.append(len(dst)),
+                                                                   foreach(dst, src)))
+
+    def check(owner, ps):
+        a16, b16 = cache.halves(owner, ps, torch.float16)
+        assert torch.equal(a16, torch.cat([ps[0], ps[1]]).half())
+        assert torch.equal(b16, torch.cat([ps[2], ps[3]]).half())
+
+    for owner, ps in zip(owners, params):  # first step: every layer fills its own
+        check(owner, ps)
+    assert copies == [4, 4, 4]
+    copies.clear()
+    for owner, ps in zip(owners, params):  # nothing changed: nothing copied
+        check(owner, ps)
+    assert copies == []
+    with torch.no_grad():  # the optimizer step
+        for ps in params:
+            for p in ps:
+                p.add_(0.25)
+    for owner, ps in zip(owners, params):
+        check(owner, ps)
+    assert copies == [12]  # all three layers in the first layer's one copy
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.05])
+def test_attention_is_the_same_with_the_cpu_diet(layer_1p5b, cpu_diet, dropout):
+    """The fused attention with the q/k/v launch and the adapter cache against the per-weight launches
+    and per-layer casts: bitwise, across an optimizer-like change of the adapters."""
+    _, attn, _, rotary = layer_1p5b
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(dropout).train() if dropout else \
+            torch.nn.Identity()
+    x, pe, grad = _attention_inputs(rotary, seed=33)
+    _fused(True)
+    try:
+        for change in range(2):
+            results = []
+            for diet in (False, True):
+                cpu_diet["diet"] = diet
+                torch.cuda.manual_seed(40 + change)
+                results.append(_attention_step(attn, x, pe, grad))
+            (out0, dx0, g0), (out1, dx1, g1) = results
+            assert torch.equal(out1, out0)
+            # the attention backward's dq is not bit-reproducible run to run (key-split sums)
+            assert _rel(dx1, dx0) < 1e-3
+            for a, b in zip(g1, g0):
+                assert _rel(a, b) < 1e-3
+            with torch.no_grad():
+                for p in _lora_params(attn):
+                    p.mul_(0.9)
+    finally:
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
+
+
+def test_dequant3_kernel_is_warmed_up(layer_1p5b, cpu_diet):
+    from solution import fused_proj, warmup
+
+    _, attn, _, _ = layer_1p5b
+    cpu_diet["diet"] = True
+    compiles = warmup.watch_compiles(log=False)
+    fused_proj.nf4_dequant3_kernel.device_caches.clear()
+    compiles.clear()
+    fused_proj._warm_dequant3()
+    assert [c["kernel"] for c in compiles] == ["nf4_dequant3_kernel"]
+    compiles.clear()
+    fused_proj._weights((attn.q_proj.base_layer, attn.k_proj, attn.v_proj.base_layer),
+                        warmup.training_half_dtype(), torch.device("cuda"))
+    assert [c for c in compiles if c["kernel"] == "nf4_dequant3_kernel"] == []
+    assert "fused_proj_nf4_dequant3" in [name for name, _ in warmup.WARMUPS]
