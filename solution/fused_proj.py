@@ -93,6 +93,50 @@ def _gate_up_split():
 
 
 # ---------------------------------------------------------------------------------------------
+# GEMM formulations, measured on the T4 (T19, solution/bench_gemm.py: three Kaggle sessions, the
+# card power-limited at 527-1,397 MHz under these loads, so compared per clock cycle; noise ~10%):
+# - the q|k|v backward (M x 2048 @ 2048 x 1536 into fp32) in two K-halves accumulated by addmm into
+#   the fp32 output while M < SPLITK_MAX_M: cuBLAS's 256x128 kernel makes 48 tiles at M = 832, 1.2
+#   waves on 40 SMs; two halves: +31..34% at M = 832, -21..27% at M = 1440. Numerics: the first
+#   half's sum is rounded to fp32 before the second is added (one more fp32 rounding per element);
+# - o_proj's and down_proj's forward GEMMs through cuBLASLt, which picks a 256x64 sliced kernel
+#   where cuBLAS takes 128x128 (o: +11..22%) or 128x256 (down: 42 tiles at M = 832; +12..24%).
+# Switches: SOUP_SOLUTION_QKV_SPLITK, SOUP_SOLUTION_O_LT, SOUP_SOLUTION_DOWN_LT (1 / 0).
+def _switch(name, default):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
+_GEMM = {"qkv_splitk": _switch("SOUP_SOLUTION_QKV_SPLITK", "0"),
+         "o_lt": _switch("SOUP_SOLUTION_O_LT", "0"),
+         "down_lt": _switch("SOUP_SOLUTION_DOWN_LT", "0")}
+SPLITK_MAX_M = 1100
+_LT = getattr(torch._C, "_BlasBackend", None)
+
+
+def _lt(gemm, *args, **kwargs):
+    """gemm(*args) with cuBLASLt as torch's BLAS for this one call (torch's process-wide preferred
+    backend, set back right after); the plain call where torch has no such setting."""
+    if _LT is None:
+        return gemm(*args, **kwargs)
+    previous = torch._C._get_blas_preferred_backend()
+    torch._C._set_blas_preferred_backend(_LT.Cublaslt)
+    try:
+        return gemm(*args, **kwargs)
+    finally:
+        torch._C._set_blas_preferred_backend(previous)
+
+
+def _qkv_grad_x(lora_x, g, w, beta):
+    """lora_x = beta * lora_x + g @ w in fp32 (in place), in two K-halves for a small M."""
+    m, k = g.shape
+    if not _GEMM["qkv_splitk"] or m >= SPLITK_MAX_M or k % 16:
+        return torch.addmm(lora_x, g, w, beta=beta, out_dtype=torch.float32, out=lora_x)
+    h = k // 2
+    torch.addmm(lora_x, g[:, :h], w[:h], beta=beta, out_dtype=torch.float32, out=lora_x)
+    return torch.addmm(lora_x, g[:, h:], w[h:], out_dtype=torch.float32, out=lora_x)
+
+
+# ---------------------------------------------------------------------------------------------
 # weights
 
 
@@ -673,7 +717,7 @@ class _QKVRope(torch.autograd.Function):
         if need_x:
             w = _weights(plan.bases, half, device)
             # one GEMM for the three projections, the adapters' share added as C (in place, fp32)
-            grad_x = torch.addmm(lora_x, g, w, beta=beta, out_dtype=torch.float32, out=lora_x)
+            grad_x = _qkv_grad_x(lora_x, g, w, beta)
             grad_x = grad_x.view(ctx.x_shape)
             if ctx.x_dtype != torch.float32:
                 grad_x = grad_x.to(ctx.x_dtype)
@@ -689,7 +733,10 @@ class _Linear4bitHalf(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x16, base, bias):
         w = _weights((base,), x16.dtype, x16.device)
-        out = torch.addmm(bias, x16, w.t()) if bias is not None else torch.mm(x16, w.t())
+        if _GEMM["o_lt"]:
+            out = _lt(torch.addmm, bias, x16, w.t()) if bias is not None else _lt(torch.mm, x16, w.t())
+        else:
+            out = torch.addmm(bias, x16, w.t()) if bias is not None else torch.mm(x16, w.t())
         ctx.base = base
         return out
 
@@ -849,7 +896,10 @@ class _MLP(torch.autograd.Function):
         example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
             gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
         w = _weights((plan.down,), half, x.device)
-        out = torch.mm(hidden.t(), w.t())  # (padded, D)
+        if _GEMM["down_lt"]:
+            out = _lt(torch.mm, hidden.t(), w.t())  # (padded, D)
+        else:
+            out = torch.mm(hidden.t(), w.t())  # (padded, D)
         # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
         # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
         ctx.source = (norm_source(x) if plan.recompute and n == padded and _ATTN["rebuild_x16"]
