@@ -61,21 +61,38 @@ def _run(fn, flat_q, flat_k, cos, sin, grad_q, grad_k):
     return out
 
 
-def _compare(cos, sin, batch, q_heads, kv_heads, n, dtype, seed):
-    from solution.rope import apply_rotary_pos_emb_triton
+def _cast_reference(out_dtype):
+    """The base's path for half projections: q, k upcast to the tables' dtype (exact), the
+    original in that dtype, its result cast as autocast casts it before SDPA. (The original fed
+    half q directly would round the two gradient terms of dq to half separately.)"""
+    def fn(q, k, cos, sin):
+        q_embed, k_embed = _reference()(q.to(cos.dtype), k.to(cos.dtype), cos, sin)
+        return q_embed.to(out_dtype), k_embed.to(out_dtype)
+    return fn
+
+
+def _compare(cos, sin, batch, q_heads, kv_heads, n, dtype, seed, out_dtype=None, tolerance=None):
+    """The drop-in against the original, or with `out_dtype` rotary_qk against the original
+    followed by a cast to `out_dtype`."""
+    from solution.rope import apply_rotary_pos_emb_triton, rotary_qk
 
     torch.manual_seed(seed)
     flat_q = _projection(batch, q_heads, n, dtype)
     flat_k = _projection(batch, kv_heads, n, dtype)
-    out_dtype = torch.promote_types(dtype, cos.dtype)
-    grad_q = torch.randn(batch, q_heads, n, D, device="cuda", dtype=out_dtype)
-    grad_k = torch.randn(batch, kv_heads, n, D, device="cuda", dtype=out_dtype)
+    grad_dtype = out_dtype or torch.promote_types(dtype, cos.dtype)
+    grad_q = torch.randn(batch, q_heads, n, D, device="cuda", dtype=grad_dtype)
+    grad_k = torch.randn(batch, kv_heads, n, D, device="cuda", dtype=grad_dtype)
 
-    ref = _run(_reference(), flat_q, flat_k, cos, sin, grad_q, grad_k)
-    out = _run(apply_rotary_pos_emb_triton, flat_q, flat_k, cos, sin, grad_q, grad_k)
+    if out_dtype is None:
+        ref_fn, fn = _reference(), apply_rotary_pos_emb_triton
+    else:
+        ref_fn = _cast_reference(out_dtype)
+        fn = lambda q, k, cos, sin: rotary_qk(q, k, cos, sin, out_dtype)  # noqa: E731
+    ref = _run(ref_fn, flat_q, flat_k, cos, sin, grad_q, grad_k)
+    out = _run(fn, flat_q, flat_k, cos, sin, grad_q, grad_k)
     for got, want, name in zip(out, ref, ("q_embed", "k_embed", "dq", "dk")):
         assert got.dtype == want.dtype and got.shape == want.shape, name
-        torch.testing.assert_close(got, want, **TOLERANCE[dtype], msg=name)
+        torch.testing.assert_close(got, want, **(tolerance or TOLERANCE[dtype]), msg=name)
     return out
 
 
@@ -110,6 +127,18 @@ def test_rope_half_inputs_with_fp32_tables():
     assert q_embed.dtype == torch.float32
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("batch,q_heads,kv_heads,n,lengths", CASES)
+def test_rotary_qk_half_out_with_fp32_tables(batch, q_heads, kv_heads, n, lengths, dtype):
+    """Half q, k, fp32 tables, half out: the original's fp32 result rounded to half once, and the
+    gradients likewise; at most one rounding step apart (fp32 FMA vs separate products)."""
+    cos, sin = _tables(_positions(batch, n, lengths), torch.float32)
+    eps = torch.finfo(dtype).eps
+    q_embed, k_embed, dq, dk = _compare(cos, sin, batch, q_heads, kv_heads, n, dtype, seed=n + 1,
+                                        out_dtype=dtype, tolerance=dict(rtol=eps, atol=1e-4))
+    assert q_embed.dtype == k_embed.dtype == dq.dtype == dk.dtype == dtype
+
+
 def test_rope_tables_indexed_per_batch_row():
     """Random cos, sin that differ per batch row and per half, as a non-contiguous view."""
     torch.manual_seed(2)
@@ -139,6 +168,10 @@ def test_rope_falls_back_where_unsupported():
             want = _reference()(q_, k_, cos_, sin_, dim)
             for a, b in zip(got, want):
                 torch.testing.assert_close(a, b)
+        got = rope.rotary_qk(q, k, cos, sin, torch.float16)  # CPU, explicit dtype
+        want = _cast_reference(torch.float16)(q, k, cos, sin)
+        for a, b in zip(got, want):
+            torch.testing.assert_close(a, b)
         assert not calls
     finally:
         rope._launch = launch
@@ -223,49 +256,63 @@ def _time_ms(fn, iters=50, warmup=10):
     return start.elapsed_time(end) / iters
 
 
-def _kernel_ms(fn, iters=50):
-    """GPU time of all kernels one call launches (torch.profiler), without the CPU-side cost."""
+def _kernels(fn, iters=50):
+    """GPU time (ms) of the kernels one call launches and their number (torch.profiler), without
+    the CPU-side cost."""
     fn()
     torch.cuda.synchronize()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
         for _ in range(iters):
             fn()
         torch.cuda.synchronize()
-    return sum(event.self_device_time_total for event in prof.key_averages()) / 1000 / iters
+    device = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    return sum(e.device_time for e in device) / 1000 / iters, len(device) / iters
 
 
 def bench():
-    """Original vs Triton, forward and backward (the gradient down to the (B, N, H*D) projection),
-    ms per call: wall time by CUDA events over 50 calls after warm-up, and the GPU time of the
-    kernels alone by torch.profiler (the wall time also holds autograd's and the launch's CPU work
-    when that is longer than the kernels)."""
-    from solution.rope import apply_rotary_pos_emb_triton
+    """Original vs Triton for one layer's q and k, forward and backward (the gradient down to the
+    (B, N, H*D) projections): wall ms by CUDA events over 50 calls after warm-up, GPU ms of the
+    kernels alone and the number of kernel launches by torch.profiler (the wall time also holds
+    autograd's and the launch's CPU work when that is longer than the kernels). With half out the
+    original is followed by the cast to half that autocast would do before SDPA."""
+    from solution.rope import rotary_qk
 
-    print(f"{torch.cuda.get_device_name()}; fp32 q, k, cos, sin; ms per call, mean of 50")
-    print("q, k                          | timer   | fwd eager | fwd triton | bwd eager | bwd triton")
-    for batch, q_heads, kv_heads, n, lengths in CASES:
-        cos, sin = _tables(_positions(batch, n, lengths), torch.float32)
-        flat_q = _projection(batch, q_heads, n, torch.float32)
-        flat_k = _projection(batch, kv_heads, n, torch.float32)
-        grad_q = torch.randn(batch, q_heads, n, D, device="cuda")
-        grad_k = torch.randn(batch, kv_heads, n, D, device="cuda")
-        times = {"events": [], "kernels": []}
-        for fn in (_reference(), apply_rotary_pos_emb_triton):
-            q, k = _heads(flat_q), _heads(flat_k)
-            outs = fn(q, k, cos, sin)
+    print(f"{torch.cuda.get_device_name()}; per call (one layer), mean of 50")
+    print("q, k                          | measure  | fwd eager | fwd triton | bwd eager | bwd triton")
+    scenarios = [("fp32 q, k; fp32 cos, sin; fp32 out", torch.float32, None),
+                 ("fp16 q, k; fp32 cos, sin; fp16 out", torch.float16, torch.float16)]
+    for title, dtype, out_dtype in scenarios:
+        print(title)
+        for batch, q_heads, kv_heads, n, lengths in CASES:
+            cos, sin = _tables(_positions(batch, n, lengths), torch.float32)
+            flat_q = _projection(batch, q_heads, n, dtype)
+            flat_k = _projection(batch, kv_heads, n, dtype)
+            grad_dtype = out_dtype or dtype
+            grad_q = torch.randn(batch, q_heads, n, D, device="cuda", dtype=grad_dtype)
+            grad_k = torch.randn(batch, kv_heads, n, D, device="cuda", dtype=grad_dtype)
+            rows = {"wall ms": [], "GPU ms": [], "launches": []}
+            eager = _reference() if out_dtype is None else _cast_reference(out_dtype)
+            triton_fn = lambda q, k, c, s: rotary_qk(q, k, c, s, out_dtype)  # noqa: E731
+            for fn in (eager, triton_fn):
+                q, k = _heads(flat_q), _heads(flat_k)
+                outs = fn(q, k, cos, sin)
 
-            def forward():
-                with torch.no_grad():
-                    fn(q, k, cos, sin)
+                def forward():
+                    with torch.no_grad():
+                        fn(q, k, cos, sin)
 
-            def backward():
-                torch.autograd.grad(outs, (flat_q, flat_k), (grad_q, grad_k), retain_graph=True)
+                def backward():
+                    torch.autograd.grad(outs, (flat_q, flat_k), (grad_q, grad_k), retain_graph=True)
 
-            times["events"].append((_time_ms(forward), _time_ms(backward)))
-            times["kernels"].append((_kernel_ms(forward), _kernel_ms(backward)))
-        shapes = f"({batch},{q_heads},{n},{D})+({batch},{kv_heads},{n},{D})"
-        for timer, ((fe, be), (ft, bt)) in times.items():
-            print(f"{shapes:30s}| {timer:7s} | {fe:9.3f} | {ft:10.3f} | {be:9.3f} | {bt:10.3f}")
+                (fwd_ms, fwd_n), (bwd_ms, bwd_n) = _kernels(forward), _kernels(backward)
+                rows["wall ms"].append((_time_ms(forward), _time_ms(backward)))
+                rows["GPU ms"].append((fwd_ms, bwd_ms))
+                rows["launches"].append((fwd_n, bwd_n))
+            shapes = f"({batch},{q_heads},{n},{D})+({batch},{kv_heads},{n},{D})"
+            for measure, ((fe, be), (ft, bt)) in rows.items():
+                fmt = ".0f" if measure == "launches" else ".3f"
+                print(f"{shapes:30s}| {measure:8s} | {fe:9{fmt}} | {ft:10{fmt}} | {be:9{fmt}} | "
+                      f"{bt:10{fmt}}")
 
 
 if __name__ == "__main__":

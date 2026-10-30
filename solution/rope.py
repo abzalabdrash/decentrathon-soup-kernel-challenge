@@ -13,7 +13,10 @@ halves of a head vector and c1, c2, s1, s2 the matching halves of cos and sin:
 
 (the backward is cos * dy plus the transpose of rotate_half, cat(x2, -x1), applied to sin * dy).
 The two halves of cos and sin are read separately, so the kernel does not rely on them being equal.
-Math in fp32, the result in the dtype the original would return (`q * cos` type promotion).
+Math in fp32. The drop-in returns the dtype the original would (`q * cos` type promotion: fp16 q
+with fp32 tables gives fp32). `rotary_qk(..., out_dtype=torch.float16)` returns half directly for
+an attention that feeds half q and k to SDPA: the same values as the original's fp32 result rounded
+to half by autocast, rounded once, without the fp32 tensors and the casts.
 
 Layout: q and k arrive as transposed views of the projections, (B, H, N, D) with the heads of one
 token next to each other in memory. The kernel takes any strides over B, H and N (D must be
@@ -100,11 +103,10 @@ def _last_dim_contiguous(x):
 
 class RotaryQK(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, cos, sin):
+    def forward(ctx, q, k, cos, sin, out_dtype):
         q, k = _last_dim_contiguous(q), _last_dim_contiguous(k)
         if cos.stride() != sin.stride() or cos.stride(-1) != 1:
             cos, sin = cos.contiguous(), sin.contiguous()
-        out_dtype = torch.promote_types(q.dtype, cos.dtype)
         q_out = torch.empty_like(q, dtype=out_dtype)  # same strides as q when q is dense
         k_out = torch.empty_like(k, dtype=out_dtype)
         _launch(q, k, q_out, k_out, cos, sin, backward=False)
@@ -121,7 +123,7 @@ class RotaryQK(torch.autograd.Function):
         dq = torch.empty_strided(*ctx.q_layout[:2], dtype=ctx.q_layout[2], device=grad_q.device)
         dk = torch.empty_strided(*ctx.k_layout[:2], dtype=ctx.k_layout[2], device=grad_k.device)
         _launch(grad_q, grad_k, dq, dk, cos, sin, backward=True)
-        return dq, dk, None, None
+        return dq, dk, None, None, None
 
 
 def _original():
@@ -165,7 +167,19 @@ def apply_rotary_pos_emb_triton(q, k, cos, sin, unsqueeze_dim=1):
     """Drop-in for `modeling_qwen2.apply_rotary_pos_emb`: same arguments, same results."""
     if not _supported(q, k, cos, sin, unsqueeze_dim):
         return _original()(q, k, cos, sin, unsqueeze_dim)
-    return RotaryQK.apply(q, k, cos, sin)
+    return RotaryQK.apply(q, k, cos, sin, torch.promote_types(q.dtype, cos.dtype))
+
+
+def rotary_qk(q, k, cos, sin, out_dtype=None):
+    """q (B, Hq, N, D) and k (B, Hkv, N, D) rotated by cos, sin (1 or B, N, D), returned in
+    `out_dtype` (None: the original's type promotion). Math in fp32 either way."""
+    if out_dtype is None:
+        return apply_rotary_pos_emb_triton(q, k, cos, sin)
+    if out_dtype not in _DTYPES or not _supported(q, k, cos, sin, 1):
+        math = torch.promote_types(q.dtype, cos.dtype)  # the gradient of q summed in this dtype
+        q_embed, k_embed = _original()(q.to(math), k.to(math), cos, sin)
+        return q_embed.to(out_dtype), k_embed.to(out_dtype)
+    return RotaryQK.apply(q, k, cos, sin, out_dtype)
 
 
 def patch_qwen2_rope():
