@@ -222,7 +222,7 @@ class HeadStreamer:
 
     def __init__(self, param, embedding=None, lm_head=None, rows=DEFAULT_ROWS, slots=DEFAULT_SLOTS,
                  virtual_dtype=torch.float32, prefetch_at=DEFAULT_PREFETCH, norm=None, source=None,
-                 device=None):
+                 device=None, pinned=None):
         """`source`: the weight's values when they are not in `param` yet (the loader read them to
         the host, load_stream.py); then `device` is the GPU the weight belongs on."""
         data = param.data if source is None else source
@@ -243,7 +243,12 @@ class HeadStreamer:
         self._ring = None
         self.configure(rows, slots)
         nbytes = data.numel() * data.element_size()
-        raw, self._unpin = pinned_host_buffer(nbytes, self)
+        self._pinned = pinned if pinned is not None and pinned.buffer is not None and pinned.nbytes >= nbytes \
+            else None
+        if self._pinned is not None:  # pinned ahead while the loader read the checkpoint
+            raw, self._unpin = pinned.buffer[:nbytes], pinned.unpin
+        else:
+            raw, self._unpin = pinned_host_buffer(nbytes, self)
         self.host = raw.view(self.dtype).view(self.vocab, self.hidden)
         self.host.copy_(data)
         torch.cuda.synchronize(self.device)
@@ -670,7 +675,7 @@ def _norm_of(model):
     return norm if isinstance(norm, torch.nn.Module) else None
 
 
-def load_embedding(model, value, device, log=print):
+def load_embedding(model, value, device, log=print, pinned=None):
     """Called by load_stream.py with the input embedding's values, read to the host by the loader
     (`value`, a CPU tensor in the dtype the model loads in): they go to pinned host memory and the
     module gets a placeholder Parameter on `device`, with the lookup and lm_head overrides (the lm_head
@@ -685,7 +690,8 @@ def load_embedding(model, value, device, log=print):
             raise HeadSkip(f"shape {tuple(value.shape)}")
         param = torch.nn.Parameter(torch.empty(0, dtype=value.dtype), requires_grad=value.is_floating_point())
         streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, virtual_dtype=value.dtype,
-                                prefetch_at=prefetch_at, norm=_norm_of(model), source=value, device=device)
+                                prefetch_at=prefetch_at, norm=_norm_of(model), source=value, device=device,
+                                pinned=pinned)
     except HeadSkip as exc:
         log(f"[solution] embedding kept on the GPU at load: {exc}")
         return value.to(device), 0

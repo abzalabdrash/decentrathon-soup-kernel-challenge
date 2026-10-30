@@ -31,6 +31,7 @@ Switch: SOUP_SOLUTION_LOAD_STREAM=0.
 
 import functools
 import inspect
+import threading
 import time
 
 import torch
@@ -38,6 +39,58 @@ import torch
 _STATE = {"depth": 0, "layers": False, "only": None, "embedding": False}
 _ACTIVE = {"load": None}  # the load in progress, when it is one this module handles
 LAST = {"load": None}  # the last load handled (counters, for the log and the tests)
+
+
+class _Pinner:
+    """Pins host buffers in a thread, in the order the load will need them, while the main thread
+    reads the checkpoint and quantizes (torch's fill and cudaHostRegister release the GIL): the
+    pinning (0.77 s of the setup on the T4 when it was done in line, T15) overlaps the load."""
+
+    def __init__(self, requests, device):
+        from .weight_stream import PinnedBuffer
+
+        self._requests = list(requests)  # [(key, nbytes)]
+        self._ready = {key: threading.Event() for key, _ in self._requests}
+        self._made = {}
+        self._stop = False
+        self.seconds = 0.0
+
+        def run():
+            started = time.perf_counter()
+            try:
+                torch.cuda.set_device(device)
+                for key, nbytes in self._requests:
+                    if self._stop:
+                        break
+                    try:
+                        self._made[key] = PinnedBuffer(nbytes)
+                    except Exception:  # noqa: BLE001 - the consumer pins it itself
+                        self._made[key] = None
+                    self._ready[key].set()
+            finally:
+                for event in self._ready.values():
+                    event.set()
+                self.seconds = time.perf_counter() - started
+
+        self._thread = threading.Thread(target=run, name="soup-pinner", daemon=True)
+        self._thread.start()
+
+    def take(self, key):
+        """The buffer pinned for `key` (waits for it), or None."""
+        event = self._ready.get(key)
+        if event is None:
+            return None
+        event.wait()
+        return self._made.pop(key, None)
+
+    def close(self):
+        """Stops the thread; buffers nobody took are unpinned."""
+        self._stop = True
+        self._thread.join()
+        for buffer in self._made.values():
+            if buffer is not None:
+                buffer.unpin()
+        self._made.clear()
 
 
 class _Load:
@@ -65,6 +118,20 @@ class _Load:
         self.failed = self.embedding_done = False
         self.layers_moved = self.layer_bytes = self.embedding_bytes = 0
         self.layer_seconds = self.embedding_seconds = 0.0  # spent here (copies to the host, pinning)
+        self.pinner = _Pinner(self._requests(), device)
+
+    def _requests(self):
+        """The pinned buffers this load will need, in the order it needs them."""
+        from .weight_stream import find_decoder_layers, predicted_layer_bytes
+
+        requests = []
+        if self.embed_key is not None:
+            weight = self.model.get_input_embeddings().weight  # meta: shape and dtype of the load
+            requests.append(("embedding", weight.numel() * weight.element_size()))
+        for layer in find_decoder_layers(self.model):
+            if id(layer) in self.remaining:
+                requests.append((id(layer), predicted_layer_bytes(layer, self.only)))
+        return requests
 
     def after_set(self, target_name):
         """A parameter was set: when it completes a decoder layer, move the layer to the host."""
@@ -91,7 +158,8 @@ class _Load:
 
         started = time.perf_counter()
         try:
-            self.layer_bytes += offload_loaded_layer(layer, self.device, self.only)
+            pinned = self.pinner.take(id(layer))
+            self.layer_bytes += offload_loaded_layer(layer, self.device, self.only, pinned)
             self.layers_moved += 1
         except Exception as exc:  # noqa: BLE001 - the rest of the load stays on the GPU
             self.failed = True
@@ -208,11 +276,13 @@ def _loader(original):
         finally:
             _ACTIVE["load"] = None
             LAST["load"] = load
+            load.pinner.close()
             if load.layer_bytes + load.embedding_bytes:
                 print(f"[solution] load streaming: {load.layers_moved} layers' 4-bit weights "
                       f"({load.layer_bytes / 2**20:.0f} MiB, {load.layer_seconds:.2f} s) and the embedding "
                       f"({load.embedding_bytes / 2**20:.0f} MiB, {load.embedding_seconds:.2f} s) to pinned "
-                      f"host memory as they were loaded")
+                      f"host memory as they were loaded; buffers pinned by a thread alongside the load in "
+                      f"{load.pinner.seconds:.2f} s")
 
     return convert_and_load_state_dict_in_model
 
@@ -239,7 +309,8 @@ def _setter(original):
 
             load.embedding_done = True
             started = time.perf_counter()
-            param_value, nbytes = load_embedding(model, param_value, load.device)
+            param_value, nbytes = load_embedding(model, param_value, load.device,
+                                                 pinned=load.pinner.take("embedding"))
             load.embedding_bytes += nbytes
             load.embedding_seconds += time.perf_counter() - started
             return original(model, target_name, param_value, *args, **kwargs)

@@ -140,9 +140,13 @@ def test_load_moves_weights_and_the_step_is_the_same(patched, tiny_dir, monkeypa
         checks["embedding"] = (emb.is_cuda and emb.untyped_storage().nbytes() == 2
                                and model.lm_head.weight is emb and streamer_for(emb) is not None)
         checks["loaded"] = len(_LOADED)
+        # the buffers pinned ahead by the thread were used, the predicted layer size exact
+        checks["pinned_ahead"] = (all(h._pinned is not None and h._pinned.nbytes == h.nbytes for h in _LOADED.values())
+                                  and streamer_for(emb)._pinned is not None)
 
     model, seen = _setup(patched, tiny_dir, after_load=after_load)
-    assert checks == {"layers_on_host": True, "absmax_on_host": True, "embedding": True, "loaded": LAYERS}
+    assert checks == {"layers_on_host": True, "absmax_on_host": True, "embedding": True, "loaded": LAYERS,
+                      "pinned_ahead": True}
     load = load_stream.LAST["load"]
     assert load.layers_moved == LAYERS and load.embedding_bytes == VOCAB * HIDDEN * 2
     streamer = streamer_of(model)

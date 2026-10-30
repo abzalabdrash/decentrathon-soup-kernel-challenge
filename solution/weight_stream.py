@@ -85,6 +85,47 @@ def pinned_host_buffer(nbytes, owner):
     return buffer, weakref.finalize(owner, _unregister, buffer)
 
 
+class PinnedBuffer:
+    """A pinned host buffer that can be made ahead (load_stream.py pins them in a thread while the
+    loader reads the checkpoint) and handed to whoever needs it; unpinned by `unpin()` or when the
+    holder is collected."""
+
+    def __init__(self, nbytes):
+        self.nbytes = nbytes
+        self.buffer, self._finalizer = pinned_host_buffer(nbytes, self)
+
+    def unpin(self):
+        if self._finalizer is not None:
+            self._finalizer()
+            self._finalizer = None
+        self.buffer = None
+
+
+def predicted_layer_bytes(layer, only=None):
+    """The size of a layer's buffer in the streamers' layout, from the shapes of its (still meta)
+    4-bit linear layers, as bitsandbytes' quantize_4bit sizes its outputs: the packed weight,
+    the absmax of each block (uint8 codes with double quantization) and the fp32 second-level absmax."""
+    import bitsandbytes as bnb
+
+    def aligned(nbytes):
+        return -(-nbytes // ALIGN) * ALIGN
+
+    total = 0
+    for name, module in layer.named_modules():
+        if not isinstance(module, bnb.nn.Linear4bit) or (only and not only.intersection(name.split("."))):
+            continue
+        weight = module.weight
+        n = module.in_features * module.out_features
+        item = torch.empty(0, dtype=getattr(weight, "quant_storage", torch.uint8)).element_size()
+        blocks = -(-n // getattr(weight, "blocksize", 64))
+        total += aligned((n + 1) // (2 * item) * item)
+        if getattr(weight, "compress_statistics", True):
+            total += aligned(blocks) + aligned(-(-blocks // 256) * 4)
+        else:
+            total += aligned(blocks * 4)
+    return total
+
+
 def _layer_tensors(layer, device, only=None):
     """[(owner, field, tensor)] of the big tensors of every 4-bit linear layer inside `layer`:
     (module, 'weight', packed weight), (quant_state, 'absmax', ...), (state2, 'absmax', ...).
@@ -138,10 +179,15 @@ class _HostLayer:
     """A decoder layer's 4-bit tensors in a pinned host buffer of its own, laid out as a
     WeightStreamer lays out a layer; the modules point at views of it."""
 
-    def __init__(self, layer, device, only):
+    def __init__(self, layer, device, only, pinned=None):
         plan, nbytes = _plan_layer(layer, device, only)
         self.device, self.only, self.nbytes = device, only, nbytes
-        self.buffer, self._unpin = pinned_host_buffer(nbytes, self)
+        if pinned is not None and pinned.buffer is not None and pinned.nbytes >= nbytes:
+            self._pinned = pinned  # pinned ahead (load_stream.py)
+            self.buffer, self._unpin = pinned.buffer[:nbytes], pinned.unpin
+        else:
+            self._pinned = None
+            self.buffer, self._unpin = pinned_host_buffer(nbytes, self)
         for segment, tensor in plan:
             segment.view(self.buffer).copy_(tensor, non_blocking=True)
         torch.cuda.synchronize(device)
@@ -165,14 +211,15 @@ class _HostLayer:
         self.buffer = None
 
 
-def offload_loaded_layer(layer, device, only=None):
+def offload_loaded_layer(layer, device, only=None, pinned=None):
     """Called by load_stream.py once the loader has quantized every 4-bit linear layer of `layer`:
-    its tensors go to pinned host memory now, for the WeightStreamer built before peft's kbit
-    preparation to adopt (no second copy). Returns the bytes moved."""
+    its tensors go to pinned host memory now (into `pinned`, a PinnedBuffer made ahead, when it is
+    big enough), for the WeightStreamer built before peft's kbit preparation to adopt (no second
+    copy). Returns the bytes moved."""
     only = frozenset(only) if only else None
     if layer in _LOADED or layer in _STREAMERS:
         return 0
-    host = _HostLayer(layer, device, only)
+    host = _HostLayer(layer, device, only, pinned)
     _LOADED[layer] = host
     return host.nbytes
 
