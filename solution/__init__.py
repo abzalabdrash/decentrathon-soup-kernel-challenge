@@ -112,6 +112,10 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    from .load_fast import patch_load_marks, patch_setup_profile
+
+    patch_load_marks()  # SOUP_SOLUTION_LOAD_MARKS=1, _PROFILE=1: measurements of the model setup
+    patch_setup_profile()
     from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
                           patch_soup_startup_profile)
 
