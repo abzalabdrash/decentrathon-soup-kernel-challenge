@@ -365,6 +365,11 @@ class AddRMSNormFunction(torch.autograd.Function):
             from .offload import mark_residual
 
             mark_residual(kept)  # taken by offload.py's pack hook when the forward returns
+        if addends is KEEP_BRANCH:
+            from .offload import ATTN, mark_offload
+
+            if ATTN:  # SOUP_SOLUTION_OFFLOAD_ATTN: the half branch goes to host memory too
+                mark_offload(b2)
         if ctx.residual_node is not None:
             ctx.save_for_backward(weight, rstd, *extra)
         else:

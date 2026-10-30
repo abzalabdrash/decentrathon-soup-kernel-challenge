@@ -77,3 +77,24 @@ def test_post_attention_norm_reads_the_residual_from_the_input_norm(modes, decod
     assert node.residual_node is not None  # the input norm's node, which keeps the sum
     assert len(node.saved_tensors) == 2  # weight and rstd only: no copy of the residual
     del mlp_out, residual
+
+
+def test_attention_tensors_offloaded_instead_of_recomputed(modes, decoder_1p5b, residual_switch,
+                                                           monkeypatch):
+    """SOUP_SOLUTION_OFFLOAD_ATTN: q, k, v, the output and lse of the attention and the post-attention
+    norm's half branch leave the GPU with the layer input; outputs and gradients unchanged."""
+    from solution import offload
+
+    layer, rotary = decoder_1p5b
+    lengths = [212, 187, 310, 117]
+    _set(modes, recompute=None, split=True)
+    _step(layer, rotary, lengths, False, residual_switch)
+    ref = _step(layer, rotary, lengths, False, residual_switch)
+    monkeypatch.setattr(offload, "ATTN", True)
+    got = _step(layer, rotary, lengths, True, residual_switch)
+    assert got["stats"].get("residuals", 0) == 1  # the layer input
+    assert got["stats"].get("marked", 0) >= 5  # q, k, v, output, the branch (lse when >= 64 KB)
+    assert torch.equal(got["out"][0], ref["out"][0]) and torch.equal(got["out"][1], ref["out"][1])
+    for a, b in zip(got["grads"], ref["grads"]):
+        assert _rel(a, b) < 1e-3
+    assert got["held"] < ref["held"]
