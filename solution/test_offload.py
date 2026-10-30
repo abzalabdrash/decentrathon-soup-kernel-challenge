@@ -272,6 +272,49 @@ def test_prefetched_tensor_waits_for_its_copy():
     scenario(SLEEP)
 
 
+def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkeypatch):
+    """Forward and backward on one stream (the training run): every copy, drop and prefetch is
+    ordered by stream waits on events; no record_stream for the allocator to track, no CPU-side
+    wait (the CPU keeps running ahead of the GPU). The values still come back exactly."""
+    import threading
+
+    from solution.offload import Offloader
+
+    calls = []
+    me = threading.get_ident()  # the patches are process-wide: a warm-up thread may sync its events
+    original_sync, original_record = torch.cuda.Event.synchronize, torch.Tensor.record_stream
+
+    def record_stream(self, stream):
+        if threading.get_ident() == me:
+            calls.append("record_stream")
+        return original_record(self, stream)
+
+    def synchronize(self):
+        if threading.get_ident() == me:
+            calls.append("synchronize")
+        return original_sync(self)
+
+    n, k = 1 << 20, 6
+    values = [torch.randn(n, device="cuda").half() for _ in range(k)]
+    xs = [leaf(n) for _ in range(k)]
+    off = Offloader(min_numel=1000, max_inflight=1, prefetch=1)
+    torch.cuda.synchronize()
+    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
+    monkeypatch.setattr(torch.cuda.Event, "synchronize", synchronize)
+    with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
+        ys = [Keep.apply(x, activation(v)) for x, v in zip(xs, values)]
+        torch.cuda._sleep(SLEEP)  # the copies are still queued when the backward starts
+        sum(y.float().sum() for y in ys).backward()
+    assert calls == []
+    monkeypatch.undo()
+    off.close()
+    torch.cuda.synchronize()
+    s = off.stats
+    assert s["offloaded"] == k and s["waited"] == k - 1 and s["prefetch_hits"] == k - 1, off.summary()
+    for x, v in zip(xs, values):
+        assert torch.equal(x.grad, v)
+
+
 def test_prepinned_slab_is_used():
     from solution import offload
 
@@ -329,6 +372,9 @@ def restore_classes():
     from soup_cli.trainer import sft
     from transformers.models.qwen2 import modeling_qwen2
 
+    from solution import fused_proj
+
+    recompute = fused_proj._MLP_MEMORY["recompute"]
     targets = ((sft.SFTTrainerWrapper, ("train", "_soup_mlp_offload", "_soup_offload_previous_train")),
                (modeling_qwen2.Qwen2MLP, ("forward", "_soup_mlp_recompute", "_soup_original_forward",
                                           "_soup_recompute_previous", "_soup_fused_proj",
@@ -342,6 +388,7 @@ def restore_classes():
         if flag in cls.__dict__:
             delattr(cls, flag)
     yield
+    fused_proj.set_mlp_recompute(recompute)
     for cls, name, present, value in saved:
         if present:
             setattr(cls, name, value)
@@ -447,18 +494,19 @@ def test_recompute_and_offload_on_frozen_nf4_layers():
 
 
 def test_offload_of_fused_proj_mlp(restore_classes):
-    """fused_proj.py's MLP (Qwen2MLP of the task's shapes on NF4 layers, its class patch) saves one
-    (gate|up) tensor made inside its autograd.Function, with no grad_fn: it is offloaded, the
-    windows are one tensor (one layer), each backward step prefetches exactly the layer below,
-    and the results are bit for bit those without the offload."""
+    """fused_proj.py's MLP (Qwen2MLP of the task's shapes on NF4 layers, its class patch) in the
+    offload mode saves one (gate|up) tensor made inside its autograd.Function, with no grad_fn: it
+    is offloaded, the windows are one tensor (one layer), each backward step prefetches exactly the
+    layer below, and the results are bit for bit those without the offload."""
     bnb = pytest.importorskip("bitsandbytes")
     from transformers import Qwen2Config
     from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
 
-    from solution.fused_proj import patch_qwen2_mlp_fused
+    from solution.fused_proj import patch_qwen2_mlp_fused, set_mlp_recompute
     from solution.offload import Offloader
 
     patch_qwen2_mlp_fused()
+    set_mlp_recompute(False)  # the offload mode (patch_mlp_memory("offload") with the fused MLP)
     torch.manual_seed(0)
     hidden, inter, rows, layers = 1536, 8960, TOKENS, 4
     config = Qwen2Config(hidden_size=hidden, intermediate_size=inter)
@@ -579,17 +627,40 @@ def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
     from soup_cli.trainer import sft
     from transformers.models.qwen2 import modeling_qwen2
 
-    from solution.offload import patch_mlp_memory
+    from solution import fused_proj
+    from solution.offload import DEFAULT_MODE, patch_mlp_memory
+
+    mlp_cls = modeling_qwen2.Qwen2MLP
+    monkeypatch.setenv("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", "0")  # no 1.5 GB of pinning in a unit test
 
     def applied():
         return (bool(vars(sft.SFTTrainerWrapper).get("_soup_mlp_offload")),
-                bool(vars(modeling_qwen2.Qwen2MLP).get("_soup_mlp_recompute")))
+                bool(vars(mlp_cls).get("_soup_mlp_recompute")), fused_proj._MLP_MEMORY["recompute"])
 
+    def reset():
+        for cls, flag in ((sft.SFTTrainerWrapper, "_soup_mlp_offload"),
+                          (mlp_cls, "_soup_mlp_recompute")):
+            if flag in vars(cls):
+                delattr(cls, flag)
+
+    # without fused_proj's MLP: recompute patches Qwen2MLP.forward (the fused flag stays as it is)
+    monkeypatch.setattr(mlp_cls, "_soup_fused_proj", False, raising=False)
+    fused_proj.set_mlp_recompute(True)
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "none")
-    assert patch_mlp_memory() == "none" and applied() == (False, False)
+    assert patch_mlp_memory() == "none" and applied() == (False, False, True)
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "swap")
     with pytest.raises(ValueError):
         patch_mlp_memory()
     monkeypatch.setenv("SOUP_SOLUTION_MLP_MEMORY", "Recompute")
-    assert patch_mlp_memory() == "recompute" and applied() == (False, True)
-    assert patch_mlp_memory("offload") == "offload" and applied() == (True, True)
+    assert patch_mlp_memory() == "recompute" and applied() == (False, True, True)
+    assert patch_mlp_memory("offload") == "offload" and applied() == (True, True, True)
+
+    # with it: the fused MLP's own recompute, never the per-module patch on top of it
+    reset()
+    monkeypatch.setattr(mlp_cls, "_soup_fused_proj", True, raising=False)
+    monkeypatch.delenv("SOUP_SOLUTION_MLP_MEMORY")
+    assert DEFAULT_MODE == "offload"
+    assert patch_mlp_memory("recompute") == "recompute" and applied() == (False, False, True)
+    assert patch_mlp_memory("none") == "none" and applied() == (False, False, False)
+    assert patch_mlp_memory("recompute") == "recompute" and applied() == (False, False, True)
+    assert patch_mlp_memory() == "offload" and applied() == (True, False, False)

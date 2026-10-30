@@ -10,39 +10,56 @@ forward, where the fused head adds its chunk of logits: the step's peak.
 
 SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
 
-- offload: saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
+- recompute: with fused_proj.py's MLP, its autograd function saves only its half input x16 (N x
+  1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the (gate|up)
+  GEMM again on the same operands, with the weights it rebuilds for the input gradient anyway (one
+  GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses PCIe. On the
+  T4 (main 4744723, diag runs of one commit) it costs ~50 ms of GPU per step (steps 3+: 24.86 s
+  against 22.52 s with the offload) and does not lower the peak (1979 against 2003 MiB): the
+  offload keeps one or two (gate|up) on the GPU, recompute keeps 28 x16. Worth it only when PCIe is
+  saturated. Without the fused MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate
+  and up (two 4-bit GEMMs) in the backward, same ops in the same order as mlp16.py.
+- offload (default): saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
   tensor of MIN_NUMEL to MAX_NUMEL elements that owns its storage and is not a weight (a parameter,
   a trainable leaf, a view of one, or anything sharing the storage of a parameter or buffer of the
   trained model), i.e. gate and up, is copied to pinned host memory on a side
   stream while the forward goes on. It may have no grad_fn: fused_proj's MLP saves (gate|up) made
   inside its autograd.Function, where grad mode is off. Our reference to the GPU tensor is dropped
-  once its copy is done; beyond `max_inflight` copies in flight the forward waits for the oldest,
-  so the CPU cannot run many layers ahead of the GPU with every copied tensor still counted as
-  allocated. The backward gets each tensor back with an H2D copy, and asking for one starts the
+  once its copy is done; beyond `max_inflight` copies in flight the oldest is dropped behind a wait
+  of its stream for its copy (on the GPU, the CPU goes on), so the copied tensors do not pile up as
+  allocated while the CPU runs layers ahead of the GPU. The backward gets each tensor back with an H2D copy, and asking for one starts the
   copies of the `prefetch` tensors saved just before it on the side stream (the backward walks the
   layers in reverse), so the next layer's gate/up arrive during this layer's backward. Both
   windows default to one layer: the tensors one MLP saves (saved_per_layer). The pinned memory is a stack of slabs: a step pushes in forward order, the backward
   releases in reverse, so the stack grows to the largest step once and is reused after that
   (pinning costs about 1 s per GB here, so it must not be paid per step or per size class).
-- recompute: Qwen2MLP.forward saves only its fp16 input (N x 1536) and recomputes gate and up (two
-  4-bit GEMMs) in the backward. Same ops in the same order as mlp16.py, so the same numbers.
-- none: nothing.
+  With the fused MLP it saves (gate|up) for the hooks to take (set_mlp_recompute(False)).
+- none: nothing (the fused MLP saves (gate|up) and it stays on the GPU).
 
-Stream rules of the offload (current = the stream the forward or backward runs on, side = ours):
+Stream rules of the offload (current = the stream the forward or backward runs on, side = ours,
+home = the stream a GPU tensor was allocated on: the caching allocator reuses its block only for
+later allocations on home). No record_stream and no CPU wait on the training path (one stream for
+the forward and the backward): every hazard is closed by making home wait for an event, so the CPU
+keeps running ahead of the GPU and the allocator never has stream uses to track:
 - D2H: side waits for an event recorded on current after the tensor was produced; the GPU tensor
-  stays referenced (inflight) until the copy's event has completed, or gets record_stream(side)
-  when the backward takes it before that;
+  stays referenced (inflight) until its copy's event has completed, or, past `max_inflight` copies
+  in flight, home waits for that event and the reference is dropped (later work on home, including
+  any reuse of the block, comes after the copy); the backward taking the tensor before that makes
+  home wait for the copy the same way;
 - a pinned slot is rewritten only after every earlier H2D read of it: reads on side are ordered by
   the stream, reads on current leave an event that side waits for before its next D2H;
-- prefetch: the GPU tensor is allocated on current, side waits for current before writing it (the
-  block may still be in use by earlier work of current), current waits for the copy's event before
-  using it, and record_stream(side) covers a prefetched tensor that is dropped unused.
+- prefetch: the GPU tensor is allocated on current (home), side waits for current before writing it
+  (the block may still be in use by earlier work of current), current waits for the copy's event
+  before using it; a prefetched tensor dropped unused makes home wait for its copy first.
+A tensor used on another stream than its home (two backward streams: not this training) falls back
+to record_stream.
 
 Knobs for experiments (environment): SOUP_SOLUTION_OFFLOAD_MIN_NUMEL, SOUP_SOLUTION_OFFLOAD_INFLIGHT,
 SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). bench_offload.py
 measures time and peak of the three modes and the pinning speed of the machine.
 """
 
+import atexit
 import collections
 import contextlib
 import os
@@ -59,6 +76,11 @@ DEFAULT_MODE = "offload"
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
 SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
+# pinned ahead by patch_mlp_memory("offload"): the stack of the task's largest step (1427 tokens, 6
+# slabs); a larger step pins more on demand. On the T4 a slab takes 130 ms of cudaHostAlloc, which
+# holds the forward up when the stack grows during training (the "stalls in torch.empty" of the
+# d9f60bb trace): 6 of them per run.
+PREPIN_MB = 1536
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
@@ -93,8 +115,9 @@ def _is_weight(tensor):
 def prepin(megabytes):
     """Pin about `megabytes` of host memory in SLAB_BYTES slabs on a daemon thread, so that the
     offload does not pin during the first steps. Pinning holds up other CUDA calls of the process
-    while it runs (measured on WSL2), so it only helps while the process does no CUDA work yet:
-    Python imports before the model load."""
+    while it runs (measured on WSL2), so it only helps while the process does little CUDA work:
+    imports, the model load. The thread is joined at exit: a daemon thread still inside
+    cudaHostAlloc while Python finalizes can abort the process (a short pytest run)."""
     count = -(-int(megabytes) // (SLAB_BYTES >> 20))
 
     def work():
@@ -105,6 +128,7 @@ def prepin(megabytes):
 
     thread = threading.Thread(target=work, name="soup-offload-prepin", daemon=True)
     thread.start()
+    atexit.register(thread.join)
     return thread
 
 
@@ -165,12 +189,17 @@ class _Saved:
     in flight (the original) or after a prefetch (with `ready`, the H2D's event)."""
 
     __slots__ = ("shape", "dtype", "device", "index", "slot", "host", "copied", "gpu", "ready",
-                 "__weakref__")
+                 "home", "__weakref__")
 
     def __del__(self):
         slot = getattr(self, "slot", None)
         if slot is not None:
             slot.released = True
+        if getattr(self, "gpu", None) is not None and getattr(self, "ready", None) is not None:
+            try:  # a prefetched tensor never unpacked: its block is not reused before the copy
+                self.home.wait_event(self.ready)
+            except Exception:  # noqa: BLE001 - interpreter shutdown
+                pass
 
 
 class Offloader:
@@ -220,7 +249,8 @@ class Offloader:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
-        side.wait_event(torch.cuda.current_stream(tensor.device).record_event())
+        home = torch.cuda.current_stream(tensor.device)
+        side.wait_event(home.record_event())
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
@@ -230,14 +260,14 @@ class Offloader:
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
         saved.slot, saved.host, saved.copied = slot, host, side.record_event()
-        saved.gpu, saved.ready = tensor, None
+        saved.gpu, saved.ready, saved.home = tensor, None, home
         saved.index = self.count
         self.count += 1
         self.by_index[saved.index] = saved
         inflight.append(saved)
         while len(inflight) > self.max_inflight:
             oldest = inflight.popleft()
-            oldest.copied.synchronize()
+            oldest.home.wait_event(oldest.copied)  # on the GPU: the CPU goes on
             oldest.gpu = None
             self.stats["waited"] += 1
         self.stats["offloaded"] += 1
@@ -258,12 +288,14 @@ class Offloader:
                 self.stats["fetched"] += 1
             elif saved.ready is not None:
                 current.wait_event(saved.ready)
-                tensor.record_stream(current)  # allocated on the stream of an earlier unpack
+                if saved.home != current:
+                    tensor.record_stream(current)
                 saved.gpu = saved.ready = None
                 self.stats["prefetch_hits"] += 1
             else:
-                tensor.record_stream(self.stream)  # the D2H may still be reading it
-                tensor.record_stream(current)  # allocated on the forward's stream
+                saved.home.wait_event(saved.copied)  # the D2H may still be reading it
+                if saved.home != current:
+                    tensor.record_stream(current)
                 saved.gpu = None
                 try:
                     self.inflight.remove(saved)
@@ -286,8 +318,7 @@ class Offloader:
                 waited = True
             with torch.cuda.stream(side):
                 tensor.copy_(saved.host, non_blocking=True)
-            tensor.record_stream(side)
-            saved.gpu, saved.ready = tensor, side.record_event()
+            saved.gpu, saved.ready, saved.home = tensor, side.record_event(), current
             self.stats["prefetched"] += 1
 
     def close(self):
@@ -303,7 +334,7 @@ class Offloader:
         return (f"{s['offloaded']} tensors, {s['bytes'] / 2**30:.2f} GiB to host (windows: "
                 f"{self.max_inflight} in flight, {self.prefetch} prefetched); back: "
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
-                f"{s['still_on_gpu']} still on GPU; forward waited {s['waited']} times; "
+                f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
                 f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}")
 
@@ -443,21 +474,38 @@ def patch_qwen2_mlp_recompute():
 # ----------------------------------------------------------------------------------------------
 
 
+def _fused_mlp():
+    """fused_proj when its Qwen2MLP patch is in place, else None."""
+    try:
+        from transformers.models.qwen2 import modeling_qwen2
+    except Exception:  # noqa: BLE001
+        return None
+    if not getattr(modeling_qwen2.Qwen2MLP, "_soup_fused_proj", False):
+        return None
+    from . import fused_proj
+
+    return fused_proj
+
+
 def patch_mlp_memory(mode=None):
     """Apply SOUP_SOLUTION_MLP_MEMORY=offload|recompute|none (default DEFAULT_MODE), or `mode`
-    when given. Returns the mode applied. recompute replaces Qwen2MLP.forward: call it after
-    mlp16's patch, not before. With offload, SOUP_SOLUTION_OFFLOAD_PREPIN_MB > 0 starts prepin()
-    right away (off by default)."""
+    when given. Returns the mode applied. Call it after mlp16's and fused_proj's MLP patches: with
+    the fused MLP in place it sets what that MLP saves (fused_proj.set_mlp_recompute); without it,
+    recompute replaces Qwen2MLP.forward. With offload, prepin() of SOUP_SOLUTION_OFFLOAD_PREPIN_MB
+    (default PREPIN_MB, 0 = off) starts right away."""
     if mode is None:
         mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "") or DEFAULT_MODE
     mode = mode.strip().lower()
     if mode not in MODES:
         raise ValueError(f"SOUP_SOLUTION_MLP_MEMORY must be one of {MODES}, got {mode!r}")
+    fused = _fused_mlp()
+    if fused is not None:
+        fused.set_mlp_recompute(mode == "recompute")
     if mode == "offload":
         patch_soup_train_offload()
-        megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", 0)
+        megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", PREPIN_MB)
         if megabytes > 0 and torch.cuda.is_available():
             prepin(megabytes)
-    elif mode == "recompute":
+    elif mode == "recompute" and fused is None:
         patch_qwen2_mlp_recompute()
     return mode
