@@ -10,16 +10,16 @@ forward, where the fused head adds its chunk of logits: the step's peak.
 
 SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
 
-- recompute (default): with fused_proj.py's MLP, its autograd function saves only its half input
-  x16 (N x 1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the
-  (gate|up) GEMM again on the same operands, with the weights it rebuilds for the input gradient
-  anyway (one GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses
-  PCIe and no tensor gets record_stream, so the caching allocator never waits for side-stream
-  events (the offload's events stalled the forward 119 ms per step in torch.empty on the T4, and
-  its copies took 176 ms of copy-engine time per step from the weight streaming). Without the fused
-  MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate and up (two 4-bit GEMMs) in
-  the backward, same ops in the same order as mlp16.py, so the same numbers.
-- offload: saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
+- recompute: with fused_proj.py's MLP, its autograd function saves only its half input x16 (N x
+  1536, 2.25 MB at 767 tokens instead of 26 MB of (gate|up)) and its backward runs the (gate|up)
+  GEMM again on the same operands, with the weights it rebuilds for the input gradient anyway (one
+  GEMM more per layer, no dequantization more, bit-identical (gate|up)). Nothing crosses PCIe. On the
+  T4 (main 4744723, diag runs of one commit) it costs ~50 ms of GPU per step (steps 3+: 24.86 s
+  against 22.52 s with the offload) and does not lower the peak (1979 against 2003 MiB): the
+  offload keeps one or two (gate|up) on the GPU, recompute keeps 28 x16. Worth it only when PCIe is
+  saturated. Without the fused MLP: Qwen2MLP.forward saves only its fp16 input and recomputes gate
+  and up (two 4-bit GEMMs) in the backward, same ops in the same order as mlp16.py.
+- offload (default): saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
   tensor of MIN_NUMEL to MAX_NUMEL elements that owns its storage and is not a weight (a parameter,
   a trainable leaf, a view of one, or anything sharing the storage of a parameter or buffer of the
   trained model), i.e. gate and up, is copied to pinned host memory on a side
@@ -59,6 +59,7 @@ SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). be
 measures time and peak of the three modes and the pinning speed of the machine.
 """
 
+import atexit
 import collections
 import contextlib
 import os
@@ -70,11 +71,16 @@ import torch
 from .swiglu import swiglu
 
 MODES = ("offload", "recompute", "none")
-DEFAULT_MODE = "recompute"
+DEFAULT_MODE = "offload"
 
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
 SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
+# pinned ahead by patch_mlp_memory("offload"): the stack of the task's largest step (1427 tokens, 6
+# slabs); a larger step pins more on demand. On the T4 a slab takes 130 ms of cudaHostAlloc, which
+# holds the forward up when the stack grows during training (the "stalls in torch.empty" of the
+# d9f60bb trace): 6 of them per run.
+PREPIN_MB = 1536
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
@@ -109,8 +115,9 @@ def _is_weight(tensor):
 def prepin(megabytes):
     """Pin about `megabytes` of host memory in SLAB_BYTES slabs on a daemon thread, so that the
     offload does not pin during the first steps. Pinning holds up other CUDA calls of the process
-    while it runs (measured on WSL2), so it only helps while the process does no CUDA work yet:
-    Python imports before the model load."""
+    while it runs (measured on WSL2), so it only helps while the process does little CUDA work:
+    imports, the model load. The thread is joined at exit: a daemon thread still inside
+    cudaHostAlloc while Python finalizes can abort the process (a short pytest run)."""
     count = -(-int(megabytes) // (SLAB_BYTES >> 20))
 
     def work():
@@ -121,6 +128,7 @@ def prepin(megabytes):
 
     thread = threading.Thread(target=work, name="soup-offload-prepin", daemon=True)
     thread.start()
+    atexit.register(thread.join)
     return thread
 
 
@@ -480,11 +488,11 @@ def _fused_mlp():
 
 
 def patch_mlp_memory(mode=None):
-    """Apply SOUP_SOLUTION_MLP_MEMORY=recompute|offload|none (default DEFAULT_MODE), or `mode`
+    """Apply SOUP_SOLUTION_MLP_MEMORY=offload|recompute|none (default DEFAULT_MODE), or `mode`
     when given. Returns the mode applied. Call it after mlp16's and fused_proj's MLP patches: with
     the fused MLP in place it sets what that MLP saves (fused_proj.set_mlp_recompute); without it,
-    recompute replaces Qwen2MLP.forward. With offload, SOUP_SOLUTION_OFFLOAD_PREPIN_MB > 0 starts
-    prepin() right away (off by default)."""
+    recompute replaces Qwen2MLP.forward. With offload, prepin() of SOUP_SOLUTION_OFFLOAD_PREPIN_MB
+    (default PREPIN_MB, 0 = off) starts right away."""
     if mode is None:
         mode = os.environ.get("SOUP_SOLUTION_MLP_MEMORY", "") or DEFAULT_MODE
     mode = mode.strip().lower()
@@ -495,7 +503,7 @@ def patch_mlp_memory(mode=None):
         fused.set_mlp_recompute(mode == "recompute")
     if mode == "offload":
         patch_soup_train_offload()
-        megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", 0)
+        megabytes = _env_int("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", PREPIN_MB)
         if megabytes > 0 and torch.cuda.is_available():
             prepin(megabytes)
     elif mode == "recompute" and fused is None:

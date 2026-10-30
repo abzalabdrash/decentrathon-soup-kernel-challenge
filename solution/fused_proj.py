@@ -30,15 +30,16 @@ one addcmul into fp32), and adds the three projections' share to it with one in-
 (`out_dtype=torch.float32`, the masks' 1 / (1 - p) as the addmm's beta).
 
 MLP: x16 once, with zero rows appended up to a multiple of 8 tokens (with N % 8 != 0 cuBLAS runs
-cutlass align1/align2 kernels on the T4, 2-3x slower than its aligned ones, for all five GEMMs of the
-MLP; the zero rows stay zero and are cut off on the way out), gate and up rebuilt into one
+cutlass align1/align2 kernels on the T4, 2-3x slower than its aligned ones, for all five GEMMs of
+the MLP; the zero rows stay zero and are cut off on the way out), gate and up rebuilt into one
 (17920, 1536) buffer and one GEMM computes (gate|up) transposed, (17920, N padded), so that gate and
 up are two contiguous row blocks for the kit's example SwiGLU kernel (it needs contiguous inputs)
-without any copy; down_proj reads the transposed product directly. By default only x16 is kept for the backward,
-which recomputes (gate|up) by the same GEMM with the weights it rebuilds for the input gradient
-anyway (set_mlp_recompute; offload.py's SOUP_SOLUTION_MLP_MEMORY=offload|none keep (gate|up) in half
-instead, as mlp16.py does). The MLP returns half: the base's MLP output is the fp16 GEMM result cast
-to fp32, and the residual add promotes half to fp32 with the same values.
+without any copy; down_proj reads the transposed product directly. (gate|up) in half is kept for the
+backward, as in mlp16.py (offload.py moves it to host memory), or, with
+SOUP_SOLUTION_MLP_MEMORY=recompute (set_mlp_recompute), only x16, and the backward recomputes
+(gate|up) by the same GEMM with the weights it rebuilds for the input gradient anyway. The MLP
+returns half: the base's MLP output is the fp16 GEMM result cast to fp32, and the residual add
+promotes half to fp32 with the same values.
 
 Numerics: the GEMMs, their fp32 accumulation and the half outputs are the base's. What changes is the
 rounding order around them: q/k/v are rounded to half once after the adapter is added (the base
@@ -492,14 +493,15 @@ def _fused_attention(attn, x, position_embeddings, plan):
 # MLP
 
 
-_MLP_MEMORY = {"recompute": True}
+_MLP_MEMORY = {"recompute": False}
 
 
 def set_mlp_recompute(on):
-    """What the fused MLP keeps for its backward: its half input x16 (N x hidden), with (gate|up)
-    recomputed by the same GEMM in the backward (True, the default: no activation crosses PCIe), or
-    (gate|up) itself (False: offload.py's saved-tensor hooks move it to host memory, or it stays on
-    the GPU). offload.patch_mlp_memory sets it from SOUP_SOLUTION_MLP_MEMORY."""
+    """What the fused MLP keeps for its backward: (gate|up) itself (False, the default: offload.py's
+    saved-tensor hooks move it to host memory, or it stays on the GPU), or its half input x16
+    (N x hidden) with (gate|up) recomputed by the same GEMM in the backward (True: no activation
+    crosses PCIe, one GEMM more per layer). offload.patch_mlp_memory sets it from
+    SOUP_SOLUTION_MLP_MEMORY."""
     _MLP_MEMORY["recompute"] = bool(on)
 
 
