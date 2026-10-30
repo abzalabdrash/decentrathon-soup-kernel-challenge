@@ -108,11 +108,20 @@ def _buffer(device, dtype, numel):
 def _weights(bases, dtype, device, offset=0):
     """The dequantized weights of `bases` stacked by rows, (sum of out, in), a view of the shared
     buffer starting at element `offset`. Valid until the next call on this device: every GEMM that
-    reads it is queued on the same stream before the next dequantization overwrites it."""
+    reads it is queued on the same stream before the next dequantization overwrites it. With
+    SOUP_SOLUTION_DEQUANT_PIPE=1 the weight may come from `_PIPE` (dequantized ahead on a side
+    stream into a second buffer)."""
     k = bases[0].in_features
     rows = sum(b.out_features for b in bases)
+    if _PIPE.on and offset == 0 and device.type == "cuda":
+        return _PIPE.weights(bases, dtype, device, rows, k)
     flat = _buffer(device, dtype, offset + rows * k)
     w = flat[offset:offset + rows * k].view(rows, k)
+    return _dequant_into(bases, dtype, w)
+
+
+def _dequant_into(bases, dtype, w):
+    """Dequantizes `bases` into the rows of `w` on the current stream; returns w."""
     if _CPU["diet"]:
         packed = [_nf4_packed(base, dtype) for base in bases]
         if all(p is not None for p in packed):
@@ -131,6 +140,90 @@ def _weights(bases, dtype, device, offset=0):
         dequantize_nf4(base.weight, base.weight.quant_state, dtype, out=w[row:row + n])
         row += n
     return w
+
+
+class _DequantPipe:
+    """Two buffers per (device, dtype) and a side stream: when a weight is handed out, the weight
+    that followed it the last time (learned per call site, the step repeats itself) is dequantized
+    on the side stream into the other buffer, so that its dequantization runs next to the GEMM the
+    caller is about to queue. The side stream first waits for an event recorded on the compute
+    stream before that GEMM (so the other buffer's last reader is done and the layer's weights are
+    in place); the compute stream waits for the prefetch's event before using it. Only weights of
+    the same layer are prefetched: two weights share a weight_stream.py ring slot exactly while that
+    layer is loaded, and the next layer's bytes may still be on their way. A wrong guess costs one
+    wasted dequantization (the buffer is waited for and overwritten). Costs one more buffer of the
+    largest weight (26 MiB on this model)."""
+
+    def __init__(self):
+        self.on = os.environ.get("SOUP_SOLUTION_DEQUANT_PIPE", "0").strip().lower() not in (
+            "0", "false", "no", "")
+        self.state = {}  # (device, dtype) -> dict(buffers, handed, pending, previous)
+        self.next_of = {}  # key of a call -> (key, bases) of the call that followed it
+        self.streams = {}
+        self.slots = {}  # key -> ring slot of its weights (fixed for the run: weight_stream.py)
+        self.stats = {"hits": 0, "misses": 0, "prefetches": 0}
+
+    def _slot(self, key, bases):
+        slot = self.slots.get(key)
+        if slot is None:
+            from .weight_stream import slot_of
+
+            found = {slot_of(b.weight.data) for b in bases}
+            slot = self.slots[key] = found.pop() if len(found) == 1 else "mixed"
+        return slot
+
+    def _buffers(self, st, device, dtype, numel):
+        if st["buffers"] is None or st["buffers"][0].numel() < numel:
+            pending = st["pending"]
+            if pending is not None:  # never free a buffer a prefetch is still writing
+                torch.cuda.current_stream(device).wait_event(pending[2])
+                st["pending"] = None
+            st["buffers"] = [torch.empty(numel, dtype=dtype, device=device) for _ in range(2)]
+        return st["buffers"]
+
+    def weights(self, bases, dtype, device, rows, k):
+        key = tuple(id(b) for b in bases)
+        st = self.state.setdefault((device, dtype), {"buffers": None, "handed": 1, "pending": None,
+                                                     "previous": None})
+        buffers = self._buffers(st, device, dtype, rows * k)
+        compute = torch.cuda.current_stream(device)
+        pending, st["pending"] = st["pending"], None
+        if pending is not None and pending[0] == key:
+            index = pending[1]
+            compute.wait_event(pending[2])
+            w = buffers[index][:rows * k].view(rows, k)
+            self.stats["hits"] += 1
+        else:
+            if pending is not None:  # a wrong guess: its buffer is free once the side stream is
+                compute.wait_event(pending[2])
+            index = 1 - st["handed"]
+            w = _dequant_into(bases, dtype, buffers[index][:rows * k].view(rows, k))
+            self.stats["misses"] += 1
+        st["handed"] = index
+        if st["previous"] is not None:
+            self.next_of[st["previous"]] = (key, bases)
+        st["previous"] = key
+        guess = self.next_of.get(key)
+        if guess is not None:
+            next_bases = guess[1]
+            next_rows = sum(b.out_features for b in next_bases)
+            next_k = next_bases[0].in_features
+            slot = self._slot(key, bases)
+            if (next_rows * next_k <= buffers[0].numel() and slot != "mixed"
+                    and self._slot(guess[0], next_bases) == slot):
+                side = self.streams.get(device)
+                if side is None:
+                    side = self.streams[device] = torch.cuda.Stream(device)
+                side.wait_event(compute.record_event())
+                other = buffers[1 - index][:next_rows * next_k].view(next_rows, next_k)
+                with torch.cuda.stream(side):
+                    _dequant_into(next_bases, dtype, other)
+                st["pending"] = (guess[0], 1 - index, side.record_event())
+                self.stats["prefetches"] += 1
+        return w
+
+
+_PIPE = _DequantPipe()
 
 
 # CPU side of the step (SOUP_SOLUTION_CPU_DIET=0: every launch as before). Every Triton launch of

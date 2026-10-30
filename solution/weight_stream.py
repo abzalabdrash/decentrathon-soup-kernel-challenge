@@ -49,6 +49,7 @@ import torch
 ALIGN = 256  # bytes; every tensor of a slot starts at this alignment (the allocator's is 512)
 
 _STREAMERS = weakref.WeakKeyDictionary()  # decoder layer -> its WeightStreamer
+_SLOT_RANGES = []  # (start, end, streamer id, slot index) of every ring slot alive (slot_of)
 # decoder layer -> _HostLayer: its 4-bit tensors moved to pinned host memory while transformers
 # loaded the model (load_stream.py), waiting for a WeightStreamer to adopt them
 _LOADED = weakref.WeakKeyDictionary()
@@ -371,6 +372,9 @@ class WeightStreamer:
             self._handles.append(layer.register_forward_pre_hook(functools.partial(self._before, i)))
             self._handles.append(layer.register_forward_hook(functools.partial(self._after, i)))
             _STREAMERS[layer] = self
+        for s, slot in enumerate(self._slots):
+            start = slot.data_ptr()
+            _SLOT_RANGES.append((start, start + slot.numel(), id(self), s))
         self.active = True
         torch.cuda.empty_cache()
         self.setup_seconds = time.perf_counter() - started
@@ -497,12 +501,24 @@ class WeightStreamer:
         torch.cuda.synchronize(self.device)
         for layer in self.layers:
             _STREAMERS.pop(layer, None)
+        _SLOT_RANGES[:] = [r for r in _SLOT_RANGES if r[2] != id(self)]
         self._slots = []
         if self._unpin is not None:
             self._unpin()
         for host in self._adopted_hosts:
             host.unpin()
         self._fresh, self._hosts, self._adopted_hosts = None, [], []
+
+
+def slot_of(tensor):
+    """(streamer id, slot index) of the ring slot that holds `tensor`'s bytes, or None for a tensor
+    outside every slot (a layer that is not streamed): two weights in the same slot belong to the
+    same layer for as long as that layer is loaded (fused_proj.py's dequantization pipeline)."""
+    ptr = tensor.data_ptr()
+    for start, end, owner, s in _SLOT_RANGES:
+        if start <= ptr < end:
+            return owner, s
+    return None
 
 
 def _first_device(layer):
