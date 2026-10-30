@@ -1,12 +1,14 @@
-"""Triton compilation of the run's kernels in a background thread while Soup loads the model.
+"""Triton compilation of the run's kernels in a helper process during apply(), and their load in a
+background thread while Soup loads the model.
 
 Every measured run starts with empty compiler caches, so the first training step compiles every
 kernel it meets (Kaggle T4, commit d649c7c: the first two steps took about 4.5 s against 0.9 s for
 two ordinary ones; from the end of apply() to the first step there are about 6 s: the model load,
-3.1 s, and the trainer setup, 2.9 s). Here a daemon thread compiles them ahead, so that the first
-step finds them in Triton's in-memory cache: the 11 variants a real step compiles (rms_norm_rows_fwd
-and _bwd two each, nf4_dequant_kernel, rope_qk_kernel forward and backward, fused_ce_rows_kernel two,
-the example SwiGLU forward and backward) and a rarer third one of fused_ce_rows_kernel.
+3.1 s, and the trainer setup, 2.9 s). Here they are compiled ahead, so that the first step finds
+them in Triton's in-memory cache: the variants a real step compiles (rms_norm_rows_fwd and _bwd two
+each, nf4_dequant_kernel, rope_qk_kernel forward and backward in half for fused_proj.py and in fp32,
+fused_ce_rows_kernel two, the example SwiGLU forward and backward) and a rarer third one of
+fused_ce_rows_kernel.
 
 What makes a launch compile (triton 3.6.0, triton/runtime/jit.py)
 -----------------------------------------------------------------
@@ -42,7 +44,7 @@ How it compiles without running anything
 (`MockTensor`, jit.py:946; its `data_ptr()` is 0, so aligned). The launcher (a small C module built
 with the system C compiler, triton/backends/nvidia/driver.py:685) and the cubin load are left for
 the first real launch (`CompiledKernel.run` -> `_init_handles`, triton/compiler/compiler.py:436-476);
-`compile_kernel` does them in the thread too. Nothing runs on the GPU, so the warm-up cannot change
+`compile_kernel` does them ahead too. Nothing runs on the GPU, so the warm-up cannot change
 what training computes, and the harness does not time it (its `JITFunction.run` wrapper skips
 calls with `warmup=True`; it still counts them as launches in `triton_launches`).
 
@@ -64,25 +66,32 @@ does not count a warm-up of a kernel that training never launches):
 once per class the training launches can take (see above), all classes of one kernel in one
 registration (the workers run registrations side by side). A registration that raises is logged
 and skipped; the others still run. `start_background_warmup()` reads the registry when it is
-called, so `apply()` calls it after the patches.
+called, so `apply()` calls it after the patches. A warm-up registered in this file also runs in
+the helper process (below); one registered from a patch function runs in the thread only.
 
-The thread and the GIL
-----------------------
-The first compile of the process hashes triton's own files, libtriton.so (415 MB) in 1 MB reads
-(`triton_key`, triton/runtime/cache.py:272-298), and the compile, the ptxas and C compiler
-subprocesses and the cubin load drop and retake the GIL many times. While the main thread runs
-Python, each retake waits up to the switch interval (5 ms by default), so the thread lowers it to
-1 ms while it runs and puts it back after (see `_run` for the numbers).
+The helper process, then the thread
+-----------------------------------
+In-process, the compiles fought the main thread for the GIL: the compile, the ptxas and C compiler
+subprocesses and the cubin load drop and retake it many times (Kaggle, d9f60bb: the model load took
+5.0 s with the warm-up thread next to it, 3.1 s alone). So `start_compile_helper()`, first thing in
+apply(), starts `python -m solution.warmup --helper` at nice 10, which compiles every registration
+of this file not marked `gpu` into triton's on-disk cache (TRITON_CACHE_DIR, shared with this
+process) and builds their launchers there too. It sees no GPU (CUDA_VISIBLE_DEVICES is empty), so
+it never creates a CUDA context: triton compiles for a target, and the helper is given this
+device's (see `_offline_driver`). The on-disk key is the hash of triton's own files, the kernel's
+source and specialization, the backend (ptxas version, arch) and the options
+(triton/runtime/cache.py:get_cache_key), all equal in both processes; the launcher is cached under
+the hash of its C source (triton/runtime/build.py:compile_module_from_src). The thread started at
+the end of apply() computes `triton_key` while the helper works, waits for it, then runs every
+registration here, where each kernel is read from the disk cache and its cubin loaded: Kaggle,
+7cca7a0, 14 of 14 kernels loaded from the cache, none compiled here, no C build here, the thread
+done 3.1 s after apply(), during the model load (4.0 s). If the helper fails, the thread compiles
+everything as before. `watch_compiles()` logs any compile or cache load outside the warm-up.
 
-Where to start it
------------------
-At the end of apply(), with `patch_soup_warmup()` (the wait at `train` begin) and
-`watch_compiles()`. RTX 3050 Ti, 3 workers, medians (bench_warmup.py load / apply): the real
-model load takes 2.77 s alone and 2.96 s with the warm-up next to it, which is done 3.27 s after
-the load starts; started before apply() instead, it makes apply() 1.28 s longer (3.05 -> 4.33 s),
-since apply() only imports and leaves the GIL no gaps. Background imports do not pay either:
-trl and datasets imported next to the model load end at 3.38 s, imported first then the load at
-2.69 s. The log line "waited N s for the warmup" at `train` begin shows whether the warm-up fits.
+While the thread does run Python, every GIL retake waits up to the switch interval (5 ms by
+default), so the thread lowers it to 1 ms while it runs and puts it back after (see `_run`).
+At exit, `_shutdown` stops both (see there). The log line "waited N s for the warmup" at `train`
+begin shows whether the warm-up fits.
 """
 
 import atexit
