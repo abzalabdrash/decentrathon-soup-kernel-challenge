@@ -298,6 +298,19 @@ def test_reference_only_for_importable_functions():
     assert warmup._reference("e", functools.partial(rmsnorm.warm_rebuild, object())) is None
 
 
+def test_step_ops_draw_no_random_numbers():
+    """The optimizer / clipping / scaler warm-up runs on its own tensors: the CPU and CUDA random
+    states are the same after it, and it stays out of the helper (it needs the GPU)."""
+    from solution import warmup
+
+    cpu, cuda = torch.get_rng_state(), torch.cuda.get_rng_state()
+    warmup.warm_step_ops()
+    torch.cuda.synchronize()
+    assert torch.equal(torch.get_rng_state(), cpu)
+    assert torch.equal(torch.cuda.get_rng_state(), cuda)
+    assert "step_ops" in warmup.NEEDS_GPU
+
+
 def test_cublas_never_goes_to_the_helper(fresh):
     @fresh.register(name="kernel")
     def kernel():

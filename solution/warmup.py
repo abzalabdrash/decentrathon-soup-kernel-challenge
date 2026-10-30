@@ -235,6 +235,31 @@ def warm_cublas():
     (x @ x).sum().item()
 
 
+@register(name="step_ops", gpu=True)
+def warm_step_ops():
+    # not Triton either: the end of a training step (fp16 loss scaling, gradient clipping at 1.0,
+    # AdamW with weight decay over the fp32 LoRA parameters, all foreach, as the run's
+    # `adamw_torch` / max_grad_norm 1.0 / fp16 set it up) loads its CUDA kernels on first use: in the
+    # first step on Kaggle AdamW's step took 0.13 s and clip_grad_norm_ 0.10 s (startup.py's profile,
+    # ba8c1b3). The same ops here on two small fp32 parameters with an optimizer and a scaler of their
+    # own, plus the first backward (the autograd engine's device thread starts with it): nothing of
+    # the run is touched and no random number is drawn.
+    import torch
+
+    params = [torch.zeros(16, 64, device="cuda", requires_grad=True),
+              torch.zeros(64, 16, device="cuda", requires_grad=True)]
+    optimizer = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01)
+    scaler = torch.amp.GradScaler("cuda")
+    loss = params[0].sum() + params[1].sum()
+    bool(torch.isnan(loss) | torch.isinf(loss))  # the trainer's check of every step's loss
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(params, 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+
+
 @register(name="rms_norm_rows_fwd")
 def warm_rmsnorm_fwd():
     # rows of the fp32 residual stream (strides = 1536, "D"; n_rows is not specialized): the plain

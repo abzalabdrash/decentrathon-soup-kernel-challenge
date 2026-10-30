@@ -4,9 +4,9 @@ Imports (`prepare_imports`, first thing in apply())
 ---------------------------------------------------
 apply() imports what the patches need: transformers' model and generation modules, trl's
 SFTTrainer (and through it peft, bitsandbytes, datasets). Soup imports the same modules later in a
-run without our package, so their cost moves, it does not add. Four parts of it are work that
+run without our package, so their cost moves, it does not add. Five parts of it are work that
 this run does not use, and `prepare_imports` skips them (Kaggle T4, `python -X importtime` of
-apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all four off):
+apply(), commits d9f60bb and ba8c1b3; SOUP_SOLUTION_IMPORT_DIET=0 switches all five off):
 
 - 2.38 s: trl computes `importlib.metadata.packages_distributions()` when imported
   (trl/import_utils.py:25), a read of the metadata of every installed distribution, about a
@@ -28,6 +28,16 @@ apply(), commit d9f60bb; SOUP_SOLUTION_IMPORT_DIET=0 switches all four off):
   `--wandb` flag (soup_cli/commands/train.py:1257), which the run does not use; `report_to` is
   "none". While trl's trainer is imported, `transformers.is_wandb_available` answers False; the
   base trainer keeps that answer (no W&B URL in a model card, as without wandb installed).
+- 0.42 s: transformers' object-detection losses (`transformers.loss`, which modeling_utils imports
+  for its loss mapping) import scipy.optimize (`linear_sum_assignment`, 0.28 s;
+  loss/loss_for_object_detection.py:26-27) and, through `transformers.image_transforms` and
+  `transformers.image_utils` (loss/loss_deformable_detr.py:4, image_utils.py:53-56), torchvision
+  (0.14 s) when they are installed. A causal LM on text never uses them. While `transformers.loss`
+  is imported, `transformers.utils.is_scipy_available` and `is_torchvision_available` answer
+  False; the modules imported in that window keep that answer (as without scipy and torchvision:
+  the DETR-type losses would refuse to run, and transformers' image helpers would decode images
+  with Pillow). Besides those, only accelerate is imported in that window, and it has its own
+  checks.
 - 0.76 s and more: bitsandbytes wraps four functions of its default (CPU fallback) backend in
   `torch.compile` when imported (bitsandbytes/backends/default/ops.py:12-31, 199, 262, 368, 429:
   the compute of dequantize_blockwise, dequantize_4bit and the 32-bit optimizer update), and
@@ -140,7 +150,8 @@ def _not_installed():
     return False
 
 
-_SKIPPED = ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx")  # checked in the log
+_SKIPPED = ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx", "scipy.optimize",
+            "torchvision")  # checked in the log, after apply() and at the first step
 
 
 @contextlib.contextmanager
@@ -184,6 +195,9 @@ def prepare_imports(log=True):
         with _replaced(transformers.utils, "is_sklearn_available", _not_installed):
             _import("transformers.generation.candidate_generator", seconds)
             _import("transformers.data", seconds)  # trl imports its collators
+        with (_replaced(transformers.utils, "is_scipy_available", _not_installed),
+              _replaced(transformers.utils, "is_torchvision_available", _not_installed)):
+            _import("transformers.loss.loss_utils", seconds)
         with _dynamo_disabled():
             _import("bitsandbytes", seconds)
         with distributions_from_transformers():
@@ -395,6 +409,9 @@ def patch_soup_first_step_mark():
             if not self.done:
                 self.done = True
                 mark("first step begin")
+                loaded = [name for name in _SKIPPED if name in sys.modules]
+                print(f"[solution] at the first step, loaded of {', '.join(_SKIPPED)}: "
+                      f"{', '.join(loaded) or 'none'}", flush=True)
 
     def train(self, *args, **kwargs):
         trainer = getattr(self, "trainer", None)
