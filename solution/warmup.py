@@ -102,6 +102,7 @@ import functools
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -812,8 +813,9 @@ def start_background_warmup(log=True):
             _DONE.set()
             return None
         _STATE["begin"] = time.perf_counter()
-        # SOUP_SOLUTION_WARMUP_SKIP=name,...: registrations left out (for measuring what each saves)
-        skip = set(filter(None, os.environ.get("SOUP_SOLUTION_WARMUP_SKIP", "").split(",")))
+        # SOUP_SOLUTION_WARMUP_SKIP=name,name (or name:name, name.name): registrations left out,
+        # for measuring what each one saves
+        skip = set(filter(None, re.split(r"[,:.]", os.environ.get("SOUP_SOLUTION_WARMUP_SKIP", ""))))
         jobs = [(name, fn) for name, fn in WARMUPS if name not in skip]
         _send_late_registrations(jobs)
         thread = threading.Thread(target=_run, args=(jobs, device, log),
