@@ -375,7 +375,10 @@ def restore_classes():
     from solution import fused_proj
 
     recompute = fused_proj._MLP_MEMORY["recompute"]
-    targets = ((sft.SFTTrainerWrapper, ("train", "_soup_mlp_offload", "_soup_offload_previous_train")),
+    targets = ((sft.SFTTrainerWrapper, ("train", "_soup_mlp_offload", "_soup_offload_previous_train",
+                                        "_setup_transformers", "_soup_offload_prepin",
+                                        "_soup_offload_prepin_started",
+                                        "_soup_offload_prepin_previous")),
                (modeling_qwen2.Qwen2MLP, ("forward", "_soup_mlp_recompute", "_soup_original_forward",
                                           "_soup_recompute_previous", "_soup_fused_proj",
                                           "_soup_fused_proj_previous")))
@@ -384,6 +387,7 @@ def restore_classes():
     # solution.apply() may have run in this process (other test files): drop our flags so that
     # the patches go on again, on top of whatever wraps train/forward by now (phases, warm-up)
     for cls, flag in ((sft.SFTTrainerWrapper, "_soup_mlp_offload"),
+                      (sft.SFTTrainerWrapper, "_soup_offload_prepin"),
                       (modeling_qwen2.Qwen2MLP, "_soup_mlp_recompute")):
         if flag in cls.__dict__:
             delattr(cls, flag)
@@ -621,6 +625,47 @@ def test_train_wrapper_offloads_only_for_a_real_cuda_trainer(restore_classes, mo
     trainer.model = trainer.model.cuda()
     assert sft.SFTTrainerWrapper.train(types.SimpleNamespace(trainer=trainer)) == "trained"
     assert len(created) == 1 and created[0].stats["offloaded"] == 1
+
+
+def test_setup_prepin_only_for_a_real_cuda_model(restore_classes, monkeypatch):
+    """The offload's host stack is pinned once Soup's setup has built a model with CUDA
+    parameters, never for Soup's tests with fakes or a CPU model, and only once per process."""
+    from soup_cli.trainer import sft
+
+    from solution import offload
+
+    pinned = []
+    monkeypatch.setattr(offload, "prepin", lambda megabytes: pinned.append(megabytes))
+
+    def fake_setup(self):
+        return "setup"
+
+    monkeypatch.setattr(sft.SFTTrainerWrapper, "_setup_transformers", fake_setup)
+    offload.patch_soup_setup_prepin(512)
+    offload.patch_soup_setup_prepin(512)  # idempotent
+    wrapper = types.SimpleNamespace(model=object())
+    assert sft.SFTTrainerWrapper._setup_transformers(wrapper) == "setup" and pinned == []
+    wrapper.model = torch.nn.Linear(2, 2)
+    assert sft.SFTTrainerWrapper._setup_transformers(wrapper) == "setup" and pinned == []
+    wrapper.model = wrapper.model.cuda()
+    assert sft.SFTTrainerWrapper._setup_transformers(wrapper) == "setup" and pinned == [512]
+    sft.SFTTrainerWrapper._setup_transformers(wrapper)
+    assert pinned == [512]
+
+
+def test_stack_waits_for_a_running_prepin_instead_of_pinning(monkeypatch):
+    """A step that needs a slab while prepin() is still pinning takes the prepin's next slab: the
+    host memory is pinned once, not twice."""
+    from solution import offload
+
+    monkeypatch.setattr(offload, "_SPARE", [])
+    thread = offload.prepin(2 * (offload.SLAB_BYTES >> 20))
+    stack = offload._HostStack()
+    slot, view = stack.push(offload.SLAB_BYTES)  # needs the whole first slab
+    slot2, _ = stack.push(offload.SLAB_BYTES)
+    thread.join()
+    assert view.is_pinned() and stack.prepinned == 2 and len(stack.slabs) == 2
+    assert offload._SPARE == [] and offload._PREPINNING[0] == 0
 
 
 def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
