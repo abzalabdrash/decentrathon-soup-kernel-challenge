@@ -221,9 +221,12 @@ class HeadStreamer:
     prefetched), copy time, and the time the compute stream waited for copies in the head."""
 
     def __init__(self, param, embedding=None, lm_head=None, rows=DEFAULT_ROWS, slots=DEFAULT_SLOTS,
-                 virtual_dtype=torch.float32, prefetch_at=DEFAULT_PREFETCH, norm=None):
-        data = param.data
-        if not torch.cuda.is_available() or not data.is_cuda:
+                 virtual_dtype=torch.float32, prefetch_at=DEFAULT_PREFETCH, norm=None, source=None,
+                 device=None):
+        """`source`: the weight's values when they are not in `param` yet (the loader read them to
+        the host, load_stream.py); then `device` is the GPU the weight belongs on."""
+        data = param.data if source is None else source
+        if not torch.cuda.is_available() or not (data.is_cuda if source is None else device is not None):
             raise HeadSkip("the weight is not on a CUDA device")
         if data.dtype not in (torch.float16, torch.bfloat16):
             raise HeadSkip(f"weight dtype {data.dtype}")
@@ -235,7 +238,8 @@ class HeadStreamer:
 
         started = time.perf_counter()
         self.vocab, self.hidden = data.shape
-        self.dtype, self.device, self.virtual_dtype = data.dtype, data.device, virtual_dtype
+        self.dtype, self.virtual_dtype = data.dtype, virtual_dtype
+        self.device = data.device if source is None else torch.device(device)
         self._ring = None
         self.configure(rows, slots)
         nbytes = data.numel() * data.element_size()
@@ -243,7 +247,7 @@ class HeadStreamer:
         self.host = raw.view(self.dtype).view(self.vocab, self.hidden)
         self.host.copy_(data)
         torch.cuda.synchronize(self.device)
-        self.fp32_out = _fp32_out_gemm_works(self.device)
+        self.fp32_out = None  # probed at the first head: the probe is the process's first cuBLAS call
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._staging, self._staging_done = None, None
         self._spans = collections.deque()
@@ -300,6 +304,15 @@ class HeadStreamer:
     def materialize(self, dtype=None, device=None):
         """The real weight as a new tensor (on the GPU in the virtual dtype by default)."""
         return self.host.to(device or self.device).to(dtype or self.virtual_dtype)
+
+    def set_virtual_dtype(self, dtype):
+        """The dtype the Parameter shows (its placeholder's): fp32 once peft would have cast it."""
+        param = self.param_ref()
+        if param is None or not self.owns(param) or dtype == self.virtual_dtype:
+            return
+        self._placeholder = torch.zeros(1, dtype=dtype, device=self.device).expand(self.vocab, self.hidden)
+        self.virtual_dtype = dtype
+        param.data = self._placeholder
 
     # ---- the ring --------------------------------------------------------------------------
 
@@ -396,6 +409,8 @@ class HeadStreamer:
         idx = torch.empty(n, dtype=torch.int32, device=dev)
         wt = torch.empty(max(n_lab, 1), d, dtype=dtype, device=dev)
         buffer = torch.empty(n * self.rows, dtype=dtype, device=dev)
+        if self.fp32_out is None:
+            self.fp32_out = _fp32_out_gemm_works(self.device)
         self.prefetch()  # a no-op for the chunks prefetched at the final norm (or the embedding)
         with torch.autocast("cuda", enabled=False):
             for c in range(self.n_chunks):
@@ -650,32 +665,88 @@ def _env_int(name, default):
         return default
 
 
+def _norm_of(model):
+    norm = getattr(getattr(_base_model(model), "model", None), "norm", None)
+    return norm if isinstance(norm, torch.nn.Module) else None
+
+
+def load_embedding(model, value, device, log=print):
+    """Called by load_stream.py with the input embedding's values, read to the host by the loader
+    (`value`, a CPU tensor in the dtype the model loads in): they go to pinned host memory and the
+    module gets a placeholder Parameter on `device`, with the lookup and lm_head overrides (the lm_head
+    is tied to it when the load ends). Returns (what to set as the parameter, bytes moved); on any
+    problem the values themselves on `device`, as the loader would have set them."""
+    rows, slots, prefetch_at = _config()
+    try:
+        embedding, lm_head = model.get_input_embeddings(), model.get_output_embeddings()
+        if type(embedding) is not torch.nn.Embedding or type(lm_head) is not torch.nn.Linear:
+            raise HeadSkip("not a plain nn.Embedding / nn.Linear pair")
+        if tuple(value.shape) != (embedding.num_embeddings, embedding.embedding_dim):
+            raise HeadSkip(f"shape {tuple(value.shape)}")
+        param = torch.nn.Parameter(torch.empty(0, dtype=value.dtype), requires_grad=value.is_floating_point())
+        streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, virtual_dtype=value.dtype,
+                                prefetch_at=prefetch_at, norm=_norm_of(model), source=value, device=device)
+    except HeadSkip as exc:
+        log(f"[solution] embedding kept on the GPU at load: {exc}")
+        return value.to(device), 0
+    atexit.register(_report, weakref.ref(streamer), log)
+    return param, streamer.host_bytes
+
+
+def _config():
+    rows = _env_int("SOUP_SOLUTION_HEAD_ROWS", DEFAULT_ROWS)
+    slots = _env_int("SOUP_SOLUTION_HEAD_SLOTS", DEFAULT_SLOTS)
+    prefetch_at = os.environ.get("SOUP_SOLUTION_HEAD_PREFETCH", DEFAULT_PREFETCH).strip().lower()
+    return rows, slots, prefetch_at
+
+
+def _restore_loaded_embedding(model, log=print):
+    """A weight the loader put in host memory goes back to the GPU (streaming declined at prepare)."""
+    try:
+        param = _base_model(model).get_input_embeddings().weight
+    except Exception:  # noqa: BLE001 - not a model with embeddings
+        return
+    streamer = _registered(param)
+    if streamer is not None:
+        streamer.restore()
+        log("[solution] the embedding moved to host memory during the load is back on the GPU")
+
+
 def stream_before_prepare(model, rows=None, slots=None, log=print):
     """Moves the tied weight of a real model to pinned host memory, with an fp32 placeholder (peft
-    is about to cast it). Returns the HeadStreamer, or None with the model untouched."""
-    rows = rows or _env_int("SOUP_SOLUTION_HEAD_ROWS", DEFAULT_ROWS)
-    slots = slots or _env_int("SOUP_SOLUTION_HEAD_SLOTS", DEFAULT_SLOTS)
-    prefetch_at = os.environ.get("SOUP_SOLUTION_HEAD_PREFETCH", DEFAULT_PREFETCH).strip().lower()
+    is about to cast it); a weight the loader moved already (load_embedding) only gets the fp32
+    placeholder. Returns the HeadStreamer, or None with the model as it would be without us."""
+    env_rows, env_slots, prefetch_at = _config()
+    rows, slots = rows or env_rows, slots or env_slots
     try:
         if not isinstance(model, torch.nn.Module) or not torch.cuda.is_available():
             raise HeadSkip("not a CUDA model")
         if getattr(model, "quantization_method", None) in NOT_CAST or getattr(model, "hqq_quantized", False):
             raise HeadSkip("peft does not cast this model's parameters")
         param, embedding, lm_head = _tied_pair(model)
+        loaded = _registered(param)
+        if loaded is not None:
+            if loaded.embedding is not embedding or loaded.lm_head is not lm_head or not loaded.owns(param):
+                raise HeadSkip("the embedding loaded to the host was replaced")
+            loaded.set_virtual_dtype(torch.float32)
+            log(f"[solution] embedding / lm_head weight ({loaded.vocab} x {loaded.hidden} {loaded.dtype}) "
+                f"in pinned host memory since the load: {loaded.host_bytes / 2**20:.0f} MiB; head in chunks "
+                f"of {loaded.rows} rows through {loaded.slots} GPU slots, first chunks copied from the "
+                f"{loaded.prefetch_at}")
+            return loaded
         before = torch.cuda.memory_allocated()
-        norm = getattr(getattr(_base_model(model), "model", None), "norm", None)
         streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, prefetch_at=prefetch_at,
-                                norm=norm if isinstance(norm, torch.nn.Module) else None)
+                                norm=_norm_of(model))
     except HeadSkip as exc:
         log(f"[solution] head streaming skipped: {exc}")
+        _restore_loaded_embedding(model, log)
         return None
     freed = before - torch.cuda.memory_allocated()
     log(f"[solution] embedding / lm_head weight ({streamer.vocab} x {streamer.hidden} {streamer.dtype}) "
         f"in pinned host memory: {streamer.host_bytes / 2**20:.0f} MiB, {freed / 2**20:.0f} MiB freed on "
         f"the GPU, {streamer.setup_seconds:.2f} s; head in chunks of {streamer.rows} rows through "
         f"{streamer.slots} GPU slots ({streamer.slots * streamer.rows * streamer.hidden * 2 / 2**20:.0f} "
-        f"MiB), first chunks copied from the {streamer.prefetch_at}"
-        f"{'' if streamer.fp32_out else ', fp16 gradient GEMM output'}")
+        f"MiB), first chunks copied from the {streamer.prefetch_at}")
     atexit.register(_report, weakref.ref(streamer), log)
     return streamer
 
@@ -757,13 +828,22 @@ def _warm_kernels(rows):
                    num_warps=4)
 
 
-def patch_head_stream(rows=None, slots=None):
+def patch_head_stream(rows=None, slots=None, load=None):
     """Streams the head during Soup's setup: peft's prepare_model_for_kbit_training (called inside
     SFTTrainerWrapper._setup_transformers) first moves the weight to the host, and the end of
-    _setup_transformers checks the result (finish_setup). Fake modules in Soup's regression tests
-    and calls outside Soup's SFT setup take the original paths."""
+    _setup_transformers checks the result (finish_setup). With `load` (default: SOUP_SOLUTION_LOAD_STREAM,
+    on) the weight goes to the host while transformers loads it (load_stream.py) and never reaches the
+    GPU. Fake modules in Soup's regression tests and calls outside Soup's SFT setup take the original
+    paths."""
     import peft
     from soup_cli.trainer import sft as soup_sft
+
+    if load is None:
+        load = os.environ.get("SOUP_SOLUTION_LOAD_STREAM", "1") not in ("0", "false", "no")
+    if load:
+        from .load_stream import patch_loader
+
+        patch_loader(embedding=True)
 
     rows = rows or _env_int("SOUP_SOLUTION_HEAD_ROWS", DEFAULT_ROWS)
     slots = slots or _env_int("SOUP_SOLUTION_HEAD_SLOTS", DEFAULT_SLOTS)
@@ -795,6 +875,7 @@ def patch_head_stream(rows=None, slots=None):
                     stream_before_prepare(model, rows, slots)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[solution] head streaming skipped: {exc!r}")
+                    _restore_loaded_embedding(model)
             return prepare(model, *args, **kwargs)
 
         prepare_model_for_kbit_training._soup_head_stream = True

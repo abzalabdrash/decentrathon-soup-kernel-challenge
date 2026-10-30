@@ -304,7 +304,7 @@ def test_stream_memory():
 
     streamer = WeightStreamer(blocks, slots=2)
     try:
-        assert streamer._host.is_pinned() and streamer.host_bytes == sum(streamer.layer_bytes)
+        assert all(h.is_pinned() for h in streamer._hosts) and streamer.host_bytes == sum(streamer.layer_bytes)
         freed = base_allocated - torch.cuda.memory_allocated()
         streamed = sum(streamer.layer_bytes) - streamer.slots * streamer.slot_bytes
         assert streamer.layer_bytes[0] > 24_000_000  # 46.8 M NF4 weights and their scales
