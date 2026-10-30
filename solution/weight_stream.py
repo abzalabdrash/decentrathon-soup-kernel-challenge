@@ -22,8 +22,10 @@ Order of the copies (host -> GPU on a side stream, from pinned memory, so they o
   queued when it was issued (the layer that last used that slot, i+d-K <= i-1, is queued by then);
 - backward: a tiny identity autograd function on the layer's output fires when the gradient reaches
   the layer, i.e. right before the layer's own backward; it does the same in the other direction
-  (wait for layer i, start i-1 .. i-K+1). The backward of every 4-bit matmul of layer i+1 comes
-  before it: their input gradients all flow into that gradient;
+  (wait for layer i, start i-1 .. i-K+1). Every weight rebuild in the backward of layer i+1
+  (bitsandbytes' MatMul4Bit, nf4.py, fused_proj.py's qkv / o / gate|up / down) comes before it:
+  their input gradients all flow into that gradient. Those rebuilds read `module.weight` and its
+  quant state when they run, i.e. the layer's slot;
 - the forward ends with the last K layers resident, so the backward starts without waiting, and
   the backward ends with layers 0 .. K-1 resident for the next step.
 A layer called out of this order (an eval forward, generation) loads what it needs on the spot: the
@@ -36,7 +38,9 @@ backward; streaming is not set up then.
 """
 
 import atexit
+import collections
 import functools
+import os
 import time
 import weakref
 
@@ -78,15 +82,19 @@ def pinned_host_buffer(nbytes, owner):
     return buffer, weakref.finalize(owner, _unregister, buffer)
 
 
-def _layer_tensors(layer, device):
+def _layer_tensors(layer, device, only=None):
     """[(owner, field, tensor)] of the big tensors of every 4-bit linear layer inside `layer`:
-    (module, 'weight', packed weight), (quant_state, 'absmax', ...), (state2, 'absmax', ...)."""
+    (module, 'weight', packed weight), (quant_state, 'absmax', ...), (state2, 'absmax', ...).
+    `only`: a set of module name parts; then only the layers whose dotted name inside `layer` has
+    one of them ({'mlp'}: gate_proj, up_proj, down_proj)."""
     import bitsandbytes as bnb
     from bitsandbytes.functional import QuantState
 
     found = []
     for name, module in layer.named_modules():
         if not isinstance(module, bnb.nn.Linear4bit):
+            continue
+        if only and not only.intersection(name.split(".")):
             continue
         weight = module.weight
         state = getattr(weight, "quant_state", None)
@@ -146,10 +154,16 @@ class _LayerExit(torch.autograd.Function):
 class WeightStreamer:
     """Moves the 4-bit weights of `layers` (called in this order) to pinned host memory and keeps
     `slots` of them on the GPU, loaded ahead of the compute. Construction does the move; `restore()`
-    puts every layer back into tensors of its own on the GPU and removes the hooks."""
+    puts every layer back into tensors of its own on the GPU and removes the hooks. `only`: stream
+    only the 4-bit layers with one of these name parts (e.g. {'mlp'}), the rest stays on the GPU.
 
-    def __init__(self, layers, slots=2):
+    Timing (CUDA events, read without blocking as they complete, see `stats()`): every copy on the
+    copy stream, and the time the compute stream spends in each wait for a layer's copy (an event
+    right before the wait and one right after it), forward and backward apart."""
+
+    def __init__(self, layers, slots=2, only=None):
         layers = list(layers)
+        only = frozenset(only) if only else None
         if not torch.cuda.is_available():
             raise StreamSkip("no CUDA")
         if not isinstance(slots, int) or slots < 2:
@@ -168,7 +182,7 @@ class WeightStreamer:
         plans, sizes, seen = [], [], set()
         for layer in layers:
             offset, plan = 0, []
-            for owner, field, tensor in _layer_tensors(layer, self.device):
+            for owner, field, tensor in _layer_tensors(layer, self.device, only):
                 if tensor.data_ptr() in seen:
                     raise StreamSkip("a 4-bit tensor shared between layers")
                 seen.add(tensor.data_ptr())
@@ -178,7 +192,7 @@ class WeightStreamer:
             sizes.append(offset)
 
         started = time.perf_counter()
-        self.layers, self.slots, self.n = layers, slots, len(layers)
+        self.layers, self.slots, self.n, self.only = layers, slots, len(layers), only
         self.layer_bytes = sizes
         self.slot_bytes = max(sizes)
         self._starts = [0]
@@ -206,9 +220,16 @@ class WeightStreamer:
         self._owner = [-1] * slots
         self.loads = 0  # layer copies issued
         self.late_loads = 0  # of them, issued when the layer was already due (not prefetched)
+        self._spans = collections.deque()  # (kind, begin event, end event, bytes) not yet read
+        self._spare_events = []
+        self._reset_timing()
         for j in range(slots):
             self._load(j)
         self._copy_stream.synchronize()
+        self._harvest(block=True)
+        # host -> GPU bandwidth of the first K layer copies, measured before anything else runs
+        self.setup_copy_gbps = self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None
+        self._reset_timing()
         self._handles = []
         for i, layer in enumerate(layers):
             self._handles.append(layer.register_forward_pre_hook(functools.partial(self._before, i)))
@@ -225,15 +246,60 @@ class WeightStreamer:
     def _host_layer(self, j):
         return self._host[self._starts[j]:self._starts[j + 1]]
 
+    def _reset_timing(self):
+        self.copy_ms, self.copy_bytes, self.copies_timed = 0.0, 0, 0
+        self.wait_ms = {1: 0.0, -1: 0.0}  # compute stream waiting for copies: forward, backward
+        self.waits = {1: 0, -1: 0}
+
+    def _event(self):
+        return self._spare_events.pop() if self._spare_events else torch.cuda.Event(enable_timing=True)
+
+    def _harvest(self, block=False):
+        """Adds up the spans whose end event has completed (all of them with block=True)."""
+        while self._spans:
+            kind, begin, end, nbytes = self._spans[0]
+            if block:
+                end.synchronize()
+            elif not end.query():
+                break
+            ms = begin.elapsed_time(end)
+            if kind == "copy":
+                self.copy_ms += ms
+                self.copy_bytes += nbytes
+                self.copies_timed += 1
+            else:
+                self.wait_ms[kind] += ms
+                self.waits[kind] += 1
+            self._spans.popleft()
+            self._spare_events += (begin, end)
+
+    def stats(self):
+        """Copies and waits so far (synchronizes the device to read the last events)."""
+        if self._spans:
+            torch.cuda.synchronize(self.device)
+            self._harvest(block=True)
+        return {
+            "loads": self.loads, "late_loads": self.late_loads,
+            "copies_timed": self.copies_timed, "copy_ms": self.copy_ms,
+            "copy_gbps": self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None,
+            "setup_copy_gbps": self.setup_copy_gbps,
+            "wait_forward_ms": self.wait_ms[1], "wait_backward_ms": self.wait_ms[-1],
+            "waits_forward": self.waits[1], "waits_backward": self.waits[-1],
+        }
+
     def _load(self, j):
         """Starts the copy of layer j into its slot on the copy stream, after the compute queued so
         far (which includes every use of the slot's previous layer)."""
         s = j % self.slots
         self._free[s].record(torch.cuda.current_stream(self.device))
+        begin, end = self._event(), self._event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
+            begin.record(self._copy_stream)
             self._slots[s][:self.layer_bytes[j]].copy_(self._host_layer(j), non_blocking=True)
+            end.record(self._copy_stream)
             self._ready[s].record(self._copy_stream)
+        self._spans.append(("copy", begin, end, self.layer_bytes[j]))
         self._owner[s] = j
         self.loads += 1
 
@@ -246,7 +312,13 @@ class WeightStreamer:
         if self._owner[s] != i:
             self._load(i)
             self.late_loads += 1
-        torch.cuda.current_stream(self.device).wait_event(self._ready[s])
+        compute = torch.cuda.current_stream(self.device)
+        begin, end = self._event(), self._event()
+        begin.record(compute)
+        compute.wait_event(self._ready[s])
+        end.record(compute)
+        self._spans.append((step, begin, end, 0))
+        self._harvest()
         for d in range(1, self.slots):
             j = i + d * step
             if j < 0 or j >= self.n:
@@ -323,10 +395,11 @@ def streamer_of(model):
     return None
 
 
-def stream_model_weights(model, slots=2, log=print):
+def stream_model_weights(model, slots=2, log=print, only=None):
     """Streams the 4-bit weights of the decoder layers of a real CUDA Qwen2 model in NF4/FP4
     (bitsandbytes). Returns the WeightStreamer, or None when the model is not one (fake modules,
-    CPU, not quantized, gradient checkpointing): then nothing is changed."""
+    CPU, not quantized, gradient checkpointing): then nothing is changed. A model streamed already
+    returns its streamer as it is."""
     if not isinstance(model, torch.nn.Module) or not torch.cuda.is_available():
         return None
     existing = streamer_of(model)
@@ -339,35 +412,59 @@ def stream_model_weights(model, slots=2, log=print):
         if getattr(model, "is_gradient_checkpointing", False):
             raise StreamSkip("gradient checkpointing would rerun the layers in the backward")
         before = torch.cuda.memory_allocated()
-        streamer = WeightStreamer(layers, slots)
+        streamer = WeightStreamer(layers, slots, only)
     except StreamSkip as exc:
         log(f"[solution] weight streaming skipped: {exc}")
         return None
     freed = before - torch.cuda.memory_allocated()
-    log(f"[solution] 4-bit weights of {streamer.n} layers streamed from pinned host memory: "
+    gbps = streamer.setup_copy_gbps
+    log(f"[solution] 4-bit weights of {streamer.n} layers streamed from pinned host memory"
+        f"{'' if not only else ' (only ' + ','.join(sorted(only)) + ')'}: "
         f"{streamer.slots} GPU slots x {streamer.slot_bytes / 2**20:.1f} MiB, "
-        f"{freed / 2**20:.0f} MiB freed on the GPU, setup {streamer.setup_seconds:.2f} s")
+        f"{freed / 2**20:.0f} MiB freed on the GPU, setup {streamer.setup_seconds:.2f} s, "
+        f"host -> GPU {'?' if gbps is None else f'{gbps:.1f}'} GB/s")
     atexit.register(_report, weakref.ref(streamer), log)
     return streamer
 
 
 def _report(ref, log):
     streamer = ref()
-    if streamer is not None:
-        log(f"[solution] weight streaming: {streamer.loads} layer copies, "
-            f"{streamer.late_loads} of them not prefetched")
+    if streamer is None:
+        return
+    try:
+        s = streamer.stats()
+    except Exception as exc:  # noqa: BLE001 - CUDA may be gone at exit
+        log(f"[solution] weight streaming: {streamer.loads} layer copies ({exc!r})")
+        return
+    copy = (f"{s['copy_ms'] / s['copies_timed']:.2f} ms per copy at {s['copy_gbps']:.1f} GB/s"
+            if s["copies_timed"] and s["copy_gbps"] else "no timed copies")
+    log(f"[solution] weight streaming: {s['loads']} layer copies, {s['late_loads']} of them not "
+        f"prefetched; {copy}; compute stream waited for copies {s['wait_forward_ms']:.1f} ms in "
+        f"{s['waits_forward']} forward layer calls, {s['wait_backward_ms']:.1f} ms in "
+        f"{s['waits_backward']} backward ones")
 
 
-def patch_weight_stream(slots=2, early=True):
+def _only_from_env():
+    """SOUP_SOLUTION_WEIGHT_STREAM_ONLY: comma-separated module name parts to stream (e.g. 'mlp',
+    or 'gate_proj,up_proj,down_proj'); empty or unset streams all 4-bit layers."""
+    value = os.environ.get("SOUP_SOLUTION_WEIGHT_STREAM_ONLY", "")
+    parts = {p.strip() for p in value.split(",") if p.strip()}
+    return parts or None
+
+
+def patch_weight_stream(slots=2, early=True, only=None):
     """Streams the model's 4-bit weights during Soup's setup.
 
     early=True: right before peft's `prepare_model_for_kbit_training` (when Soup calls it without
     gradient checkpointing), i.e. before it casts the embedding to fp32, so that the setup's peak
     does not hold all 4-bit weights either. In any case once more after
     `SFTTrainerWrapper._setup_transformers` returns (a no-op when the early hook already streamed).
-    Fake modules in Soup's regression tests take the original paths."""
+    Fake modules in Soup's regression tests take the original paths. `only` (default from
+    SOUP_SOLUTION_WEIGHT_STREAM_ONLY): see WeightStreamer."""
     from soup_cli.trainer import sft as soup_sft
 
+    if only is None:
+        only = _only_from_env()
     cls = soup_sft.SFTTrainerWrapper
     if not getattr(cls, "_soup_weight_stream", False):
         original_setup = cls._setup_transformers
@@ -377,7 +474,7 @@ def patch_weight_stream(slots=2, early=True):
             model = getattr(self, "model", None)
             if isinstance(model, torch.nn.Module):
                 try:
-                    stream_model_weights(model, slots)
+                    stream_model_weights(model, slots, only=only)
                 except Exception as exc:  # noqa: BLE001 - an optimisation must not break setup
                     print(f"[solution] weight streaming skipped: {exc!r}")
             return result
@@ -397,7 +494,7 @@ def patch_weight_stream(slots=2, early=True):
             checkpointing = kwargs.get("use_gradient_checkpointing", args[0] if args else True)
             if checkpointing is False and isinstance(model, torch.nn.Module):
                 try:
-                    stream_model_weights(model, slots)
+                    stream_model_weights(model, slots, only=only)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[solution] weight streaming skipped: {exc!r}")
             return original_prepare(model, *args, **kwargs)

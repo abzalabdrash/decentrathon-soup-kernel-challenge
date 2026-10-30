@@ -4,20 +4,24 @@ recomputation in the backward. The rules allow both ("recomputation or offloadin
 task sets them.
 
 With mlp16.py every layer keeps two fp16 tensors for the backward, gate and up (N x 8960, 14.8 MB
-each at the 826 tokens of an average step after unpad.py), about 0.83 GB over 28 layers. They are
-all alive at the end of the forward, where the fused head adds its chunk of logits: the step's peak.
+each at the 826 tokens of an average step after unpad.py), about 0.83 GB over 28 layers; with
+fused_proj.py it is one, (gate|up) as (17920, N padded to 8). They are all alive at the end of the
+forward, where the fused head adds its chunk of logits: the step's peak.
 
 SOUP_SOLUTION_MLP_MEMORY picks one (patch_mlp_memory):
 
 - offload: saved-tensor hooks around the whole SFTTrainerWrapper.train. A saved half-precision CUDA
-  activation (it has a grad_fn and owns its storage) of at least MIN_NUMEL elements, i.e. gate and
-  up, is copied to pinned host memory on a side stream while the forward goes on. Our reference to
-  the GPU tensor is dropped once its copy is done; beyond MAX_INFLIGHT copies in flight the forward
-  waits for the oldest, so the CPU cannot run many layers ahead of the GPU with every copied tensor
-  still counted as allocated. The backward gets each tensor back with an H2D copy, and asking for
-  one starts the copies of the PREFETCH tensors saved just before it on the side stream (the
-  backward walks the layers in reverse), so the next layer's gate/up arrive during this layer's
-  backward. The pinned memory is a stack of slabs: a step pushes in forward order, the backward
+  tensor of MIN_NUMEL to MAX_NUMEL elements that owns its storage and is not a weight (a parameter,
+  a trainable leaf, a view of one, or anything sharing the storage of a parameter or buffer of the
+  trained model), i.e. gate and up, is copied to pinned host memory on a side
+  stream while the forward goes on. It may have no grad_fn: fused_proj's MLP saves (gate|up) made
+  inside its autograd.Function, where grad mode is off. Our reference to the GPU tensor is dropped
+  once its copy is done; beyond `max_inflight` copies in flight the forward waits for the oldest,
+  so the CPU cannot run many layers ahead of the GPU with every copied tensor still counted as
+  allocated. The backward gets each tensor back with an H2D copy, and asking for one starts the
+  copies of the `prefetch` tensors saved just before it on the side stream (the backward walks the
+  layers in reverse), so the next layer's gate/up arrive during this layer's backward. Both
+  windows default to one layer: the tensors one MLP saves (saved_per_layer). The pinned memory is a stack of slabs: a step pushes in forward order, the backward
   releases in reverse, so the stack grows to the largest step once and is reused after that
   (pinning costs about 1 s per GB here, so it must not be paid per step or per size class).
 - recompute: Qwen2MLP.forward saves only its fp16 input (N x 1536) and recomputes gate and up (two
@@ -52,10 +56,9 @@ from .swiglu import swiglu
 MODES = ("offload", "recompute", "none")
 DEFAULT_MODE = "offload"
 
-MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on; nothing else saved per layer is this large
-MAX_INFLIGHT = 2  # copies the forward may run ahead of: one layer's gate and up
-PREFETCH = 2  # tensors fetched ahead of the backward: the next layer's gate and up
-SLAB_BYTES = 256 << 20
+MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
+MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
+SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
@@ -69,6 +72,22 @@ _SPARE_LOCK = threading.Lock()
 def _env_int(name, default):
     value = os.environ.get(name, "").strip()
     return int(value) if value else default
+
+
+def saved_per_layer():
+    """Tensors one Qwen2MLP saves for the backward: 1 with fused_proj.py's MLP ((gate|up) in one
+    buffer), else 2 (gate and up, mlp16.py)."""
+    try:
+        from transformers.models.qwen2 import modeling_qwen2
+    except Exception:  # noqa: BLE001 - no transformers: the plain SwiGLU's two
+        return 2
+    return 1 if getattr(modeling_qwen2.Qwen2MLP, "_soup_fused_proj", False) else 2
+
+
+def _is_weight(tensor):
+    """A parameter, a trainable leaf or a view of one: saved by reference, offloading frees nothing."""
+    base = tensor if tensor._base is None else tensor._base
+    return isinstance(base, torch.nn.Parameter) or (base.requires_grad and base.grad_fn is None)
 
 
 def prepin(megabytes):
@@ -112,7 +131,7 @@ class _HostStack:
         self.prepinned = 0  # slabs taken from prepin()
 
     def push(self, nbytes):
-        """(slot, pinned uint8 view of nbytes), or (None, None) when the cap is reached."""
+        """(slot, pinned uint8 view of nbytes <= SLAB_BYTES), or (None, None) at the cap."""
         slots = self.slots
         while slots and slots[-1].released:
             slots.pop()
@@ -123,19 +142,16 @@ class _HostStack:
         while slab < len(self.slabs) and start + nbytes > self.slabs[slab].numel():
             slab, start = slab + 1, 0
         if slab == len(self.slabs):
-            size = max(SLAB_BYTES, 1 << (nbytes - 1).bit_length())
-            if self.nbytes + size > self.limit:
+            if self.nbytes + SLAB_BYTES > self.limit:
                 return None, None
-            spare = None
-            if size == SLAB_BYTES:
-                with _SPARE_LOCK:
-                    spare = _SPARE.pop() if _SPARE else None
+            with _SPARE_LOCK:
+                spare = _SPARE.pop() if _SPARE else None
             if spare is None:
-                spare = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+                spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
             else:
                 self.prepinned += 1
             self.slabs.append(spare)
-            self.nbytes += size
+            self.nbytes += SLAB_BYTES
         slot = _Slot(slab, start, start + nbytes)
         slots.append(slot)
         return slot, self.slabs[slab][start:start + nbytes]
@@ -161,15 +177,18 @@ class Offloader:
     """The pack/unpack pair of torch.autograd.graph.saved_tensors_hooks (see the module doc)."""
 
     def __init__(self, device=None, min_numel=None, max_inflight=None, prefetch=None,
-                 host_limit=HOST_LIMIT_BYTES):
+                 host_limit=HOST_LIMIT_BYTES, weights=()):
         self.device = torch.device("cuda", torch.cuda.current_device()) if device is None else device
         self.stream = torch.cuda.Stream(self.device)
         self.min_numel = _env_int("SOUP_SOLUTION_OFFLOAD_MIN_NUMEL", MIN_NUMEL) \
             if min_numel is None else min_numel
-        self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", MAX_INFLIGHT) \
+        layer = saved_per_layer()
+        self.max_inflight = _env_int("SOUP_SOLUTION_OFFLOAD_INFLIGHT", layer) \
             if max_inflight is None else max_inflight
-        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", PREFETCH) \
+        self.prefetch = _env_int("SOUP_SOLUTION_OFFLOAD_PREFETCH", layer) \
             if prefetch is None else prefetch
+        # storages of the model's parameters and buffers: never offloaded, whatever aliases them
+        self.weight_storages = {t.untyped_storage().data_ptr() for t in weights}
         self.host = _HostStack(host_limit)
         self.inflight = collections.deque()
         self.reads = []  # events after H2D reads on a current stream, not yet waited for by side
@@ -179,9 +198,12 @@ class Offloader:
         self.stats = collections.Counter()
 
     def pack(self, tensor):
-        if (tensor.dtype not in HALF_DTYPES or tensor.numel() < self.min_numel
-                or not tensor.is_cuda or tensor.grad_fn is None or not tensor.is_contiguous()
-                or tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size()):
+        if (tensor.dtype not in HALF_DTYPES or not self.min_numel <= tensor.numel() <= MAX_NUMEL
+                or not tensor.is_cuda or not tensor.is_contiguous()):
+            return tensor
+        storage = tensor.untyped_storage()
+        if (storage.nbytes() != tensor.numel() * tensor.element_size()
+                or storage.data_ptr() in self.weight_storages or _is_weight(tensor)):
             return tensor
         with self.lock:
             return self._offload(tensor)
@@ -278,7 +300,8 @@ class Offloader:
 
     def summary(self):
         s = self.stats
-        return (f"{s['offloaded']} tensors, {s['bytes'] / 2**30:.2f} GiB to host; back: "
+        return (f"{s['offloaded']} tensors, {s['bytes'] / 2**30:.2f} GiB to host (windows: "
+                f"{self.max_inflight} in flight, {self.prefetch} prefetched); back: "
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
                 f"{s['still_on_gpu']} still on GPU; forward waited {s['waited']} times; "
                 f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
@@ -323,9 +346,11 @@ def patch_soup_train_offload():
     original = cls.train
 
     def train(self, *args, **kwargs):
-        if not _real_cuda_trainer(getattr(self, "trainer", None)):
+        trainer = getattr(self, "trainer", None)
+        if not _real_cuda_trainer(trainer):
             return original(self, *args, **kwargs)
-        with offload_saved_tensors() as offloader:
+        model = trainer.model
+        with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader:
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
         return result

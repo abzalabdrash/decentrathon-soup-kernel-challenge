@@ -170,11 +170,129 @@ def test_stream_matches_resident(slots, matmul_path):
     assert _equal(reference, _step(blocks, x, weight))
 
 
+@pytest.mark.parametrize("slots", [2, 3])
+def test_prefetch_runs_k_minus_1_layers_ahead(slots):
+    """Right after a layer's wait, the ring holds (or is copying into it) that layer and the next
+    K-1 layers in the direction of the pass: with 3 slots the copy of layer i+2 starts at layer i,
+    two layers of compute before it is needed."""
+    from solution.weight_stream import WeightStreamer
+
+    blocks = make_stack(hidden=256, inter=512, kv=64)
+    x, weight = _inputs(tokens=64, hidden=256)
+    streamer = WeightStreamer(blocks, slots=slots)
+    seen = []
+    use = streamer._use
+
+    def traced_use(i, direction):
+        use(i, direction)
+        seen.append((i, direction, set(streamer._owner)))
+
+    streamer._use = traced_use
+    try:
+        _step(blocks, x, weight)
+        _step(blocks, x, weight)
+    finally:
+        streamer.restore()
+    n = len(blocks)
+    assert [(i, d) for i, d, _ in seen] == 2 * ([(i, 1) for i in range(n)]
+                                                 + [(i, -1) for i in reversed(range(n))])
+    for i, direction, owners in seen:
+        ahead = {i + d * direction for d in range(slots) if 0 <= i + d * direction < n}
+        assert owners >= ahead, (i, direction, owners)
+
+
+def test_copy_and_wait_timing():
+    """stats(): every copy after the setup is timed, every wait of the compute stream is timed per
+    direction, and a layer loaded on the spot shows up as forward waiting time."""
+    from solution.nf4 import patch_bnb_matmul4bit
+    from solution.weight_stream import WeightStreamer
+
+    patch_bnb_matmul4bit()
+    blocks = make_stack()
+    x, weight = _inputs()
+    streamer = WeightStreamer(blocks, slots=2)
+    try:
+        assert streamer.setup_copy_gbps > 0.5
+        _step(blocks, x, weight)
+        _step(blocks, x, weight)
+        stats = streamer.stats()
+        n = len(blocks)
+        assert stats["copies_timed"] == stats["loads"] - 2 == 2 * 2 * (n - 2)
+        assert stats["waits_forward"] == 2 * n and stats["waits_backward"] == 2 * n
+        assert stats["copy_gbps"] > 0.5
+        assert stats["wait_forward_ms"] >= 0 and stats["wait_backward_ms"] >= 0
+        before = stats["wait_forward_ms"]
+        with torch.no_grad():
+            run_stack(blocks, x)  # ends with the last layers in the ring
+        _step(blocks, x, weight)
+        stats = streamer.stats()
+        assert streamer.late_loads > 0
+        copy_ms = stats["copy_ms"] / stats["copies_timed"]
+        assert stats["wait_forward_ms"] - before >= 0.5 * copy_ms
+        print(f"\ncopy {copy_ms:.2f} ms at {stats['copy_gbps']:.1f} GB/s (setup "
+              f"{streamer.setup_copy_gbps:.1f}), waits {stats['wait_forward_ms']:.2f} ms forward, "
+              f"{stats['wait_backward_ms']:.2f} ms backward")
+    finally:
+        streamer.restore()
+
+
+def test_stream_only_mlp(matmul_path):
+    """only={gate_proj, up_proj, down_proj}: those stream, q/k/v/o keep their own GPU tensors."""
+    from solution.weight_stream import WeightStreamer, _only_from_env
+
+    blocks = make_stack()
+    x, weight = _inputs()
+    reference = _step(blocks, x, weight)
+    mlp = ("gate_proj", "up_proj", "down_proj")
+    streamer = WeightStreamer(blocks, slots=2, only=set(mlp))
+    try:
+        assert all(len(plan) == 9 for plan in streamer._plans)
+        # 3 x (6.88 MB packed + 215 KB absmax + 3.4 KB scales) of the full layer's 24.14 MB
+        assert 21_000_000 < streamer.layer_bytes[0] < 21_600_000
+        bounds = [(s.data_ptr(), s.data_ptr() + s.numel()) for s in streamer._slots]
+
+        def in_slot(module):
+            return any(a <= module.weight.data_ptr() < b for a, b in bounds)
+
+        for block in blocks:
+            assert all(in_slot(getattr(block, name)) for name in mlp)
+            assert not any(in_slot(getattr(block, name)) for name in ("q_proj", "k_proj", "v_proj",
+                                                                       "o_proj"))
+        assert _equal(reference, _step(blocks, x, weight))
+        assert _equal(reference, _step(blocks, x, weight))
+    finally:
+        streamer.restore()
+    assert _equal(reference, _step(blocks, x, weight))
+
+
+def test_only_from_env(monkeypatch):
+    from solution.weight_stream import _only_from_env
+
+    for value, expected in [("", None), ("mlp", {"mlp"}), (" gate_proj, up_proj ,down_proj ",
+                                                            {"gate_proj", "up_proj", "down_proj"})]:
+        monkeypatch.setenv("SOUP_SOLUTION_WEIGHT_STREAM_ONLY", value)
+        assert _only_from_env() == expected
+    monkeypatch.delenv("SOUP_SOLUTION_WEIGHT_STREAM_ONLY")
+    assert _only_from_env() is None
+
+
+def _quiet_gpu():
+    """No allocations of other threads during a memory measurement: when apply() ran earlier in
+    this process (another test file), its warm-up thread may still be compiling on the GPU."""
+    import sys
+
+    warmup = sys.modules.get("solution.warmup")
+    if warmup is not None:
+        warmup.wait_for_warmup(120)
+    torch.cuda.synchronize()
+
+
 def test_stream_memory():
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
 
     patch_bnb_matmul4bit()
+    _quiet_gpu()
     blocks = make_stack()
     x, weight = _inputs()
     _step(blocks, x, weight)
@@ -297,13 +415,13 @@ def _load_4bit(path):
                                                 device_map={"": 0})
 
 
-def _peft(model):
-    """Soup's adapter (r=16 on q_proj and v_proj; dropout 0 here so that runs compare exactly), with
-    random B so that A gets a gradient too."""
+def _peft(model, dropout=0.0):
+    """Soup's adapter (r=16 on q_proj and v_proj), with random B so that A gets a gradient too.
+    With dropout, every step reseeds the RNG, so that runs compare exactly."""
     from peft import LoraConfig, get_peft_model
 
     torch.manual_seed(1)
-    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.0,
+    model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=dropout,
                                              target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"))
     gen = torch.Generator().manual_seed(2)
     for name, param in model.named_parameters():
@@ -312,26 +430,32 @@ def _peft(model):
     return model
 
 
-def _soup_like(path):
-    from peft import prepare_model_for_kbit_training
+def _original_prepare():
+    """peft's prepare_model_for_kbit_training without the early streaming hook that apply() (run by
+    another test file in this process) may have put around it: the tests decide when to stream."""
+    import peft
 
-    model = prepare_model_for_kbit_training(_load_4bit(path), use_gradient_checkpointing=False)
-    return _peft(model)
+    prepare = peft.prepare_model_for_kbit_training
+    return getattr(prepare, "_soup_original", prepare)
 
 
-def _batch(vocab=512):
+def _soup_like(path, dropout=0.0):
+    model = _original_prepare()(_load_4bit(path), use_gradient_checkpointing=False)
+    return _peft(model, dropout)
+
+
+def _batch(vocab=512, lengths=(40, 31, 17)):
     gen = torch.Generator().manual_seed(3)
-    ids = torch.randint(0, vocab, (3, 40), generator=gen).cuda()
-    mask = torch.ones_like(ids)
-    mask[1, 31:] = 0
-    mask[2, 17:] = 0
+    ids = torch.randint(0, vocab, (len(lengths), max(lengths)), generator=gen).cuda()
+    mask = (torch.arange(ids.shape[1])[None, :] < torch.tensor(lengths)[:, None]).long().cuda()
     labels = ids.masked_fill(mask == 0, -100)
     return ids, mask, labels
 
 
-def _hf_step(model):
-    ids, mask, labels = _batch()
+def _hf_step(model, lengths=(40, 31, 17)):
+    ids, mask, labels = _batch(lengths=lengths)
     model.zero_grad(set_to_none=True)
+    torch.manual_seed(7)
     with torch.autocast("cuda", dtype=torch.float16):
         loss = model(input_ids=ids, attention_mask=mask, labels=labels).loss
     loss.backward()
@@ -339,16 +463,17 @@ def _hf_step(model):
                                       if p.requires_grad]
 
 
-def _varlen_step(model):
+def _varlen_step(model, lengths=(40, 31, 17)):
     """The decoder through unpad.varlen_model_forward with the solution's layer patches."""
     from solution.unpad import pack_batch, varlen_model_forward
 
-    ids, mask, _ = _batch()
+    ids, mask, _ = _batch(lengths=lengths)
     packed, pos, _, spans = pack_batch(ids, mask)
     decoder = model.get_base_model().model
     gen = torch.Generator().manual_seed(4)
     weight = torch.randn(1, packed.shape[1], decoder.config.hidden_size, generator=gen).cuda()
     model.zero_grad(set_to_none=True)
+    torch.manual_seed(7)
     with torch.autocast("cuda", dtype=torch.float16):
         hidden = varlen_model_forward(decoder, packed, pos, spans)
     (hidden.float() * weight).sum().backward()
@@ -361,6 +486,8 @@ def _same(a, b):
 
 
 def _apply_layer_patches():
+    """The layer patches of apply(), in its order."""
+    from solution.fused_proj import patch_qwen2_attention_fused, patch_qwen2_mlp_fused
     from solution.mlp16 import patch_qwen2_mlp_half
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.rmsnorm import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
@@ -373,6 +500,8 @@ def _apply_layer_patches():
     patch_qwen2_decoder_layer()
     patch_bnb_matmul4bit()
     patch_qwen2_rope()
+    patch_qwen2_attention_fused()
+    patch_qwen2_mlp_fused()
 
 
 @pytest.mark.parametrize("path", ["hf", "varlen"])
@@ -384,15 +513,28 @@ def test_tiny_qwen2_4bit(tiny_qwen_dir, path):
     step = _hf_step if path == "hf" else _varlen_step
     model = _soup_like(tiny_qwen_dir)
     assert len(find_decoder_layers(model)) == 5
+    assert streamer_of(model) is None
     reference = step(model)
+    _quiet_gpu()
     allocated = torch.cuda.memory_allocated()
     streamer = stream_model_weights(model, slots=2)
     assert streamer is not None and streamer_of(model) is streamer
-    assert stream_model_weights(model, slots=2) is streamer  # once per model
     try:
         # 7 linear layers per decoder layer, 3 tensors each
         assert all(len(plan) == 21 for plan in streamer._plans)
-        assert torch.cuda.memory_allocated() < allocated
+        streamed = torch.cuda.memory_allocated()
+        assert streamed < allocated
+        # a second call on the same model (the early hook, then the one after Soup's setup) is a
+        # no-op: same streamer, nothing copied, allocated or hooked again
+        loads, handles = streamer.loads, len(streamer._handles)
+        hooks = [len(layer._forward_hooks) + len(layer._forward_pre_hooks)
+                 for layer in find_decoder_layers(model)]
+        assert stream_model_weights(model, slots=2) is streamer
+        assert stream_model_weights(model, slots=3) is streamer
+        assert streamer.loads == loads and len(streamer._handles) == handles
+        assert hooks == [len(layer._forward_hooks) + len(layer._forward_pre_hooks)
+                         for layer in find_decoder_layers(model)]
+        assert torch.cuda.memory_allocated() == streamed
         assert _same(reference, step(model))
         assert _same(reference, step(model))
         assert streamer.late_loads == 0
@@ -400,6 +542,101 @@ def test_tiny_qwen2_4bit(tiny_qwen_dir, path):
         streamer.restore()
     assert streamer_of(model) is None
     assert _same(reference, step(model))
+
+
+@pytest.fixture(scope="module")
+def layer_shaped_qwen_dir(tmp_path_factory):
+    """Qwen2 with the task's layer shapes (hidden 1536, intermediate 8960, 12 q heads and 2 kv heads
+    of 128), 4 layers and a small vocabulary: 375 MB in fp16."""
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    torch.manual_seed(0)
+    config = Qwen2Config(vocab_size=512, hidden_size=HIDDEN, intermediate_size=INTER,
+                         num_hidden_layers=4, num_attention_heads=12, num_key_value_heads=2,
+                         max_position_embeddings=512, tie_word_embeddings=True)
+    path = tmp_path_factory.mktemp("layer_shaped_qwen2")
+    Qwen2ForCausalLM(config).half().save_pretrained(path)
+    return path
+
+
+# the token count of a training step (above bitsandbytes' small-M 4-bit GEMM, which fused_proj and
+# nf4.py leave to bitsandbytes)
+STEP_LENGTHS = (200, 150, 90)
+
+
+def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
+    """fused_proj.py rebuilds a layer's weights in its backward from `module.weight` and its quant
+    state as they are at that moment (dequantize_nf4 into a shared buffer). With streaming every such
+    rebuild must come after the layer's marker brought it into its slot, in the forward and in the
+    backward; with the MLP offload (offload.py) on, a dropout of 0.05 and the GPU kept far behind the
+    CPU at every rebuild, the step still equals the resident one bit for bit. SDPA runs its math
+    backend here: the memory-efficient backward accumulates with atomics on these shapes and differs
+    from run to run without any streaming."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from solution import fused_proj, weight_stream
+    from solution.offload import offload_saved_tensors
+    from solution.weight_stream import find_decoder_layers, stream_model_weights
+
+    _apply_layer_patches()
+    model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
+    layers = find_decoder_layers(model)
+    owner = {id(m): i for i, layer in enumerate(layers) for m in layer.modules()}
+    events, sleep = [], [0]
+    rebuild = fused_proj._weights
+
+    def traced_weights(bases, dtype, device, offset=0):
+        events.append(("rebuild", owner[id(bases[0])], None))
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return rebuild(bases, dtype, device, offset)
+
+    monkeypatch.setattr(fused_proj, "_weights", traced_weights)
+
+    def step():
+        with offload_saved_tensors(), sdpa_kernel(SDPBackend.MATH):
+            return _varlen_step(model, lengths=STEP_LENGTHS)
+
+    reference = step()
+    # fused_proj ran: qkv, o, gate|up and down rebuilt in the forward and again in the backward
+    # (layer 0's qkv not, when the embedding output needs no gradient)
+    per_step = len(events)
+    assert per_step in (8 * len(layers), 8 * len(layers) - 1)
+    events.clear()
+
+    streamer = stream_model_weights(model, slots=2)
+    assert streamer is not None
+    use = streamer._use
+
+    def traced_use(i, direction):
+        events.append(("use", i, direction))
+        use(i, direction)
+
+    streamer._use = traced_use
+    sleep[0] = SLEEP_CYCLES // 3
+    try:
+        assert _same(reference, step())
+        assert _same(reference, step())
+        checked = list(events)
+        # the check sees a backward without the marker's loads: the forward still matches, the
+        # gradients of the layers whose slots hold later layers at the end of the forward do not
+        monkeypatch.setattr(weight_stream._LayerExit, "backward",
+                            staticmethod(lambda ctx, grad: (grad, None, None)))
+        broken = step()
+        assert torch.equal(broken[0], reference[0]) and not _same(reference, broken)
+    finally:
+        streamer.restore()
+
+    current, backward = None, set()
+    for kind, layer, direction in checked:
+        if kind == "use":
+            current = (layer, direction)
+        else:
+            assert current is not None and current[0] == layer, events
+            if current[1] == -1:
+                backward.add(layer)
+    assert backward == set(range(len(layers)))
+    assert sum(kind == "rebuild" for kind, _, _ in checked) == 2 * per_step
 
 
 def test_early_hook_and_adapter_save(tiny_qwen_dir, tmp_path, monkeypatch):
