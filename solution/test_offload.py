@@ -623,6 +623,7 @@ def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
     from solution.offload import DEFAULT_MODE, patch_mlp_memory
 
     mlp_cls = modeling_qwen2.Qwen2MLP
+    monkeypatch.setenv("SOUP_SOLUTION_OFFLOAD_PREPIN_MB", "0")  # no 1.5 GB of pinning in a unit test
 
     def applied():
         return (bool(vars(sft.SFTTrainerWrapper).get("_soup_mlp_offload")),
