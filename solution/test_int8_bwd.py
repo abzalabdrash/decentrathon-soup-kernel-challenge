@@ -38,20 +38,14 @@ def test_nf4_int8_transposed_decode(int8_on):
     assert diff.max().item() <= 1 and (diff > 0).float().mean().item() < 1e-3
 
 
-def test_row_quant_and_scale_epilogue(int8_on):
-    import triton
-
+def test_row_quant(int8_on):
     g = torch.randn(832, 1536, device="cuda").half()
     g[-16:] = 0  # padding rows
-    q = torch.empty(832, 1536, dtype=torch.int8, device="cuda")
-    s = torch.empty(832, dtype=torch.float32, device="cuda")
-    int8_on.quant_rows_int8_kernel[(832,)](g, q, s, 1536, BLOCK=triton.next_power_of_2(1536))
+    q, s = int8_on._quant_rows(g)
     amax = g.float().abs().amax(1)
-    # Triton's fp32 division is not IEEE-rounded: scales to a few ulp, codes to one step at ties
     assert torch.allclose(s, amax / 127.0, rtol=1e-6, atol=0)
     ref = _round(g.float() * torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))[:, None])
-    diff = (q.float() - ref).abs()
-    assert diff.max().item() <= 1 and (diff > 0).float().mean().item() < 1e-3
+    assert torch.equal(q.float(), ref)
     assert torch.all(q[-16:] == 0) and torch.all(s[-16:] == 0)
 
 
