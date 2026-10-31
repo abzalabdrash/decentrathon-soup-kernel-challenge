@@ -250,3 +250,47 @@ rounds + warm run, no pytest): c1 wall 41.53 / 42.53 s, steps 3+ 23.75 / 24.20; 
 steps 3+ 24.00 / 24.04; **alloc peak 225.5 -> 224.1 MiB but reserved 250 -> 270, nvidia-smi 371 ->
 391** (the expanded k/v live from the rebuild to the attention backward and fragment the pool). No
 time gained, a 20 MiB page lost: **stays off**.
+
+### 7. Why s is lower in the jury order (analysis of downloaded logs, no new T4 runs)
+
+Runs (main checkout `runs_kaggle/`): cold full soup-m2-full (ce27a54), m3 (8d2d0bd), m4 (0f9bc57), m6
+(ca6db38), all on the public rows; jury soup-m2-jury (ce27a54, rows 15000:15256, order base / sol /
+sol / base) and soup-m5-jury (6050a09, rows 18000:18256). Tokens per step from TRL's `num_tokens`
+(4 significant digits), step times from `metrics.json`; "per token" = step time at equal token count
+(jury steps matched to full steps within +-25 tokens, median ratio).
+
+| | m2-full | m3 / m4 / m6 full | m2-jury sol1 / sol2 | m5-jury sol1 / sol2 |
+|---|---|---|---|---|
+| s | 1.929 | 1.934 / 1.960 / 1.960 | 1.80 | 1.85 |
+| tokens, steps 3+ | 51,571 | 51,571 | 56,541 (+9.6 %) | 61,986 (+20 %) |
+| our loop / base loop, s | 27.4 / 61.8 | 29.5-27.8 / 65.0-62.3 | 33.1, 33.6 / 65.9, 68.3 | 33.0, 32.3 / 66.3, 69.6 |
+| our wall - loop, s | 16.7 | 15.7 / 16.1 / 15.6 | 15.9 / 16.1 | 17.4 / 17.3 |
+| first step after process start, s | 15.0 | 14.4 / 14.4 / 14.7 | 14.8 / 15.1 | 16.4 / 16.3 |
+| setup host -> GPU, GB/s | 10.6 | 10.8 / 10.4 / 10.8 | 11.0 / 10.6 | 11.2 / 10.8 |
+| ours per 1k tokens, ms | 507 | 548 / 535 / 514 | 561 / 569 | 509 / 498 |
+| ours at equal tokens vs full | | | 1.03-1.12 | 0.95-1.01 |
+| base at equal tokens vs full | | | 0.95-1.00 | 0.88-0.93 |
+| 2nd run / 1st run in session, loop | | | ours +1.5 %, base +3.7 % | ours -2.3 %, base +4.8 % |
+
+Findings (facts from the table):
+- The whole difference is the training loop: loop ratio base/ours 2.25 (m2-full) against 2.02 (m2-jury)
+  and 2.08 (m5-jury). Start-up is the same (apply 3.3-3.6 s, setup 3.1-3.4 s, first step 14.4-15.1 s
+  after process start) except m5's prolog: `apply begin` at +6.5 s against +5.3-5.8 (the harness and
+  imports before apply(), host time, ~1 s in that one session).
+- No sign of a slower host or PCIe: the load's host -> GPU rate 10.4-11.2 GB/s and its tensor loop
+  1.9-2.2 s in every run; weight streaming and the head report 0 late copies everywhere (their waits are
+  untimed by default, so not in the logs).
+- Heat inside the jury session costs the base more than us: our second run -2.3 to +1.5 %, the base's
+  last run +3.7 to +4.8 % (it raises the base mean, which helps s).
+- The jury rows carry 10-20 % more tokens per step, and at equal token count our step loses 6-12 %
+  against the base's relative to the public rows, in both jury sessions against all four cold ones
+  (m2-jury: ours slower per token, base unchanged; m5-jury: ours unchanged, base cheaper per token).
+- Session spread on the same rows: ours 507-548 ms per 1k tokens, base 1,135-1,212, moving together.
+
+Not confirmed: which property of the rows does it (padding per batch for the base, row lengths for
+attention, labelled share for our head). The per-row token counts are in each run's `rewind.jsonl`,
+which tools/kaggle_run.py does not download (file pattern), and the jury batches are not in the logs.
+
+My opinion: nothing to do about hot-card sensitivity on our side (our runs vary +-2 % within a session,
+less than the base). The jury gap is per-token GPU cost on token-heavy rows; levers are per-token ones
+(the int8 MLP backward, measured -12 to -36 ms per step), not start-up or CPU.
