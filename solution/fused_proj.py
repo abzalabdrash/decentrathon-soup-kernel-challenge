@@ -918,6 +918,8 @@ def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, token_ma
     cos, sin = _tables(cos, sin)
     if token_major:
         q4, k4, v4 = _rope_token_major(qkv, n, plan, cos, sin)
+    elif _ATTN["views"]:  # the head-major views _heads made: transposes of the token-major ones
+        q4, k4, v4 = (t.transpose(1, 2) for t in _rope_token_major(qkv, n, plan, cos, sin))
     else:
         q4 = _heads(torch.empty((n, nq), dtype=half, device=x.device), n, plan.heads, plan.head_dim)
         k4 = _heads(torch.empty((n, nk), dtype=half, device=x.device), n, plan.kv_heads,
@@ -967,6 +969,14 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False):
                              g, (n * row, dim, row), g[:, nq:], (n * row, dim, row), cos, sin, n,
                              plan.heads, plan.kv_heads, dim, backward=True)
         g.as_strided((1, n, plan.kv_heads, dim), (n * row, row, dim, 1),
+                     g.storage_offset() + nq + nk).copy_(grad_v)
+    elif _ATTN["views"]:  # head-major gradients: their own strides, g's columns as _heads views them
+        grad_q, grad_k = _last_dim_contiguous(grad_q), _last_dim_contiguous(grad_k)
+        row, dim = g.stride(0), plan.head_dim
+        rope._launch_strided(grad_q, grad_q.stride()[:3], grad_k, grad_k.stride()[:3],
+                             g, (n * row, dim, row), g[:, nq:], (n * row, dim, row), cos, sin, n,
+                             plan.heads, plan.kv_heads, dim, backward=True)
+        g.as_strided((1, plan.kv_heads, n, dim), (n * row, dim, row, 1),
                      g.storage_offset() + nq + nk).copy_(grad_v)
     else:
         gq4 = _heads(g[:, :nq], n, plan.heads, plan.head_dim)
@@ -1033,11 +1043,18 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False):
     return (grad_x, *grads)
 
 
-# SOUP_SOLUTION_ATTN_ONE_FUNCTION=0: a layer's attention as three autograd nodes (_QKVRope, unpad's
-# variable-length attention, _Linear4bitHalf), as before. On (the default) a recomputing layer's are
-# one node, _AttnBlock (task C1: two Python round trips into autograd less per layer and direction,
-# and the transposes and reshapes between the three nodes with their own nodes)
-_ATTN["one_function"] = os.environ.get("SOUP_SOLUTION_ATTN_ONE_FUNCTION", "1").strip().lower() \
+# SOUP_SOLUTION_ATTN_ONE_FUNCTION=1: a recomputing layer's attention as one autograd node, _AttnBlock,
+# instead of three (_QKVRope, unpad's variable-length attention, _Linear4bitHalf): two Python round
+# trips into autograd less per layer and direction. Off by default: autograd keeps a node's incoming
+# gradient until the node returns, so the o_proj output's gradient (N x D half) stays alive through
+# the attention and q/k/v backward (T4, soup-c1-abba2: allocated peak 234.6 -> 238.8 MiB, 4.2 MiB =
+# the 1,440-token step's N x 1536 halves, one 20 MiB segment of reserved more)
+_ATTN["one_function"] = os.environ.get("SOUP_SOLUTION_ATTN_ONE_FUNCTION", "0").strip().lower() \
+    not in ("0", "false", "no", "")
+# SOUP_SOLUTION_FEWER_VIEWS=1 (task C1): rope launched from strides (rope._launch_strided, the same
+# kernel arguments) and the recompute's q, k, v made in the kernel's token-major layout directly,
+# without the head-major views that the next op turned back (~20 view ops less per layer and step)
+_ATTN["views"] = os.environ.get("SOUP_SOLUTION_FEWER_VIEWS", "1").strip().lower() \
     not in ("0", "false", "no", "")
 
 
@@ -1232,7 +1249,7 @@ class _AttnRecompute:
             b16[:nq].t(), b16[nq:].t())
         qkv[:, :nq].addmm_(h_q, bq_t, alpha=plan.scaling)
         qkv[:, nq + nk:].addmm_(h_v, bv_t, alpha=plan.scaling)
-        if _ATTN["one_function"]:  # the same rope launch and kernel operands, fewer views
+        if _ATTN["views"]:  # the same rope launch and kernel operands, fewer views
             q, k, v = _rope_token_major(qkv, n, plan, self.cos, self.sin)
         else:
             q4 = _heads(torch.empty((n, nq), dtype=half, device=x16.device), n, plan.heads,

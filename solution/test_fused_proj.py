@@ -1014,3 +1014,32 @@ def test_mlp_addmm_in_place_is_bitwise(layer_1p5b, monkeypatch, mlp_recompute):
         results.append(_mlp_step(mlp, x, grad))
     (out0, dx0), (out1, dx1) = results
     assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
+
+
+@pytest.mark.parametrize("mode", ["all", None])
+def test_attention_fewer_views_is_bitwise(layer_1p5b, monkeypatch, mode):
+    """The three-node attention with rope launched from strides and the recompute's q, k, v made
+    token-major directly (SOUP_SOLUTION_FEWER_VIEWS) against the views it replaces: output, input
+    gradient and LoRA gradients bit for bit, with and without the attention recompute."""
+    from solution import fused_proj, unpad
+
+    _, attn, _, rotary = layer_1p5b
+    monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", mode)
+    monkeypatch.setitem(fused_proj._ATTN, "one_function", False)
+    monkeypatch.setitem(unpad._STATE, "splits_key", 1)
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(0.05).train()
+    x, pe, grad = _attention_inputs(rotary, seed=45)
+    _fused(True)
+    try:
+        results = []
+        for views in (False, True):
+            monkeypatch.setitem(fused_proj._ATTN, "views", views)
+            torch.cuda.manual_seed(8)
+            results.append(_attention_step(attn, x, pe, grad))
+        (out0, dx0, g0), (out1, dx1, g1) = results
+        assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
+        assert all(torch.equal(a, b) for a, b in zip(g1, g0))
+    finally:
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
