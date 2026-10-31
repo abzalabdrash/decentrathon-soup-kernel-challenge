@@ -1139,7 +1139,7 @@ def _recompute_mode():
     value = os.environ.get("SOUP_SOLUTION_RECOMPUTE_ATTN", "1").strip().lower()
     if value in ("1", "true", "yes", "on", "all"):
         return "all"
-    return "auto" if value == "auto" else None
+    return value if value in ("auto", "cap") else None
 
 
 # SOUP_SOLUTION_RECOMPUTE_ATTN (see the module doc); `check` (tests): the recompute compares what it
@@ -1162,14 +1162,21 @@ def _kept_bytes(plan, d):
 
 
 def recompute_layers(plan, d, layers):
-    """How many layers, from layer 0, recompute their attention block in this step: none, all, or
+    """How many layers, from layer 0, recompute their attention block in this step: none, all,
     (auto) the fewest that keep the step's attention memory at what a step of
-    SOUP_SOLUTION_RECOMPUTE_TOKENS tokens keeps without the recompute."""
+    SOUP_SOLUTION_RECOMPUTE_TOKENS tokens keeps without the recompute, or (cap) all but the
+    mem_policy.kept_layers that fit under its fixed peak."""
     mode = _RECOMPUTE["mode"]
     if mode is None:
         return 0
     if mode == "all":
         return layers
+    if mode == "cap":  # mem_policy.py: the last layers keep their attention under a fixed peak
+        from .rmsnorm import _SPLIT
+
+        plain, split, rebuilt = _kept_bytes(plan, d)
+        base = split if _SPLIT["keep"] else plain
+        return layers - mem_policy.kept_layers(plan.n_tokens, base - rebuilt, layers)
     t0, n = _RECOMPUTE["tokens"], plan.n_tokens
     if n <= t0:
         return 0
