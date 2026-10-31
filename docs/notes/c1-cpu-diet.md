@@ -168,3 +168,54 @@ variant has 250. Reserved - allocated is now 24.5 MiB (one 20 MiB page of the la
 pool); 230 MiB reserved would need the fragmentation at the peak under 4.5 MiB, which no C1 switch
 changes. Nothing to recover here; 371 MiB is main's number. (The single runs' walls rise with their
 position in the session: 41.6, 41.6, 43.6, 44.3 s; not a comparison.)
+
+### 2. Two nodes instead of one (`SOUP_SOLUTION_ATTN_TWO_NODES=1`, fused_proj.py, on by default)
+
+Why one node cost +4.2 MiB: autograd holds a node's incoming gradient until the node returns, and
+`_AttnBlock`'s incoming gradient is the o_proj output's (N x 1536 half), alive through the attention
+backward, the layer's peak. `_QKVAttn` is `_QKVRope` + the variable-length attention as one node
+(the reshape to the o_proj input a view of its output); the o_proj stays `_Linear4bitHalf`. Its
+backward consumes the output's gradient first, as with three nodes; `_QKVAttn` then holds its own
+incoming gradient (the attention output's, N x 1536 half) through the q/k/v backward, in place of the
+q/k/v gradients (N x 2048 half) that `_QKVRope`'s node held there, and the q/k/v gradients die as soon
+as they are in `g` (`_qkv_backward(box=...)` takes the only references). Same ops, operands and order
+as `_AttnBlock`'s token-major path. `SOUP_SOLUTION_ATTN_ONE_FUNCTION=1` still wins when set; eval, the
+non-recomputing layers and attention dropout take the three nodes.
+
+Tests (`test_fused_proj.py`): `test_attention_two_nodes_is_bitwise` (three, two and one node: output,
+input gradient and LoRA gradients bit for bit, LoRA dropout 0 and 0.05, node types checked);
+`test_attention_two_nodes_backward_peak` (one layer, the output gradient made inside the backward:
+allocated peak two <= three; one = three + N x 2048 bytes on the laptop). The other attention tests pin
+`two_nodes` off where they compare three-node variants. T4 pytest of 1c66f61 (soup-c1-nodes):
+**405 passed, 5 skipped, 0 failed**; Soup's 79 with apply() pass on the laptop.
+
+### 3. The embedding lookup with host ids (`SOUP_SOLUTION_HOST_IDS=1`, step_pipeline.py, unpad.py, head_stream.py)
+
+The host plan (B1) records the packed ids' CPU copy for their GPU view (`step_pipeline.remember`);
+`unpad.varlen_model_forward` builds the alignment tail on the CPU copy too (same fill) and records it
+for the tail-extended GPU ids; `head_stream.lookup` gathers with `step_pipeline.host_ids(ids)` (identity,
+shape and dtype checked) and reads the GPU ids back only when there is none. The forward then starts
+without a host wait. Tests: `test_host_ids_reach_the_embedding_with_the_tail` (37 and 48 tokens, tail id
+None or set, switch on/off), `test_embedding_lookup_with_host_ids` (same rows, no `.to("cpu")` of the
+GPU ids, a copy of another shape ignored), the tiny SFT run with all B1 switches still identical.
+
+### 4. Pre-test "one autograd.Function per decoder block" (`solution/bench_nodes.py`, T4, soup-c1-nodes)
+
+Host cost of one autograd node (a chain of 6 custom Functions against one Function running the same
+6 ops, median of 100): **14 us forward + 19 us backward** at 300, 830 and 1,440 tokens (13.8-14.4 /
+18.4-19.8 us). The attention block of one layer with the recompute (real fused code, 4 rows, host ms
+to issue from an idle GPU, median of 100; kernel launches equal in all three):
+
+| tokens | three nodes fwd / bwd | two nodes fwd / bwd | one node fwd / bwd | MLP fwd / bwd |
+|---|---|---|---|---|
+| 300 | 1.196 / 1.857 | 1.021 / 1.763 | 0.987 / 1.728 | 0.713 / 0.781 |
+| 830 | 1.248 / 1.870 | 1.179 / 1.787 | 1.142 / 1.740 | 0.726 / 0.830 |
+| 1,440 | 1.678 / 1.895 | 1.596 / 1.805 | 1.580 / 1.778 | 0.669 / 0.743 |
+
+The attention block as one Function against today's three nodes: -11 % host time at 300 tokens
+(3.05 -> 2.72 ms), -8 % at 830, -6 % at 1,440; two nodes take most of it (-9 %, -5 %, -5 %). The whole
+layer costs 3.55 + 4.0 ms of host time per layer in training (prof_1 timeline, short steps); one
+Function per decoder block would remove at most the attention's 0.34 ms plus the two norms' and the
+MLP's node round trips (3 x 33 us) and their glue: about 0.5 ms, 6-7 % of the layer. Below the 15-20 %
+threshold of the review: **not rewritten**. Most of what a merge saves is the Python glue between
+nodes (three -> two: 0.27 ms, of which one node's round trip is 0.03 ms), not the autograd node itself.
