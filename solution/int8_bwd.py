@@ -41,7 +41,7 @@ import torch
 import triton
 import triton.language as tl
 
-from . import nf4
+from . import int8_glue, nf4
 
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "1").strip().lower()
@@ -305,8 +305,8 @@ def mlp_backward(plan, gate_up, grad16, buffer):
             int8_in = False
         else:
             q, qs = offload_int8.views(gate_up, 2 * inter, tokens)
-    # 1. the incoming gradient per token (torch ops: a small pass, no kernel to compile)
-    g_q, s_g = _quant_rows(grad16)
+    # 1. the incoming gradient per token (int8_glue's kernel, or the torch ops)
+    g_q, s_g = int8_glue.quant_rows(grad16) if int8_glue.usable(grad16) else _quant_rows(grad16)
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
@@ -334,13 +334,18 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
     inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
     inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
-    scale_gu = torch.maximum(scale_g, scale_u)
-    inv_gu = _inverse(scale_gu * 127.0)
+    if int8_glue.ON:  # kept on the layer: frozen weights
+        scale_gu, inv_gu = int8_glue.gate_up_scales(plan.gate, scale_g, scale_u, _inverse)
+    else:
+        scale_gu = torch.maximum(scale_g, scale_u)
+        inv_gu = _inverse(scale_gu * 127.0)
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
+    if int8_glue.ON:
+        return int8_glue.dequant_rows_cols(acc_x, amax, scale_gu)
     grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])
     return grad_x
 
@@ -363,6 +368,7 @@ def _warm():
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=1, INT8_IN=False)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
+    int8_glue.warm(half, HIDDEN)
     return None
 
 
