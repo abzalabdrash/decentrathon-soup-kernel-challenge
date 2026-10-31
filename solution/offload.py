@@ -283,8 +283,10 @@ class Offloader:
     def pack(self, tensor):
         if self.early:
             saved = self.early.pop(tensor.data_ptr(), None)
-            if saved is not None and saved.shape == tensor.shape and saved.dtype == tensor.dtype:
-                return saved
+            if (saved is not None and saved.gpu is not None
+                    and saved.gpu.data_ptr() == tensor.data_ptr()
+                    and saved.shape == tensor.shape and saved.dtype == tensor.dtype):
+                return saved  # the copy offload_early started for this very storage
         if _RESIDUAL["marked"]:
             saved = self._pack_marked(tensor)
             if saved is not None:
@@ -390,6 +392,9 @@ class Offloader:
                 self.stats["still_on_gpu"] += 1
             if saved.keep:  # its other readers in this layer's backward get the same tensor
                 saved.gpu, saved.unpacked = tensor, True
+            else:  # read: out of the prefetch window (a node unpacking several handles in
+                # ascending order would otherwise copy the ones it already read back again)
+                self.by_index.pop(saved.index, None)
             self._prefetch_before(saved.index, current)
         return tensor
 
@@ -411,6 +416,7 @@ class Offloader:
 
     def close(self):
         with self.lock:
+            self.early.clear()
             while self.inflight:
                 oldest = self.inflight.popleft()
                 oldest.copied.synchronize()
@@ -482,6 +488,7 @@ def drain_inflight():
     if offloader is None:
         return
     with offloader.lock:
+        offloader.early.clear()  # any handle not packed by now is stale
         while offloader.inflight:
             oldest = offloader.inflight.popleft()
             oldest.home.wait_event(oldest.copied)
