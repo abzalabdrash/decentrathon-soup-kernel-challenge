@@ -31,9 +31,13 @@ def clean_hook(monkeypatch):
     knobs.build.impl = saved
 
 
-def test_off_by_default(clean_hook, monkeypatch):
+def test_on_by_default_and_off_switch(clean_hook, monkeypatch):
     monkeypatch.delenv("SOUP_SOLUTION_LAUNCHER_OPT", raising=False)
     monkeypatch.delenv("SOUP_SOLUTION_LAUNCHER_NICE", raising=False)
+    assert warmup.install_launcher_build() is True  # -O0 launchers by default
+    assert clean_hook.build.impl._soup_launcher_build == ("0", 0)
+    clean_hook.build.impl = None
+    monkeypatch.setenv("SOUP_SOLUTION_LAUNCHER_OPT", "off")
     assert warmup.install_launcher_build() is False
     assert clean_hook.build.impl is None
 

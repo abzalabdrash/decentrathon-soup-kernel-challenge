@@ -107,7 +107,6 @@ sources, flags and libraries otherwise; SOUP_SOLUTION_LAUNCHER_NICE=<n> runs the
 import atexit
 import importlib
 import os
-import re
 import queue
 import re
 import sys
@@ -586,7 +585,9 @@ def install_launcher_build():
     """SOUP_SOLUTION_LAUNCHER_OPT / SOUP_SOLUTION_LAUNCHER_NICE (see the module docstring): installs
     the build through `triton.knobs.build.impl` unless someone set that hook already. Returns
     whether it is installed."""
-    level = os.environ.get("SOUP_SOLUTION_LAUNCHER_OPT", "").strip()
+    # on by default since the night integration (-O0 launchers: the warm-up finishes ~1 s earlier
+    # on the T4, launch cost unchanged); SOUP_SOLUTION_LAUNCHER_OPT=off leaves triton's own build
+    level = os.environ.get("SOUP_SOLUTION_LAUNCHER_OPT", "0").strip()
     try:
         nice = int(os.environ.get("SOUP_SOLUTION_LAUNCHER_NICE", "0") or 0)
     except ValueError:
@@ -612,7 +613,7 @@ def start_early(log=True):
     imports (see _triton_key). With SOUP_SOLUTION_WARMUP_START=apply_begin the warm-up thread
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
-    install_launcher_build()  # off by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
+    install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
     threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)

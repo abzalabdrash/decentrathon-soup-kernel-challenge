@@ -85,8 +85,8 @@ import types
 _GENERATION = re.compile(r"\{\%-?\s*generation\s*-?\%\}")  # transformers' check (chat_template_utils.py:508)
 
 
-def _flag(name):
-    return os.environ.get(name, "0").strip().lower() not in ("0", "false", "no", "")
+def _flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
 
 
 # ---------------------------------------------------------------- SOUP_SOLUTION_FAST_ROWS
@@ -553,7 +553,7 @@ def _cheap_update_fingerprint(original):
 def _replacements():
     """[(owner, attribute, factory)] for the switches that are on."""
     out = []
-    if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT"):
+    if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT", "1"):  # on by default since the night integration
         try:
             import datasets.arrow_dataset
             import datasets.fingerprint
@@ -563,7 +563,7 @@ def _replacements():
                 out.append((datasets.arrow_dataset, "update_fingerprint", _cheap_update_fingerprint))
         except Exception:  # noqa: BLE001
             pass
-    if _flag("SOUP_SOLUTION_FAST_ROWS"):
+    if _flag("SOUP_SOLUTION_FAST_ROWS", "1"):  # on by default since the night integration
         try:
             from soup_cli.data import loss_mask
 
