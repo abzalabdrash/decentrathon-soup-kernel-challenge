@@ -131,4 +131,27 @@ from the build's quantization; peagverr):
 - soup-h1-jury1 (seed 139, rows 34000:34256 / 46000:46256, base/solution/solution/base): **all 10 checks**; base
   90.0 s, ours 50.3 s (s 1.787), peak 435 MiB (reserved 314), eval +0.027 %; per-step gaps of the two solution
   runs: loss 0.23 / 0.22 %, entropy 0.32 / 0.30 %, accuracy 0.68 / 0.70 % (largest single step 2.3 %; base_2 vs
-  base_1: 0.01 / 0.01 / 0.10 %). The fp16 head on the same rows (soup-h1-jury1c) for the peak's comparison: below.
+  base_1: 0.01 / 0.01 / 0.10 %). The fp16 head on the same rows and seed (soup-h1-jury1c, ce85dc8 with
+  SOUP_SOLUTION_HEAD_INT8=0, another session): all 10 checks, 51.8 s, **peak 435 MiB (reserved 314) as with int8**,
+  eval -0.002 %, loss curve 0.05 %: the 435 MiB is these rows', not the int8 head's.
+
+## Summary
+
+- Default: on in the `soup train` process (head_int8.enabled(), as int8_bwd.py), off in pytest; build at the first
+  head, the switch at head 5, smoothing by the final norm weight, forward in 512-row blocks, 16-warp chunk kernel.
+  `SOUP_SOLUTION_HEAD_INT8=0` turns it off.
+- T4: steps 3+ -0.70..-0.76 s in two ABBA sessions; wall -0.55 s in soup-h1-abba3 (rounds -0.94 / -0.16) and -0.28 s
+  in soup-h1-abba2 (the slower build of then). Peak unchanged (395 MiB public rows, 435 on jury rows 34000/46000 with
+  either head). Own kernels +2.3 points (int8_rows_kernel, head_i8_chunk_kernel, int8_transpose_kernel,
+  head_i8_acc_kernel).
+- Numerics: loss +0.19 % on average against the base (the int8 forward's rounding raises the loss a little), eval
+  +0.02..+0.03 % (eval itself stays fp16); per-step gaps loss 0.22-0.24 %, entropy 0.30-0.32 %, accuracy 0.68-0.89 %
+  against 0.06 / 0.18 / 0.28 % for main: inside check 5/6's 3 % with room, close to the orchestrator's 1 % for the
+  accuracy.
+- Risks: the accuracy gap is the closest to 1 % (largest single step 2.3-3.8 %); the gain is about the size of a
+  session's noise per round; the build thread compiles four kernels during steps 0-3 (a slow CPU session could make
+  head 5 wait for it: the log line "ready after N heads" shows it); 223 MiB more pinned host memory (+0 MiB
+  nvidia-smi measured). README wording: int8 lm_head (answer 29), forward and backward by the input, per-row weight
+  scales with the final norm weight folded in, per-token hidden scales, P per row and chunk; the embedding lookup and
+  eval stay fp16; the first four steps use the fp16 head while the int8 copy is built.
+- Not done: variant B (resident int8 head, ~+220 MiB) not measured (memory stays at <= 450 MiB by decision).
