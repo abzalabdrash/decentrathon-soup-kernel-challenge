@@ -179,23 +179,40 @@ Tests: test_head_int8.py 21 (the int8 pass against fp64 int8 math with rescoring
 against the fp16 head: equal correctness, loss error halved at least; real hidden states: 3 steps, loss < 0.2 %,
 entropy < 0.5 %, accuracy < 0.3 %, rewind < 0.3 %, skipped without the cached checkpoint).
 
-## Summary
+## T4 runs after the accuracy work
 
-- Default: on in the `soup train` process (head_int8.enabled(), as int8_bwd.py), off in pytest; build at the first
-  head, the switch at head 5, smoothing by the final norm weight, forward in 512-row blocks, 16-warp chunk kernel.
+Speed (in training):
+- Modal h1-abba5 (7b67a32, PCIe x8 host, ABBA 2 rounds): fp16 55.08 s / steps 3+ 37.37; int8 53.73 / 35.47 (-1.35 s
+  wall); without the loss correction 53.39 / 35.32; without rescoring and correction 53.43 / 35.30: the two cost
+  ~0.15 s of steps on an x8 host (zero-copy reads), less on x16.
+- Modal h1-abba6 (73796c4, PCIe x16, ABBA 3 rounds): fp16 48.58 / 27.34; int8 48.17 (-0.41) / 26.95 (-0.39); peak
+  417 against 395 MiB: quant_rows' temporaries on the build stream (its own pool, reserved 296 vs 274). Fixed in
+  693af66 (preallocated buffers, test_build_allocates_nothing_on_its_stream); not measured on the T4 yet.
+- soup-h1-abba4 (7b67a32, Kaggle x16): +0.10 s wall, steps 6+ -0.38 s, steps 0-5 +0.46 s (above).
+
+Accuracy criteria (|delta eval| <= 0.2 %, mean curves <= 0.5 %, first steps on the fp16 head), jury runs with the
+rescoring and the loss correction (base/solution/solution/base; curves = mean per-step gap of each solution run to
+base_1; rewind = check 5's measure from result.json):
+
+| run | commit | checks | check 6: first step, mean of all steps | check 7: eval | loss | entropy | accuracy | rewind | peak |
+|---|---|---|---|---|---:|---:|---:|---:|---|
+| soup-h1-jury3, seed 149, rows 26000/44000 | 7b67a32 | 10/10 | 0.00 / 0.08 %, 0.00 / 0.09 % | +0.020 % | 0.084 / 0.087 % | 0.189 / 0.183 % | 0.382 / 0.444 % | 0.273 % | 415 MiB |
+| soup-h1-jury4, seed 139, rows 34000/46000 | 73796c4 | 10/10 | 0.01 / 0.08 %, 0.01 / 0.08 % | +0.016 % | 0.077 / 0.079 % | 0.312 / 0.339 % | 0.441 / 0.497 % | 0.328 % | 457 MiB (the bug above; fp16 head on these rows: 435) |
+| base_2 vs base_1 (noise) | | | 0.00 / 0.01 % | | 0.008 % | 0.007-0.008 % | 0.070-0.091 % | | |
+
+Before the rescoring and the correction (2e5e2ac): accuracy 0.68-0.89 %, rewind 0.48-0.61 %, loss 0.22-0.24 %.
+What remains of the accuracy gap is the trajectory (dL/dh 7-10 % from the fp16 head's, through P of int8 logits),
+not flips: at 0.44-0.50 % it sits at the 0.5 % line on seed 139.
+
+## Summary (31 Oct ~18:15)
+
+- Code 693af66 (local: GitHub pushes from this laptop hang in the credential manager since 17:47; last pushed
+  73796c4 has the +22 MiB build-stream bug, 7b67a32 is the last pushed commit without it). Default: on in every
+  process (conftest pins the fp16 head for solution's tests), the first five heads fp16, build at the first head.
   `SOUP_SOLUTION_HEAD_INT8=0` turns it off.
-- T4: steps 3+ -0.70..-0.76 s in two ABBA sessions; wall -0.55 s in soup-h1-abba3 (rounds -0.94 / -0.16) and -0.28 s
-  in soup-h1-abba2 (the slower build of then). Peak unchanged (395 MiB public rows, 435 on jury rows 34000/46000 with
-  either head). Own kernels +2.3 points (int8_rows_kernel, head_i8_chunk_kernel, int8_transpose_kernel,
-  head_i8_acc_kernel).
-- Numerics: loss +0.19 % on average against the base (the int8 forward's rounding raises the loss a little), eval
-  +0.02..+0.03 % (eval itself stays fp16); per-step gaps loss 0.22-0.24 %, entropy 0.30-0.32 %, accuracy 0.68-0.89 %
-  against 0.06 / 0.18 / 0.28 % for main: inside check 5/6's 3 % with room, close to the orchestrator's 1 % for the
-  accuracy.
-- Risks: the accuracy gap is the closest to 1 % (largest single step 2.3-3.8 %); the gain is about the size of a
-  session's noise per round; the build thread compiles four kernels during steps 0-3 (a slow CPU session could make
-  head 5 wait for it: the log line "ready after N heads" shows it); 223 MiB more pinned host memory (+0 MiB
-  nvidia-smi measured). README wording: int8 lm_head (answer 29), forward and backward by the input, per-row weight
-  scales with the final norm weight folded in, per-token hidden scales, P per row and chunk; the embedding lookup and
-  eval stay fp16; the first four steps use the fp16 head while the int8 copy is built.
-- Not done: variant B (resident int8 head, ~+220 MiB) not measured (memory stays at <= 450 MiB by decision).
+- Accuracy: forward-only flips fixed (rescoring), loss/rewind corrected to first order; jury seeds 139 and 149: 10/10,
+  eval +0.016/+0.020 %, loss 0.08 %, entropy 0.18-0.34 %, accuracy 0.38-0.50 %, rewind 0.27-0.33 %.
+- Speed: steps after the switch -6.6..-15.6 ms per step on Kaggle; the build thread's compilations cost steps 0-4
+  +0.3..+0.46 s; wall -0.41 s on a Modal x16 host (73796c4), +0.10 s in one Kaggle session (7b67a32). The -0.5 s
+  wall criterion is not met reliably.
+- Not done: the 693af66 peak fix measured on the T4, full + two juries on 693af66, variant B (resident head).
