@@ -196,3 +196,58 @@ def test_loads_outside_soup_setup_are_untouched(patched, tiny_dir):
     assert load_stream.LAST["load"] is None and len(_LOADED) == 0
     assert all(w.is_cuda for w in _layer_weights(model))
     assert model.get_input_embeddings().weight.untyped_storage().nbytes() == VOCAB * HIDDEN * 2
+
+
+def test_meta_init_skips_meta_tensors_only():
+    """SOUP_SOLUTION_META_INIT: torch's init functions return meta tensors untouched; a real tensor gets
+    the same values and leaves the generator in the same state; undo puts torch's functions back."""
+    from solution import load_stream
+
+    original = torch.nn.init.kaiming_uniform_
+    torch.manual_seed(7)
+    expected = torch.nn.Linear(16, 8)
+    expected_rng = torch.get_rng_state()
+    before = load_stream.LAST_META_INIT["skipped"]
+    undo = load_stream._install_meta_init()
+    try:
+        assert torch.nn.init.kaiming_uniform_ is not original
+        with torch.device("meta"):
+            torch.nn.Linear(16, 8)
+        assert load_stream.LAST_META_INIT["skipped"] >= before + 2  # kaiming_uniform_ and the bias' uniform_
+        torch.manual_seed(7)
+        got = torch.nn.Linear(16, 8)
+        assert torch.get_rng_state().equal(expected_rng)
+        assert torch.equal(got.weight, expected.weight) and torch.equal(got.bias, expected.bias)
+    finally:
+        undo()
+    assert torch.nn.init.kaiming_uniform_ is original
+
+
+def test_meta_init_same_setup(patched, tiny_dir, monkeypatch):
+    """The whole setup with SOUP_SOLUTION_META_INIT: the generators after the load and the training step
+    are the same as without it."""
+    from solution import load_stream
+    from solution.head_stream import streamer_for
+    from solution.weight_stream import streamer_of
+
+    def run(flag):
+        monkeypatch.setenv("SOUP_SOLUTION_META_INIT", flag)
+        seen = {}
+
+        def after_load(model):
+            seen["rng"] = (torch.get_rng_state(), torch.cuda.get_rng_state())
+
+        torch.manual_seed(11)
+        before = load_stream.LAST_META_INIT["skipped"]
+        model, _ = _setup(patched, tiny_dir, after_load=after_load)
+        seen["skipped"] = load_stream.LAST_META_INIT["skipped"] - before
+        step = _step(model)
+        streamer_of(model).restore()
+        streamer_for(model.get_base_model().get_input_embeddings().weight).restore()
+        return seen, step
+
+    ours, ours_step = run("1")
+    theirs, theirs_step = run("0")
+    assert ours["skipped"] > 0 and theirs["skipped"] == 0
+    assert all(a.equal(b) for a, b in zip(ours["rng"], theirs["rng"]))
+    assert len(ours_step) == len(theirs_step) and all(torch.equal(a, b) for a, b in zip(ours_step, theirs_step))

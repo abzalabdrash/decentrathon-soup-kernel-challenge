@@ -454,13 +454,71 @@ def _wrap(owner, name, make):
     setattr(owner, name, wrapper)
 
 
+_INIT_FUNCTIONS = ("uniform_", "normal_", "constant_", "ones_", "zeros_", "eye_", "dirac_", "xavier_uniform_",
+                   "xavier_normal_", "kaiming_uniform_", "kaiming_normal_", "trunc_normal_", "orthogonal_", "sparse_")
+_INIT_MODULES = ("torch.nn.init", "torch.nn.modules.activation", "torch.nn.modules.transformer",
+                 "torch.nn.modules.linear", "torch.nn.modules.loss", "torch.nn.modules.batchnorm",
+                 "torch.nn.modules.conv", "torch.nn.modules.normalization", "torch.nn.modules.rnn",
+                 "torch.nn.modules.sparse")  # transformers' TORCH_MODULES_TO_PATCH (initialization.py)
+LAST_META_INIT = {"skipped": 0}
+
+
+def _meta_skipping(fn):
+    """`fn` (a torch.nn.init function) that returns a meta tensor untouched (SOUP_SOLUTION_META_INIT)."""
+
+    @functools.wraps(fn)
+    def init_function(tensor, *args, **kwargs):
+        if isinstance(tensor, torch.Tensor) and tensor.is_meta:
+            LAST_META_INIT["skipped"] += 1
+            return tensor
+        return fn(tensor, *args, **kwargs)
+
+    init_function._soup_meta_init = fn
+    return init_function
+
+
+def _install_meta_init():
+    """SOUP_SOLUTION_META_INIT=1: while Soup's model setup runs, torch's init functions return a meta
+    tensor as it is. transformers builds the model skeleton under `torch.device("meta")` without
+    `no_init_weights` (modeling_utils.py get_init_context), so every nn.Linear's reset_parameters runs
+    kaiming_uniform_ / uniform_ on meta tensors, through the device context's __torch_function__:
+    0.3 s of the main thread on the T4 (soup-l1-p0 profile) for tensors that hold no values and draw no
+    random numbers (a meta tensor's uniform_ uses no generator). Any tensor that is not meta (peft's
+    LoRA init on the GPU, which draws from the generators) takes torch's function. Returns the undo."""
+    import sys
+
+    done = []
+    for module_name in _INIT_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for name in _INIT_FUNCTIONS:
+            fn = getattr(module, name, None)
+            if fn is None or getattr(fn, "_soup_meta_init", None) is not None:
+                continue
+            wrapper = _meta_skipping(fn)
+            setattr(module, name, wrapper)
+            done.append((module, name, fn, wrapper))
+
+    def undo():
+        while done:
+            module, name, fn, wrapper = done.pop()
+            if getattr(module, name, None) is wrapper:
+                setattr(module, name, fn)
+
+    return undo
+
+
 def _scoped_setup(original):
     @functools.wraps(original)
     def _setup_transformers(self, *args, **kwargs):
         _STATE["depth"] += 1
+        undo_init = _install_meta_init() if _STATE["depth"] == 1 and _flag("SOUP_SOLUTION_META_INIT") else None
         try:
             return original(self, *args, **kwargs)
         finally:
+            if undo_init is not None:
+                undo_init()
             _STATE["depth"] -= 1
             if _STATE["depth"] <= 0:
                 _STATE["opened"] = []  # files of loads this module did not handle
