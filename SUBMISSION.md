@@ -14,10 +14,10 @@ Decentrathon 6.0, трек 01 Soup Kernel Challenge. Описание решен
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
-| `<CAPTAIN_NAME>` | капитан | `<GITHUB_LOGIN>` | `<KAGGLE_LOGIN>` | `<CAPTAIN_CONTACT>` |
-| `<NAME>` | `<ROLE>` | `<GITHUB_LOGIN>` | `<KAGGLE_LOGIN>` | |
-| `<NAME>` | `<ROLE>` | `<GITHUB_LOGIN>` | `<KAGGLE_LOGIN>` | |
-| `<NAME>` | `<ROLE>` | `<GITHUB_LOGIN>` | `<KAGGLE_LOGIN>` | |
+| Нурлан Абдраш | капитан | abdrnurlan | nurlanjj | +77017783296, Telegram @Nurlan0006 |
+| Абзал Абдраш | разработчик | abzalabdrash | namedesign | |
+| Ерасыл Кудайберген | разработчик | peagverr | peagverr | |
+| Руслан Дементов | участник | — | — | |
 
 ## Our kernels
 Доля — время ядра по CUDA-событиям харнесса на шагах 3+ к времени этих шагов (проверка 4). Числа —
