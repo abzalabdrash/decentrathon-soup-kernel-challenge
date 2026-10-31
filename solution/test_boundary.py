@@ -21,13 +21,21 @@ def _peft_model(seed=0):
 def boundary_on():
     from solution import boundary
 
+    def forget():
+        # the ids of earlier tests' models stay in `watched` after their lists are dropped: a module
+        # made later at a freed address (the ModuleList of a layer slice) would count as a listed
+        # model's and bump the generation (a rebuild, not an error, but test_layer_slices counts builds)
+        boundary._CACHE.clear()
+        boundary._STATE["watched"].clear()
+
     saved = boundary._STATE["on"]
     boundary._STATE["on"] = True
+    forget()
     boundary.patch_step_boundary()
     yield boundary
     boundary.unpatch_step_boundary()
     boundary._STATE["on"] = saved
-    boundary._CACHE.clear()
+    forget()
 
 
 def _grads(model):
