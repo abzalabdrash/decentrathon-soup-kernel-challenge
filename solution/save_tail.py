@@ -230,10 +230,70 @@ def _time_adapter_saves():
     PeftModel._soup_save_timed = True
 
 
+# SOUP_SOLUTION_SAVE_ONCE=time (diagnostics): no replay, every call of the save tail timed instead,
+# one line per label at exit (nested labels include their children)
+_TIMES = {}
+_TAIL_CALLS = (
+    ("transformers.trainer", "Trainer", "_save_checkpoint"),
+    ("transformers.trainer", "Trainer", "save_model"),
+    ("transformers.trainer", "Trainer", "_save_optimizer_and_scheduler"),
+    ("transformers.trainer", "Trainer", "_save_rng_state"),
+    ("transformers.trainer", "Trainer", "_save_scaler"),
+    ("transformers.trainer_callback", "TrainerState", "save_to_json"),
+    ("peft", "PeftModel", "save_pretrained"),
+    ("peft", "PeftModel", "create_or_update_model_card"),
+    ("transformers.tokenization_utils_base", "PreTrainedTokenizerBase", "save_pretrained"),
+    ("soup_cli.trainer.sft", None, "_assert_finite_training_state"),
+    ("soup_cli.utils.run_provenance", None, "write_run_provenance"),
+    ("soup_cli.experiment.tracker", "ExperimentTracker", "finish_run"),
+    ("soup_cli.experiment.tracker", "ExperimentTracker", "record_base_revision"),
+    ("torch", None, "save"),
+)
+
+
+def _timer(label, fn):
+    def timed(*args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            entry = _TIMES.setdefault(label, [0, 0.0])
+            entry[0] += 1
+            entry[1] += time.perf_counter() - started
+
+    timed.__doc__, timed.__name__ = fn.__doc__, getattr(fn, "__name__", label)
+    return timed
+
+
+def _time_tail():
+    import importlib
+
+    for module_name, owner_name, attr in _TAIL_CALLS:
+        try:
+            module = importlib.import_module(module_name)
+            owner = getattr(module, owner_name) if owner_name else module
+            fn = getattr(owner, attr)
+        except (ImportError, AttributeError):
+            continue
+        label = f"{owner_name or module_name}.{attr}"
+        setattr(owner, attr, _timer(label, fn))
+
+    def report():
+        for label, (calls, seconds) in sorted(_TIMES.items(), key=lambda kv: -kv[1][1]):
+            print(f"[solution] save tail time: {label} {calls}x {seconds * 1e3:.0f} ms", flush=True)
+
+    atexit.register(report)
+
+
 def patch_soup_save_tail():
-    """apply(): with SOUP_SOLUTION_SAVE_ONCE=1, in the `soup train` process only."""
+    """apply(): with SOUP_SOLUTION_SAVE_ONCE=1, in the `soup train` process only (=time: the tail's
+    calls timed, nothing replayed)."""
     from .exit_release import _soup_train_process
 
-    if _soup_train_process():
-        patch_tokenizer_save()
-        _time_adapter_saves()
+    if not _soup_train_process():
+        return
+    if os.environ.get("SOUP_SOLUTION_SAVE_ONCE", "").strip().lower() == "time":
+        _time_tail()
+        return
+    patch_tokenizer_save()
+    _time_adapter_saves()
