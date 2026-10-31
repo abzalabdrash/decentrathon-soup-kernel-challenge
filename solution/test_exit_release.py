@@ -51,6 +51,7 @@ def test_release_thread_runs_once(monkeypatch):
     monkeypatch.setattr(exit_release, "_STATE", dict(exit_release._STATE, thread=None, seconds=None))
     calls = []
     monkeypatch.setattr(exit_release, "_release", lambda device: calls.append(device))
+    monkeypatch.setattr(exit_release.atexit, "register", lambda *a, **k: None)  # no report line at exit
     thread = exit_release.start_release("cuda")
     assert exit_release.start_release("cuda") is thread
     thread.join()

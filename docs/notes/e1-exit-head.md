@@ -1,6 +1,27 @@
 # E1: the process exit and the head's bytes (branch claude/e1-exit-head-8fb01b)
 
-Draft, filled in as the T4 measurements come in.
+## Report
+
+**A, exit (`solution/exit_release.py`).** On the T4 our process spent 0.81-0.88 s after its threads
+were gone (kernel teardown) against the base's 0.32 s: ~3.6 GB of pinned host memory handed back
+page by page with nothing to overlap. `SOUP_SOLUTION_EXIT_RELEASE=1` starts a non-daemon thread at
+the last step's end that frees the offload slabs (cudaFreeHost) and unregisters the weights' and
+head's buffers (values stay, pageable), under the checkpoint/adapter save. `SOUP_SOLUTION_EXIT_NOGC=1`
+disables the collector there (Py_FinalizeEx's 44 ms full collection is skipped). Train end -> process
+end: 1.84 -> 1.27 s (-0.57) -> 1.22 s (-0.61) with NOGC (soup-e1-exit2); `=all` (also the allocator's
+cached GPU blocks) another -0.035 s (soup-e1-exit3, 2 runs). No os._exit, nothing skipped.
+**Recommend on: EXIT_RELEASE=all, EXIT_NOGC=1.** `solution/__init__.py`: one `if` wiring it.
+
+**B, head (`solution/head_pack.py`, `SOUP_SOLUTION_HEAD_PACK=1`, own kernel `head_unpack_kernel`).**
+Lossless 12-bit form of the bf16-origin fp16 weight: exactly 75.00 % (333.8 of 445.1 MiB), 15
+escapes, every chunk verified bit for bit at build. T4: copy 1.06 -> 0.82 ms per 4,096-row chunk,
+decode 0.15 ms; isolated head -9.3 ms at <= 650 tokens, +2..3 ms at >= 1,100 (hence
+`SOUP_SOLUTION_HEAD_PACK_MAX_ROWS=800`). In training the head's copy wait falls 9 -> 2 ms/step, but
+the power-limited T4 returns only -0.07..-0.24 s per run (per-step analysis, soup-e1-packv2/v3), and
+the extra CUDA module costs +2 MiB nvidia-smi (401 -> 403). **Recommend off.**
+
+Full run with all four on (soup-e1-full1): all 10 checks, 46.4 s / 403 MiB vs base 80.5 s.
+Question for the organizers: below. Branch: `claude/e1-exit-head-8fb01b`.
 
 ## Part A: the process exit
 
@@ -56,7 +77,9 @@ exit stages are what this switch changes and they are measured directly. What is
 ~30 ms in torch.library's own finalizers (the base has the same 234-246 `_del_library` callbacks, 12 ms
 there; left alone), and the post-train work (+0.1 s: the harness reads back ~41k CUDA event pairs of
 our kernels' launches). `SOUP_SOLUTION_EXIT_RELEASE=all` also returns the caching allocator's free
-GPU blocks on the thread (148 MiB locally, aimed at the 0.25 s C-level exit); not measured on the T4.
+GPU blocks on the thread (136 MiB on the T4): soup-e1-exit3 (db6a66f, 2 runs each, both with NOGC):
+train end -> process end 1.116 s (=1) against 1.081 s (=all), C-level exit 0.242 -> 0.225, kernel
+0.301 -> 0.278; the release thread 0.45-0.47 s either way.
 
 ## Part B: the head's bytes (SOUP_SOLUTION_HEAD_PACK=1, off by default)
 
@@ -123,6 +146,19 @@ EXIT_NOGC=1 HEAD_PACK=1 HEAD_PACK_MAX_ROWS=800`): **all 10 checks pass**; base 8
 46.4 s / 403 MiB (s 1.735 against a fast base; m 35.6), eval -0.015 %, loss curve 0.01 % / 0.05 %,
 own kernels 14.0 % (head_unpack_kernel listed under check 3); 33 of 64 heads packed, the pack ready
 0.2 s before train begin; the release: 2,560 MiB freed and 1,424 MiB unregistered in 0.45 s.
+
+soup-e1-packv3 (namedesign, c0c7be2, every variant with EXIT_RELEASE=1 + EXIT_NOGC=1, ABBA 2 runs,
+a cooler session): steps 3+ / wall / first step minus setup begin: no pack 25.46 / 43.62 / 5.87 s;
+pack at setup end, MAX_ROWS=800: 25.94 / 44.34 / 5.87 s; pack at prepare: 26.39 / 45.60 / 6.30 s;
+pack for every head: 26.20 / 44.70 / 5.88 s, and one of its two runs crossed a 20 MiB page (423 MiB,
+reserved 292: the packed ring is +6 MiB at the head of the largest steps). Starting the build at the
+end of the setup removes the startup cost; the step totals swing with the session's drift (the first
+positions are faster) more than the pack moves them. Normalizing by the unpacked large steps of the
+same runs (packed only for steps of <= 800 tokens: 31 of 64), the packed steps are 0.6 % (packv2) and
+2.2 % (packv3) shorter: -0.07..-0.24 s per run. The head's copy wait itself falls from 6.4-9.7 to
+1.7-2.5 ms per step (-0.45 s per run); the T4 at its 70 W limit spends the idle it loses on lower
+clocks (RESEARCH: removed GPU idle never returns to the wall in full). Verdict: works, bit-exact,
+ready behind its switch; not worth +2 MiB at the measured gain.
 
 ## Question for the organizers (exact wording)
 

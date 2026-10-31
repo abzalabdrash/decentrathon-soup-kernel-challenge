@@ -36,6 +36,12 @@ the packed chunk goes to the pinned host buffer. Any mismatch, a value no class 
 MAX_ESC times in a chunk, a dtype other than fp16, or an error leaves the pack unbuilt: the head
 streams fp16 as before. Until the pack is ready (and on any head whose ring was made earlier) the
 head streams fp16; the choice is made once per head, when its ring is allocated.
+
+Measured on the T4 (docs/notes/e1-exit-head.md): copy 1.06 -> 0.82 ms per 4,096-row chunk, decode
+0.15 ms; an isolated head -9..-11 ms up to ~800 rows, +2..5 ms from ~1,100 (compute-bound: the decode
+adds), hence SOUP_SOLUTION_HEAD_PACK_MAX_ROWS; in training the head's copy wait falls from ~9 to ~2 ms
+per step but the power-limited T4 returns only -0.07..-0.24 s per run, and the extra module costs
++2 MiB of nvidia-smi peak: off by default.
 """
 
 import atexit

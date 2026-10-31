@@ -28,6 +28,10 @@ over, and Py_FinalizeEx's own full collection is skipped (PyGC_Collect returns a
 collector is disabled); the module teardown and its own collection run as always, every file is
 already flushed and closed by then. No output is skipped and nothing is cut short: the adapter, the
 checkpoint, the rewind log, the experiment database and the logs are written exactly as before.
+
+T4 (soup-e1-exit2/3, bench_exit.py, 2 runs each): train end -> process end 1.84 s -> 1.27 s with the
+release (kernel teardown 0.88 -> 0.36 s, the base's is 0.32), 1.22 s with NOGC, 1.08 s with =all and
+NOGC (another session); the thread takes 0.45-0.53 s and is done before main() returns.
 """
 
 import atexit
