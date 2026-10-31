@@ -1,6 +1,6 @@
 """The run's pinned host memory handed back while Soup saves, not at the process exit
-(SOUP_SOLUTION_EXIT_RELEASE=1, or =all to also hand back the caching allocator's free GPU blocks;
-SOUP_SOLUTION_EXIT_NOGC=1 also stops the garbage collector there).
+(SOUP_SOLUTION_EXIT_RELEASE=1, or =all to also hand back the caching allocator's free GPU blocks).
+The garbage collector is not touched (organizers' answer 31).
 
 The harness times the whole process, its exit included. Measured on the T4 (solution/bench_exit.py,
 soup-e1-exit1, two runs each), from Trainer.train's end to the process's end: base 2.39 s, ours 1.75 s,
@@ -23,21 +23,16 @@ when the trainer evaluates, which runs the model after the last step) a thread, 
 The main thread meanwhile saves the last checkpoint, Soup saves the adapter and prints its summary,
 the harness writes its metrics: the release runs under that work instead of after it. The thread is
 joined by the interpreter at exit (threading._shutdown), so nothing CUDA runs while it finalizes.
-With SOUP_SOLUTION_EXIT_NOGC=1 the garbage collector is disabled at the same point: the training is
-over, and Py_FinalizeEx's own full collection is skipped (PyGC_Collect returns at once when the
-collector is disabled); the module teardown and its own collection run as always, every file is
-already flushed and closed by then. No output is skipped and nothing is cut short: the adapter, the
+No output is skipped and nothing is cut short: the adapter, the
 checkpoint, the rewind log, the experiment database and the logs are written exactly as before.
 
 T4 (soup-e1-exit2/3, bench_exit.py, 2 runs each): train end -> process end 1.84 s -> 1.27 s with the
-release (kernel teardown 0.88 -> 0.36 s, the base's is 0.32), 1.22 s with NOGC, 1.08 s with =all and
-NOGC (another session); the thread takes 0.45-0.53 s and is done before main() returns.
+release (kernel teardown 0.88 -> 0.36 s, the base's is 0.32); the thread takes 0.45-0.53 s and is
+done before main() returns.
 """
 
 import atexit
-import gc
 import os
-import sys
 import threading
 import time
 
@@ -69,13 +64,6 @@ def _release(device):
     _STATE["seconds"] = time.perf_counter() - started
 
 
-def _soup_train_process():
-    """True in the measured `soup train` process (the harness runs Soup's CLI with that argv), False
-    under pytest and other callers: there the collector must stay on after a tiny training."""
-    argv = sys.argv
-    return len(argv) >= 2 and os.path.basename(argv[0]).split(".")[0] == "soup" and argv[1] == "train"
-
-
 def start_release(device=None):
     """Starts the release thread once (later calls do nothing). Returns the thread."""
     if _STATE["thread"] is None:
@@ -83,8 +71,6 @@ def start_release(device=None):
         _STATE["thread"] = thread
         thread.start()
         atexit.register(lambda: print(f"[solution] exit release: {report()}", flush=True))
-        if _on("SOUP_SOLUTION_EXIT_NOGC") and _soup_train_process():
-            gc.disable()  # only in the `soup train` process: a test process keeps its collector
     return _STATE["thread"]
 
 
