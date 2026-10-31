@@ -684,9 +684,11 @@ def patch_soup_trainer_build():
     """SFTTrainerWrapper.setup runs with the replacements of the switches that are on, the early
     tokenization (SOUP_SOLUTION_EARLY_ROWS) and the early probes (SOUP_SOLUTION_EARLY_PROBES, which
     last until train() returns); none by default: then nothing is wrapped."""
+    from . import tokenizer_pickle
+
     early = _flag("SOUP_SOLUTION_EARLY_ROWS")
     probes = _flag("SOUP_SOLUTION_EARLY_PROBES")
-    if not _replacements() and not early and not probes:
+    if not _replacements() and not early and not probes and not tokenizer_pickle.enabled():
         return
     from soup_cli.trainer import sft as soup_sft
 
@@ -700,12 +702,17 @@ def patch_soup_trainer_build():
 
     def setup(self, *args, **kwargs):
         undo = install()
+        # SOUP_SOLUTION_TOKENIZER_PICKLE: datasets' fingerprint of the tokenization map, the same bytes
+        # written faster (tokenizer_pickle.py)
+        undo_pickle = tokenizer_pickle.install() if tokenizer_pickle.enabled() else None
         undo_early = _install_early(self, args, kwargs, rows=early, probes=probes) if (early or probes) else None
         try:
             return original_setup(self, *args, **kwargs)
         finally:
             if undo_early is not None:
                 undo_early()
+            if undo_pickle is not None:
+                undo_pickle()
             undo()
 
     def train(self, *args, **kwargs):
