@@ -44,7 +44,7 @@ SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARL
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
-SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache),
+SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache, =late starts after Soup's final save),
 SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; on by default, answer 29),
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
