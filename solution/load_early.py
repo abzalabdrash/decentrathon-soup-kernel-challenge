@@ -55,12 +55,13 @@ def enabled():
 
 
 class _Chunk:
-    __slots__ = ("start", "end", "ready", "registered")
+    __slots__ = ("start", "end", "ready", "registered", "order")
 
     def __init__(self, start, end):
         self.start, self.end = start, end  # byte range in the file's data section
         self.ready = threading.Event()
         self.registered = False
+        self.order = ()  # the natural key of its first tensor in the loader's order (see _plan)
 
 
 class _File:
@@ -130,15 +131,27 @@ def _plan(path):
         header = json.loads(f.read(length))
         stat = os.fstat(f.fileno())
         size = stat.st_size - 8 - length
-    ends = sorted(info["data_offsets"][1] for key, info in header.items() if key != "__metadata__")
+    tensors = sorted((info["data_offsets"][0], info["data_offsets"][1], key) for key, info in header.items()
+                     if key != "__metadata__")
     chunks, start = [], 0
-    for end in ends:
+    for _, end, _ in tensors:
         if end - start >= CHUNK_BYTES:
             chunks.append(_Chunk(start, end))
             start = end
     if start < size:
         chunks.append(_Chunk(start, size))
+    # transformers' loop takes the tensors in natural key order (layers 0, 1, 2, ...: core_model_loading
+    # dot_natural_key), the file holds them alphabetically (0, 1, 10, 11, ...): the thread reads the
+    # chunk with the loop's earliest tensor first
+    for chunk in chunks:
+        keys = [_natural(key) for first, end, key in tensors if chunk.start <= first and end <= chunk.end]
+        chunk.order = min(keys) if keys else ()
     return _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
+
+
+def _natural(key):
+    """Sort key of a state-dict name with its numbers compared as numbers."""
+    return tuple((0, int(part), "") if part.isdigit() else (1, 0, part) for part in key.split("."))
 
 
 # ---------------------------------------------------------------- the reading thread
@@ -154,7 +167,7 @@ def _read(files, device):
             entry.buffer = torch.empty(entry.size, dtype=torch.uint8)
             fd = os.open(entry.path, os.O_RDONLY)
             try:
-                for chunk in entry.chunks:
+                for chunk in sorted(entry.chunks, key=lambda c: c.order):
                     view = entry.buffer[chunk.start:chunk.end]
                     _read_into(fd, entry.data_start + chunk.start, view, chunk.end - chunk.start)
                     ok = cudart.cudaHostRegister(view.data_ptr(), chunk.end - chunk.start, 0) == cudart.cudaError.success
