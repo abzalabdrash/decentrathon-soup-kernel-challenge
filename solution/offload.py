@@ -659,34 +659,6 @@ def _real_cuda_trainer(trainer):
 # maps its own; "0" (default) leaves the cache alone. The allocator's settings are not touched.
 EMPTY_CACHE = os.environ.get("SOUP_SOLUTION_EMPTY_CACHE", "0").strip().lower()
 
-# SOUP_SOLUTION_GC_PAUSE: Python's garbage collector during the training (Soup's train, the loop
-# included): "freeze" moves every object made before (the model, the libraries: millions) to the
-# permanent generation, so the collections in the loop only walk what the loop makes; "off" also
-# disables the automatic collections until the training returns; "0" leaves the collector alone.
-# Afterwards the collector is enabled again (if it was); frozen objects stay frozen (startup.py
-# freezes the imports' objects at the end of apply() the same way, and a training's objects are
-# freed by reference counting).
-GC_PAUSE = os.environ.get("SOUP_SOLUTION_GC_PAUSE", "0").strip().lower()
-
-
-@contextlib.contextmanager
-def _gc_paused():
-    import gc
-
-    if GC_PAUSE not in ("freeze", "off"):
-        yield
-        return
-    enabled = gc.isenabled()
-    gc.freeze()
-    if GC_PAUSE == "off":
-        gc.disable()
-    try:
-        yield
-    finally:
-        if enabled:
-            gc.enable()
-
-
 def patch_soup_train_offload():
     """SFTTrainerWrapper.train runs inside offload_saved_tensors when its trainer is real and on
     CUDA; anything else (Soup's regression tests with fake trainers, CPU) runs the original."""
@@ -726,7 +698,7 @@ def patch_soup_train_offload():
         from .adam_host import moments_on_host
 
         with offload_saved_tensors(weights=[*model.parameters(), *model.buffers()]) as offloader, \
-                _gc_paused(), moments_on_host() as moments:
+                moments_on_host() as moments:
             result = original(self, *args, **kwargs)
         print(f"[solution] mlp offload: {offloader.summary()}", flush=True)
         if moments is not None:
