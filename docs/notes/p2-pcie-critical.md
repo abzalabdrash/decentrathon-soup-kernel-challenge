@@ -109,6 +109,22 @@ the same results. Two slots per type add nothing on top (+20 MiB); a deeper offl
 (+60 MiB). On the jury-like rows early release is neutral (above): their longer steps already hid most
 of these copies (113 ms of backward matrix waits per run there against 1.4 s here).
 
+**Upper bounds of what PCIe costs, public rows (soup-p2-ub-pub, 55f4e3e, 5 variants x 2 rounds + warm
+run, one session; Astra's diagnostic, not candidates):**
+
+| variant | wall s | steps 3+ s | vs main | vs early release | nvidia-smi |
+|---|---|---|---|---|---|
+| main (early release off) | 45.48 / 45.79 (45.64) | 24.68 | | | 395 |
+| early release | 45.28 / 45.18 (45.23) | 24.33 | -0.41 | | 395 |
+| all NF4 resident (`SOUP_SOLUTION_WEIGHT_STREAM=0`) | 44.88 / 44.28 (44.58) | 24.04 | -1.06 | -0.65 | 1,025 |
+| head resident (`SOUP_SOLUTION_HEAD_STREAM=0`) | 45.14 / 45.14 (45.14) | 24.04 | -0.50 | -0.09 | 1,123 |
+| weights + head + activations resident (+ `SOUP_SOLUTION_MLP_MEMORY=none`) | 43.62 / 43.27 (43.45) | 23.01 | -2.19 | -1.79 | 3,181 |
+
+Early release holds in this second independent session (-0.41 s after -0.43). After it, removing every
+byte of PCIe at any memory cost buys at most ~1.8 s on the public rows: the NF4 stream ~0.65 s (below
+Astra's 1 s bar: partial NF4 residency is not worth memory), the head ~0.1 s, the activations ~1 s
+(I1's side). The rest of the step's idle time is the CPU.
+
 **Head options, public rows (soup-p2-abba-head, b8d5902, 3 variants x 2 rounds + warm run):** early
 release 44.52 / 46.53 s (45.53), + `SOUP_SOLUTION_HEAD_SLOTS=3` 46.69 / 46.91 (46.80), +
 `SOUP_SOLUTION_HEAD_PREFETCH=embedding` 46.99 / 46.79 (46.89, peak 415). The session drifted by 2 s (the
