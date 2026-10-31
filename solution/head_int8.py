@@ -60,14 +60,22 @@ from .head_stream import BLOCK_D, head_finish_kernel
 
 START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "2"))
 NN = os.environ.get("SOUP_SOLUTION_HEAD_INT8_NN", "0").strip().lower() not in ("0", "false", "no", "")
-T_TILE = 64  # int8_transpose_kernel's square tile (64-byte rows in and out)
+# int8_transpose_kernel's square tile and warps: T4, one head's 38 transposes, 2.47 ms against 2.77 for 64 x 64
+# with 4 warps (soup-h1-kern1)
+T_TILE, T_WARPS = 128, 8
+# SOUP_SOLUTION_HEAD_INT8_TSTREAM=1: the transpose of each chunk on a side stream (it waits only for the
+# chunk's copy and the previous backward GEMM), overlapping the forward GEMM and the chunk kernel; it
+# then needs its own 6 MiB buffer instead of the logits'
+TSTREAM = os.environ.get("SOUP_SOLUTION_HEAD_INT8_TSTREAM", "0").strip().lower() not in ("0", "false", "no", "")
 QUANT_ROWS = 1024  # vocabulary rows per quantization step of the build (transient GPU memory ~10 MiB)
 ACC_BLOCK = 512
 # hidden rows per forward GEMM: the int32 logits of a chunk (FWD_ROWS x 4096 x 4 bytes, 16 MiB) are
 # twice the fp16 head's per row, so long steps take the forward in blocks of rows
 PBOUND = os.environ.get("SOUP_SOLUTION_HEAD_INT8_PBOUND", "0").strip().lower() not in ("0", "false", "no", "")
 RPP = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_RPP", "1"))  # rows per program of the chunk kernel
-WARPS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARPS", "0"))  # 0: head_stream's choice (x RPP)
+# warps of the chunk kernel: T4, one head at 830 tokens, 16 warps 5.8-6.0 ms against 8.5-9.8 for 8 and 8.0-9.5
+# for 4 (soup-h1-kern1; head_stream's fp16 kernel is fastest with 8); 2-8 rows per program were slower
+WARPS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARPS", "16"))
 FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "1024")) // 8 * 8, 24)
 
 
@@ -322,6 +330,7 @@ class HeadInt8:
         from .head_stream import _num_warps
 
         self.num_warps = WARPS if WARPS in (1, 2, 4, 8, 16, 32) else min(_num_warps(self.block) * RPP, 32)
+        self._t_stream = None
         self.ready, self.error, self.seconds = False, None, 0.0
         self.calls = 0  # heads that asked (take())
         self.log = log
@@ -466,7 +475,15 @@ class HeadInt8:
         lab_pad = _pad_rows(n_lab)
         g32 = torch.empty(lab_pad, d, dtype=torch.int32, device=dev) if n_lab else None
         pq_buf = torch.empty(lab_pad * rows, dtype=torch.int8, device=dev)
-        q_t = l32.view(torch.int8)
+        side = None
+        if TSTREAM and n_lab and not NN:
+            if self._t_stream is None:
+                self._t_stream = torch.cuda.Stream(device=dev)
+            side = self._t_stream
+            q_t = torch.empty(d * rows, dtype=torch.int8, device=dev)
+            t_done, b_done = torch.cuda.Event(), torch.cuda.Event()
+        else:
+            q_t = l32.view(torch.int8)
         views = {}  # chunk rows -> (int32 logits, P_q): two sizes at most
         for c in range(self.n_chunks):
             c0 = c * rows
@@ -474,6 +491,15 @@ class HeadInt8:
             slot = st._acquire(c, compute)
             q = slot[:vc * d].view(torch.int8).view(vc, d)
             sv = slot[vc * d:vc * (d + 4)].view(torch.float32)
+            if side is not None:
+                q_cols = q_t[:d * vc].view(d, vc)
+                side.wait_event(st._ready[c % st.slots])
+                if c:
+                    side.wait_event(b_done)  # the previous backward GEMM has read q_t
+                with torch.cuda.stream(side):
+                    int8_transpose_kernel[(triton.cdiv(vc, T_TILE), triton.cdiv(d, T_TILE))](
+                        q, q_cols, vc, d, T=T_TILE, num_warps=T_WARPS)
+                t_done.record(side)
             chunk = views.get(vc)
             if chunk is None:
                 chunk = views[vc] = ([(h_q[b0:b0 + _pad_rows(nb)], l32[:_pad_rows(nb) * vc].view(-1, vc))
@@ -498,10 +524,15 @@ class HeadInt8:
                 if NN:
                     torch._int_mm(p_q, q, out=g32)
                     st._release(c, compute)
+                elif side is not None:
+                    compute.wait_event(t_done)
+                    st._release(c, compute)
+                    torch._int_mm(p_q, q_cols.t(), out=g32)
+                    b_done.record(compute)
                 else:
                     q_cols = q_t[:d * vc].view(d, vc)
                     int8_transpose_kernel[(triton.cdiv(vc, T_TILE), triton.cdiv(d, T_TILE))](
-                        q, q_cols, vc, d, T=T_TILE, num_warps=4)
+                        q, q_cols, vc, d, T=T_TILE, num_warps=T_WARPS)
                     st._release(c, compute)  # the slot is read no more: its next chunk may come
                     torch._int_mm(p_q, q_cols.t(), out=g32)
                 head_i8_acc_kernel[(n_lab, triton.cdiv(d, ACC_BLOCK))](
@@ -562,4 +593,4 @@ def warm_kernels(obj=None):
         compile_kernel(head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, hidden,
                        FIRST=first, BLOCK=ACC_BLOCK, num_warps=4)
     if not NN:
-        compile_kernel(int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=4)
+        compile_kernel(int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)

@@ -242,6 +242,19 @@ def test_rows_per_program_kernel(streamed, monkeypatch, rpp, pbound):
         assert torch.allclose(x.float(), y.float(), rtol=1e-6, atol=1e-6), name
 
 
+def test_transpose_on_a_side_stream(streamed, monkeypatch):
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(640, 0.6, 1.0, seed=17)
+    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    monkeypatch.setattr(head_int8, "TSTREAM", True)
+    for _ in range(3):
+        b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+        for x, y in zip(a, b):
+            assert torch.equal(x, y)
+
+
 def test_nn_backward_matches_transposed(streamed, monkeypatch):
     from solution import head_int8
 

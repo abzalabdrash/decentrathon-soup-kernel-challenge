@@ -275,10 +275,13 @@ def main():
     print(f"int8 copy ready {int8.ready} ({int8.error}) in {time.perf_counter() - started:.2f} s "
           f"(build + compile in the thread {int8.seconds:.2f} s), smoothing {int8.col is not None}", flush=True)
     fwd_rows = [int(x) for x in re.split(r"[,/]", args.fwd_rows)]
-    configs = [(f"ring of 2, forward in {r}-row blocks", 2, False, r) for r in fwd_rows]
-    configs.append(("resident", streamer.n_chunks, False, fwd_rows[0]))
-    for label, slots, nn, rows in configs:
-        head_int8.NN, head_int8.FWD_ROWS = nn, rows
+    configs = [(f"ring of 2, forward in {r}-row blocks", 2, False, r, False) for r in fwd_rows]
+    configs.append((f"ring of 2, forward in {fwd_rows[0]}-row blocks, transpose on a side stream", 2, False,
+                    fwd_rows[0], True))
+    configs.append(("resident", streamer.n_chunks, False, fwd_rows[0], False))
+    configs.append(("resident, transpose on a side stream", streamer.n_chunks, False, fwd_rows[0], True))
+    for label, slots, nn, rows, tstream in configs:
+        head_int8.NN, head_int8.FWD_ROWS, head_int8.TSTREAM = nn, rows, tstream
         streamer.configure(rows=args.rows, slots=slots)
         for n in tokens:
             for frac in fracs:
