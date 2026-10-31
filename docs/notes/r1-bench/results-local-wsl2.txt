@@ -1,0 +1,66 @@
+Host: WSL2 Ubuntu, conda env "soup" (torch 2.11.0+cu130, triton 3.6.0, bitsandbytes 0.50.2),
+CPU AMD Ryzen 7 260 w/ Radeon 780M (16 logical), GPU NVIDIA GeForce RTX 5060 Laptop (driver 582.05).
+Not the Kaggle T4 host. All numbers are median-of-7 per-call enqueue times in microseconds
+(the loop ends before GPU sync; n kept at 80-20000 to stay under the launch queue).
+
+bench_cpu_ops.py
+cpu add_ scalar (16 el), python method                    1.87 us
+cpu torch.ops.aten.add_.Tensor direct                     2.44 us
+cpu attr read .shape (plain tensor)                       0.06 us
+cuda add_ scalar (16 el)                                  8.03 us
+cuda torch.ops.aten.add_.Tensor direct                   11.38 us
+triton launch, 1 CTA, BLOCK 1024                         13.28 us
+cublas addmm M=1 K=N=1536 fp16 (enqueue)                 19.43 us
+cublas addmm M=832 K=N=1536 fp16 (enqueue)               13.35 us
+cuda Event.record()                                       3.80 us
+current_stream().wait_event(ev) (done event)              0.61 us
+with torch.cuda.stream(s): pass                           6.15 us
+autograd.Function.apply (identity, fwd only)              3.86 us
+native view_as under grad mode                            1.03 us
+autograd.Function.apply under no_grad                     2.84 us
+attr .shape on plain Tensor                               0.06 us
+attr .shape on nn.Parameter (__torch_function__ disabled)      0.08 us
+attr .shape on bnb Params4bit (python __torch_function__)      0.99 us
+attr .requires_grad on Params4bit                         0.88 us
+attr .dtype on Params4bit                                 0.88 us
+attr .quant_state on Params4bit (python __dict__)         0.03 us
+bnb Linear4bit fwd M=832, grad on (MatMul4Bit.apply)    134.96 us
+bnb Linear4bit fwd M=832, no_grad (gemm_4bit)           116.76 us
+bnb Linear4bit fwd M=1, no_grad (gemm_4bit)              37.90 us
+.item() on idle GPU (sync round trip)                    32.97 us
+loop add_ over 450 tensors (per 450-tensor pass)       4423.38 us
+torch._foreach_add_ over 450 tensors (per pass)          69.98 us
+
+bench_cpu_ops2.py
+cuda aten.add_.Tensor pre-bound                           7.06 us
+cuda torch.ops.aten.add_.Tensor (chain each call)         7.64 us
+cuda g.add_(1.0) method                                   7.52 us
+cuda torch.empty(16, device=cuda)                         1.31 us
+triton JIT launch kernel[(1,)](...)                       9.92 us
+triton CompiledKernel[(1,1,1)](...) reused handle         FAILED (TypeError: 16 args expected, 15 given; runner
+                                                          signature in triton/compiler/compiler.py:490-500, not fixed)
+LoRA module eager (clone, dropout, A, B, scale, add) M=832   96.20 us
+LoRA module eager without dropout M=832                     75.42 us
+
+bench_cpu_ops3.py (queue-safe, n=80)
+bnb Linear4bit fwd M=832 grad on (MatMul4Bit.apply)     124.29 us
+bnb Linear4bit fwd M=832 no_grad                         93.21 us
+LoRA module eager, dropout, clone, add (M=832)           95.19 us
+LoRA module eager, no dropout (M=832)                    89.09 us
+loop add_ over 450 tensors (per 450-tensor pass)       4420.81 us
+torch._foreach_add_ over 450 tensors (per pass)          61.70 us
+
+bench_data_attr.py
+p.data read on Params4bit: 1.17 us; the returned object is a plain torch.Tensor without quant_state
+p.grad 0.90 us; p.is_cuda 0.85 us; p.ndim 0.87 us (all Params4bit)
+
+bench_bnb_stack.py (28 layers, Qwen2.5-1.5B shapes, 7 Linear4bit per layer, frozen NF4, backward to input)
+M=1:   forward enqueue 15.8 ms, backward enqueue 27.3 ms, total CPU 43.2 ms (1.54 ms per layer);
+       GPU wall of one step 78.5 ms (events) -> at M=1 the queue may back-pressure, treat as upper bound
+M=832, run 2: forward enqueue 29.3 ms, backward enqueue 97.7 ms, total CPU 126.9 ms; GPU wall 226.0 ms -> GPU-bound
+       M=832, run 1 (same code without the GPU-wall timer): forward 99.6 ms, backward 84.4 ms, total 184.0 ms.
+       The M=832 enqueue split is unstable between runs (queue back-pressure); do not use it as a CPU floor.
+
+bench_hooks.py (CPU tensors, 2000 chained muls, one saved tensor each)
+per mul fwd+bwd CPU, no hooks     4.74 us
+per mul fwd+bwd CPU, python hooks 9.57 us  (identity pack+unpack: +4.8 us per saved tensor)
