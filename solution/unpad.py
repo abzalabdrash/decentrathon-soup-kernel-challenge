@@ -58,6 +58,11 @@ _STATE = {
     "pad": int(os.environ.get("SOUP_SOLUTION_PAD_TOKENS", "16") or "0"),
     "varlen": _env_flag("SOUP_SOLUTION_VARLEN_ATTN", "1"),
     "carry": _env_flag("SOUP_SOLUTION_CARRY_RESIDUAL", "1"),
+    # the attention backward's key splits (aten's num_splits_key; 0 = the kernel's own choice). One
+    # split: each key block's dK/dV is summed by one program (no fp32 accumulation workspace per
+    # split: the step's peak sat in this backward after the early gate|up offload, 78.8 MiB in the
+    # op at ~1,400 tokens) and dQ is added in a fixed order, so it is bit-reproducible
+    "splits_key": int(os.environ.get("SOUP_SOLUTION_ATTN_SPLITS_KEY", "0") or "0"),
     "tail_id": None,  # the tail's token id; None: the last real id (tests vary it)
 }
 _CTX = {"spans": None, "cu": None, "last_mlp": None}
@@ -253,13 +258,28 @@ class _VarlenAttention(torch.autograd.Function):
             q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
             ctx.recompute = None
         grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
-        grad_q, grad_k, grad_v, _ = torch.ops.aten._efficient_attention_backward(
-            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), None, out, cu, cu,
-            max_len, max_len, lse, 0.0, seed, offset, _CAUSAL_FROM_TOP_LEFT, False, scale=scale)
+        grad_q, grad_k, grad_v, _ = _efficient_backward(
+            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
+            seed, offset, scale)
         if groups > 1:  # the expansion's backward: the sum over each kv head's q heads
             grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
             grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
         return grad_q, grad_k, grad_v, None, None, None, None
+
+
+def _efficient_backward(grad_out, q, k, v, out, cu, max_len, lse, seed, offset, scale):
+    """aten's variable-length memory-efficient backward, with SOUP_SOLUTION_ATTN_SPLITS_KEY when set
+    (a torch without the keyword takes the kernel's own choice from then on)."""
+    args = (grad_out, q, k, v, None, out, cu, cu, max_len, max_len, lse, 0.0, seed, offset,
+            _CAUSAL_FROM_TOP_LEFT, False)
+    splits = _STATE["splits_key"]
+    if splits > 0:
+        try:
+            return torch.ops.aten._efficient_attention_backward(*args, scale=scale,
+                                                                num_splits_key=splits)
+        except (TypeError, RuntimeError):
+            _STATE["splits_key"] = 0
+    return torch.ops.aten._efficient_attention_backward(*args, scale=scale)
 
 
 def _sdpa_dtype(t):
