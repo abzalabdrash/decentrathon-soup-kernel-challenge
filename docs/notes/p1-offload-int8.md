@@ -145,6 +145,21 @@ Wall -0.58 s, steps 3+ -0.68 s, median step -5.8 %, the same peak. On the public
 no PCIe bound, so this gain is mostly the backward's SwiGLU and quantization kernels reading half the
 bytes (int8 form) and the shorter D2H/H2D contention with the weight stream.
 
+**bbc1001 on 2,048-token steps (soup-p1-abba-long3, `--select longest`, seed 157):**
+
+| variant | wall s | steps 3+ s | median step | step 0 | nvidia-smi | alloc | own |
+|---|---|---|---|---|---|---|---|
+| off | 77.93 / 77.52 | 55.27 | 0.895 | 0.982 | 453 | 284.5 | 14.4 % |
+| i8 | 76.78 / 76.77 | 54.40 | 0.883 | 1.001 | 453 | 284.5 | 17.4 % |
+
+Wall -0.95 s, steps 3+ -0.88 s, the same peak: where the separate quantization pass lost 1.1 s (d0d48a0),
+the SwiGLU-fused form and the int8-form backward gain about a second.
+
+**Summary of the go/no-go (same-session ABBA, i8 against off):** jury-like rows -0.46 s wall / -0.88 s
+training phase (1e0eac4, with the 0.4 s switch-step stall that bbc1001 removes), public rows -0.58 s
+(1e0eac4), 2,048-token rows -0.95 s (bbc1001); peak equal everywhere (395 public, 453 jury-like and
+long); 10 of 10 in the full run.
+
 ## 6. Full + jury
 
 **Full, bbc1001** (soup-p1-full, peagverr; int8 on in `soup train`, as the measured process runs it):
