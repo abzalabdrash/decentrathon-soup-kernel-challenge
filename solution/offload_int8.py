@@ -25,7 +25,7 @@ Numerics: the forward, the loss and the eval are untouched; the SwiGLU derivativ
 gradients against the half offload: bench_offload_int8.py, test_offload_int8.py).
 
 The two kernels are compiled by a thread started at the first MLP backward of the second step (raw());
-the first START_CALLS offloads stay half (four steps of 28 layers), the next one waits for the thread if
+the first START_CALLS offloads stay half (seven steps of 28 layers), the next one waits for the thread if
 it is not done, so which offloads go int8 never depends on timing (int8_bwd.py does the same).
 """
 
@@ -42,9 +42,10 @@ from .int8_bwd import _soup_train_process
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8", "1" if _soup_train_process() else "0")
           .strip().lower() not in ("0", "false", "no", ""), "thread": None, "calls": 0, "backwards": 0}
-START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "112"))
+# seven steps of 28 layers: soup-p1-abba-jury3 switched at step 4 and waited 0.4 s there for the thread
+START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "196"))
 # MLP backwards before the compile thread starts: not during the first step (soup-p1-abba-pub2: a
-# thread started there put step 0 +0.13 s later); three steps are left for it before START_CALLS
+# thread started there put step 0 +0.13 s later); six steps are left for it before START_CALLS
 COMPILE_AFTER = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_COMPILE_AFTER", "28"))
 # features per scale (64, 128 or 256 divide Qwen2.5-1.5B's 8960); tokens per program
 GROUP = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_GROUP", "128"))
@@ -253,4 +254,8 @@ def _warm():
                    GROUP=GROUP, TM=TILE_M, SWIGLU=True, num_warps=WARPS)
     compile_kernel(gu_dequant_kernel, torch.int16, torch.float32, half, INTERMEDIATE, tokens,
                    GROUP=GROUP, TM=TILE_M, num_warps=WARPS)
+    from . import int8_bwd
+
+    if RAW["on"] and int8_bwd._STATE["on"]:  # the int8 MLP backward reading the int8 form
+        int8_bwd.warm_int8_in(GROUP)
     return None

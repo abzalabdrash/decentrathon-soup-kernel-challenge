@@ -368,14 +368,19 @@ def _warm():
                            ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
     compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, half, half, f32, INTERMEDIATE, tokens,
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=1, INT8_IN=False)
-    from . import offload_int8
-
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
-    if offload_int8._STATE["on"] and offload_int8.RAW["on"]:  # its raw unpack hands the int8 form over
-        compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, torch.int16, f32, f32, INTERMEDIATE,
-                       tokens, INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=offload_int8.GROUP,
-                       INT8_IN=True)
-        compile_kernel(quant_t_int8_il_kernel, i32, f32, f32, i8, INTERMEDIATE, tokens,
-                       GROUPS=GROUPS, TR=TQ_R, TM=TQ_M, BF16=half == torch.bfloat16)
     return None
+
+
+def warm_int8_in(group):
+    """The INT8_IN variants (offload_int8.py's int8 form read directly), compiled by offload_int8's own
+    thread: this module's thread compiles what main's does."""
+    from .warmup import INTERMEDIATE, TOKENS, compile_kernel, training_half_dtype
+
+    tokens = -(-TOKENS // 16) * 16
+    half, f32, i8, i32 = training_half_dtype(), torch.float32, torch.int8, torch.int32
+    compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, torch.int16, f32, f32, INTERMEDIATE,
+                   tokens, INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=group, INT8_IN=True)
+    compile_kernel(quant_t_int8_il_kernel, i32, f32, f32, i8, INTERMEDIATE, tokens, GROUPS=GROUPS,
+                   TR=TQ_R, TM=TQ_M, BF16=half == torch.bfloat16)

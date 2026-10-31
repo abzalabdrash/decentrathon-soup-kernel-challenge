@@ -99,10 +99,26 @@ int8 write: locally 0.10 ms at 832 and 0.17 ms at 2,048 over the example SwiGLU 
 | | | i8 fused | 83.18 / 83.36 | 59.84 | 1.115 | 513 | 320.6 |
 | | | i8 rebuild pass | 84.53 / 84.49 | 61.05 | 1.077 | 553 | 284.5 |
 
-Bytes to the host over a long-row run: 143.5 GiB (off) -> 87.9 GiB (i8). Step 0 is +0.13 s with int8:
-the compile thread competes with the first step.
+| 1f44bbc: + d_gate/d_up interleaved as half words over the int32 product (soup-p1-abba-jury) | jury-like (seed 157, train 42000:42256, eval 51800:52056) | off | 50.35 / 52.91 | 30.16 | 0.665 | 453 | 267.6 |
+| | | i8 | 55.96 / 56.12 | 34.15 | 0.740 | 453 | 268.6 |
+| 1f44bbc (soup-p1-abba-pub3) | public | off | 47.60 / 47.50 | 26.80 | 0.501 | 395 | 229.3 |
+| | | i8 | 49.85 / 50.36 | 29.13 | 0.622 | 395 | 230.1 |
+| cebfd3e: int8 form made in place by the SwiGLU forward (soup-p1-abba-jury2) | jury-like | off | 50.98 / 51.13 | 30.90 | 0.667 | 453 | 267.6 |
+| | | i8 | 53.65 / 53.90 | 33.57 | 0.717 | 453 | 268.6 |
 
-TODO: cebfd3e on jury rows (seed 157, train 42000:42256, eval 51800:52056) and public rows.
+Bytes to the host over a long-row run: 143.5 GiB (off) -> 87.9 GiB (i8). Step 0 is +0.13 s with int8:
+the compile thread competes with the first step (62c2094 starts it after the first step).
+
+1f44bbc and cebfd3e lost 2.6-4.4 s to two slow kernels, not to the offload: with d_gate / d_up written as
+interleaved half words (stride-2 stores) and per-element scale gathers, int8_swiglu_bwd_kernel took 0.94
+ms instead of 0.23 at 832 tokens (2.16 / 0.62 at 2,048) and the transposing quantization 0.36 / 0.09
+(own-kernel share 29-30 % against 16-17 %). 1e0eac4 stores one 32-bit word per element and loads one
+scale vector per 32-row tile: 0.190 ms from the int8 form against 0.225 from the half one at 832 tokens,
+0.545 / 0.625 at 2,048; quantization 0.080 / 0.093 and 0.299 / 0.303 (RTX 5060). The memory of
+1f44bbc / cebfd3e is that of off (453 MiB on the jury rows, 395 public): the earlier +40 / +60 MiB are
+gone.
+
+TODO: 1e0eac4 on jury-like and public rows.
 
 ## 6. Full + jury
 
