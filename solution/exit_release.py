@@ -84,10 +84,22 @@ def report():
             f"unregistered{device} in {_STATE['seconds']:.2f} s" + (f" ({_STATE['error']})" if _STATE["error"] else ""))
 
 
+def _late():
+    return os.environ.get("SOUP_SOLUTION_EXIT_RELEASE", "").strip().lower() == "late"
+
+
 def patch_soup_exit_release():
     """SFTTrainerWrapper.train gets a callback that starts the release at the last step's end (or at
     the train end, if training stops before max_steps); fake trainers (Soup's tests) and CPU runs
-    are left alone."""
+    are left alone.
+
+    SOUP_SOLUTION_EXIT_RELEASE=late starts it after Soup's final `trainer.save_model(output_dir)`
+    instead (soup_cli/trainer/sft.py:2537; the checkpoint's own call passes `_internal_call=True`),
+    or at the end of train() if that call never came. Released at the last step, the thread's
+    cudaFreeHost holds up the checkpoint's device-to-host copies: on the T4 the last step -> train end
+    tail is 0.86-1.08 s (median 0.94, 113 runs) with the release against 0.45-0.60 s (median 0.51,
+    141 runs) without it (docs/notes/recon/tail.md). After the final save the main thread does CPU
+    work only (Soup's tokenizer save, tracker, summary)."""
     from soup_cli.trainer import sft as soup_sft
 
     cls = soup_sft.SFTTrainerWrapper
@@ -103,6 +115,8 @@ def patch_soup_exit_release():
             from transformers import TrainerCallback
 
             device = next(trainer.model.parameters()).device
+            if _late():
+                return _train_release_late(original, self, trainer, device, args, kwargs)
             # an evaluation after the last step would run the model (copies from the host buffers):
             # with one configured the release waits for the end of train()
             strategy = getattr(getattr(trainer, "args", None), "eval_strategy", "no")
@@ -121,3 +135,30 @@ def patch_soup_exit_release():
 
     cls.train = train
     cls._soup_exit_release = True
+
+
+def _train_release_late(original, wrapper, trainer, device, args, kwargs):
+    """Runs Soup's train() with the trainer's save_model wrapped on the instance for its duration: the
+    first call without `_internal_call` (Soup's final save; the checkpoint's goes through
+    `_save_checkpoint` with `_internal_call=True`) starts the release once it has returned. If no
+    such call came (another save path, a stopped run), the release starts when train() returns."""
+    bound = trainer.save_model
+    own = trainer.__dict__.get("save_model")  # an instance attribute set by someone else, put back after
+
+    def save_model(*save_args, **save_kwargs):
+        result = bound(*save_args, **save_kwargs)
+        if not save_kwargs.get("_internal_call", False):
+            start_release(device)
+        return result
+
+    trainer.save_model = save_model
+    try:
+        result = original(wrapper, *args, **kwargs)
+    finally:
+        if trainer.__dict__.get("save_model") is save_model:
+            if own is None:
+                del trainer.save_model
+            else:
+                trainer.save_model = own
+    start_release(device)
+    return result
