@@ -23,7 +23,9 @@ case "$acct" in
   2) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle2.token; user=peagverr ;;
   3) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle3.token; user=slerfas ;;
   4) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle7.token; user=dinarakoshkaeva ;;
-  *) echo "first argument: account 1 (namedesign), 2 (peagverr), 3 (slerfas) or 4 (dinarakoshkaeva)"; exit 2 ;;
+  5) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle4.token; user=shyraylym ;;
+  6) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle5.token; user=zhemishan ;;
+  *) echo "first argument: account 1 (namedesign), 2 (peagverr), 3 (slerfas), 4 (dinarakoshkaeva), 5 (shyraylym) or 6 (zhemishan)"; exit 2 ;;
 esac
 slug=soup-kernel-run
 prev=""
