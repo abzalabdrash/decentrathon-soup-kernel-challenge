@@ -519,6 +519,15 @@ def install_light_triton_key():
         return False
 
 
+def _triton_knob(group, name):
+    try:
+        from triton import knobs
+
+        return getattr(getattr(knobs, group), name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _prepare_triton():
     """What the first compile of the process does once, done before the workers start so that they
     do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
@@ -615,6 +624,14 @@ def _run(device, log, workers, switch):
         # interval stays at the interpreter's default while the warm-up runs (`switch` is unused).
         previous = ours = None
         _prepare_triton()
+        from . import launcher_one
+
+        if launcher_one.enabled():  # SOUP_SOLUTION_LAUNCHERS_ONE: every launcher in one compiler run
+            torch.cuda.set_stream(stream)  # as in the workers (the probed registrations only compile)
+            impl = _triton_knob("build", "impl")  # the -O0 launcher build when it is ours, else triton's
+            launcher_one.start([(name, fn) for name, fn in list(_STATE["queue"].queue)
+                                if name not in FIRST and launcher_one.probe_safe(fn)],
+                               build=impl if getattr(impl, "_soup_launcher_build", None) else None)
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any
         # Executor, triton/runtime/_async_compile.py)
@@ -655,11 +672,15 @@ def _run(device, log, workers, switch):
                      + (f", {_AHEAD['failed']} failed" if _AHEAD["failed"] else "")
                      + (f", stopped: {_AHEAD['error']}" if _AHEAD["error"] else "")
                      if _AHEAD["thread"] is not None else "")
+            from . import launcher_one
+
+            one = launcher_one.report()
             print(f"[solution] warmup done in {_STATE['seconds']:.2f} s"
                   + (f" ({len(compiled) - loaded} kernels compiled, {loaded} read from the on-disk "
                      f"cache)" if _HOOKS["installed"] else "")
                   + f": {done or 'nothing'}"
-                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else "") + ahead,
+                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else "") + ahead
+                  + (f"; {one}" if one else ""),
                   flush=True)
 
 
