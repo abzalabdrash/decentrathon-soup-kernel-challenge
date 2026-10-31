@@ -91,3 +91,36 @@ rms_norm_rows_rebuild 1.50 s, nf4_dequant4 1.18, head_finish 1.02, masked_pair_s
 `SOUP_SOLUTION_WARMUP_NICE=<n>` (warmup.py `lower_thread_priority`; allowed by the organizers): the warm-up's
 worker threads and the one-build thread raise their own Linux nice value (`os.setpriority` on the thread
 id; the C compiler and ptxas they start inherit it); the main thread and the process keep theirs.
+
+soup-l2-m1 (Modal T4, glofcast-prod, an x8 host; d6ce5de; first step / apply end / setup end / tensor loop
+/ wall):
+- base 10.35 / 3.75 / 7.15 / 1.45 / 49.17
+- all (PREPIN + SPEC + EARLY + ONE_SYNC + META_INIT + TRACKER) 11.03 / 4.87 / 7.84 / 0.97 / 49.64
+- allnice (+ WARMUP_NICE=19) 10.95 / 4.81 / 7.75 / 0.97 / 49.45
+- nice (WARMUP_NICE=19 alone) 10.13 / 3.69 / 7.00 / 1.42 / 48.59
+On this host the early read and the pinning of 2.9 GB next to the imports make apply 1.1 s longer (on
+Kaggle +0.09 s): the load set is host-dependent.
+
+soup-l2-m2 (Modal T4, x8 host; 7c0d52e; first step / apply end / setup end / tensor loop / wall):
+- base 10.24 / 3.71 / 7.09 / 1.44 / 48.80
+- all 10.98 / 4.83 / 7.81 / 0.95 / 49.47
+- late (all, the read started after the imports: SOUP_SOLUTION_LOAD_EARLY_START=imports_done) 11.44 / 5.24 /
+  8.23 / 0.95 / 50.02
+- small (ONE_SYNC + META_INIT + TRACKER + WARMUP_NICE=19, no early read) 10.40 / 3.80 / 7.17 / 1.52 / 49.23
+A later read makes apply longer still (5.24 s): the cost is not the read next to the imports but, most
+likely, the CUDA driver's lock: `cudaHostRegister` of 2.9 GB in 128 MiB chunks (and the spec thread's CUDA
+work) blocks the main thread's own CUDA calls in apply (bitsandbytes' import, the patches, the warm-up's
+start). On the Kaggle hosts that cost is ~0.1 s, on this Modal host 1.1-1.5 s.
+
+## Decision
+
+Everything of this branch stays off by default. Measured: on Kaggle (the jury's machine, one session,
+soup-l2-v3) the load set (LOAD_EARLY + LOAD_SPEC + LOAD_PREPIN + LOAD_ONE_SYNC + META_INIT + TRACKER_THREAD)
+gives first step -0.61 s and wall -0.64 s; on Modal (two sessions) +0.68..+0.74 s and +0.47..+0.67 s. A
+gain that depends on the host's driver behaviour is not safe to switch on from one session; a second
+Kaggle ABBA of base against that set decides it (if it again shows >= 0.5 s: switch on with
+`SOUP_SOLUTION_LOAD_EARLY`, `_LOAD_SPEC`, `_LOAD_PREPIN`, `_LOAD_ONE_SYNC` defaults to "1"). Next step if
+time allows: pageable early buffers (no cudaHostRegister next to the main thread's CUDA calls) or smaller
+registration chunks. WARMUP_NICE=19 alone: -0.22 s first step on Modal (one session), not measured on Kaggle.
+The remaining start is GIL-bound work that cannot move: imports 3.1 s, the dill hash 2.9 s, Soup's CLI and
+tokenizer ~1 s; with the load fully hidden the floor is ~8.5-9 s from apply begin.
