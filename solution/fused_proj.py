@@ -1129,12 +1129,13 @@ class _AttnBlock(torch.autograd.Function):
         seed, offset, max_len, scale, groups = ctx.attn_args
         cu = saved[-1]
         q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
+        kv = q.shape[2] // groups  # k and v may come expanded already (SOUP_SOLUTION_EXPAND_KV_ONCE)
         grad_q, grad_k, grad_v, _ = _efficient_backward(
-            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
-            seed, offset, scale)
+            grad_out, q, _expand_heads(k, q.shape[2] // k.shape[2]),
+            _expand_heads(v, q.shape[2] // v.shape[2]), out, cu, max_len, lse, seed, offset, scale)
         if groups > 1:
-            grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
-            grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
+            grad_k = grad_k.unflatten(2, (kv, groups)).sum(3)
+            grad_v = grad_v.unflatten(2, (kv, groups)).sum(3)
         del grad_out, q, k, v, out, lse
         # _QKVRope.backward (it took the transposes of these: the gradients of its q4, k4, v4)
         grads = _qkv_backward(ctx, saved[:ctx.qkv_count], grad_q, grad_k, grad_v, token_major=True)
@@ -1148,6 +1149,13 @@ class _AttnBlock(torch.autograd.Function):
 # of the q/k/v gradients (N x (nq + nk + nv) half) that _QKVRope's node held there. One autograd node
 # and the reshape's view node less per layer and direction. SOUP_SOLUTION_ATTN_ONE_FUNCTION=1 wins
 _ATTN["two_nodes"] = os.environ.get("SOUP_SOLUTION_ATTN_TWO_NODES", "1").strip().lower() \
+    not in ("0", "false", "no", "")
+# SOUP_SOLUTION_EXPAND_KV_ONCE=1 (task C1): the recompute expands k and v to the q heads once and
+# hands the same expanded tensors to its attention forward and to the attention backward (which
+# expanded the compact ones again): one strided copy of k and one of v less per layer and step, the
+# same bytes into both kernels. They live from the rebuild (the post-attention norm's backward) to the
+# attention backward as 12 heads instead of 2
+_ATTN["expand_once"] = os.environ.get("SOUP_SOLUTION_EXPAND_KV_ONCE", "0").strip().lower() \
     not in ("0", "false", "no", "")
 
 
@@ -1185,13 +1193,14 @@ class _QKVAttn(torch.autograd.Function):
         q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
         grad_out = grad.reshape(1, plan.n_tokens, plan.heads, plan.head_dim)
         grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+        kv = q.shape[2] // groups  # k and v may come expanded already (SOUP_SOLUTION_EXPAND_KV_ONCE)
         grad_q, grad_k, grad_v, _ = _efficient_backward(
-            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
-            seed, offset, scale)
+            grad_out, q, _expand_heads(k, q.shape[2] // k.shape[2]),
+            _expand_heads(v, q.shape[2] // v.shape[2]), out, cu, max_len, lse, seed, offset, scale)
         del grad_out, q, out, lse
         if groups > 1:
-            grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
-            grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
+            grad_k = grad_k.unflatten(2, (kv, groups)).sum(3)
+            grad_v = grad_v.unflatten(2, (kv, groups)).sum(3)
         del k, v
         # _QKVRope.backward on the gradients of its q4, k4, v4 (whose transposes it took)
         box = [grad_q, grad_k, grad_v]
@@ -1327,6 +1336,9 @@ class _AttnRecompute:
                          self.cos, self.sin, backward=False)
             v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
             q, k, v = kernel_operands(q4, k4, v4, half)
+        if _ATTN["expand_once"]:  # varlen_forward expands nothing when k and v have q's heads
+            groups = q.shape[2] // k.shape[2]
+            k, v = _compact(_expand_heads(k, groups)), _compact(_expand_heads(v, groups))
         out, lse, seed, offset = varlen_forward(q, k, v, self.cu, self.max_len, self.scale)
         self.tensors = (_compact(q), _compact(k), _compact(v), out, lse, seed, offset)
         self.x16 = x16
@@ -1349,6 +1361,9 @@ class _AttnRecompute:
                                for i, (start, end) in enumerate(zip(plan.bounds[:-1], plan.bounds[1:])))
                 elif name == "lse" and value.dim() == 3:  # one row of all tokens, aligned
                     same = torch.equal(value[..., :plan.n_tokens], want[..., :plan.n_tokens])
+                elif name in ("k", "v") and value.shape[2] != want.shape[2]:  # expanded once
+                    groups = value.shape[2] // want.shape[2]
+                    same = torch.equal(value, _expand_heads(want, groups))
                 else:
                     same = torch.equal(value, want.view_as(value))
                 if not same:

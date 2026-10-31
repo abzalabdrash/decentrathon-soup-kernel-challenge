@@ -1077,6 +1077,39 @@ def test_attention_two_nodes_backward_peak(layer_1p5b, monkeypatch):
     assert peaks["one"] >= peaks["three"] + n * 1024, peaks
 
 
+@pytest.mark.parametrize("mode", ["three", "two", "one"])
+def test_attention_expand_kv_once_is_bitwise(layer_1p5b, monkeypatch, mode):
+    """The recompute's k and v expanded once for its forward and the attention backward
+    (SOUP_SOLUTION_EXPAND_KV_ONCE) against the compact ones expanded twice: output, input gradient and
+    LoRA gradients bit for bit in each node layout, and the recompute's own check passes (its k and v
+    equal the forward's, expanded)."""
+    from solution import fused_proj, unpad
+
+    _, attn, _, rotary = layer_1p5b
+    monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", "all")
+    monkeypatch.setitem(unpad._STATE, "splits_key", 1)
+    _attention_mode(monkeypatch, mode)
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(0.05).train()
+    x, pe, grad = _attention_inputs(rotary, seed=48)
+    _fused(True)
+    try:
+        results = []
+        for once in (False, True):
+            monkeypatch.setitem(fused_proj._ATTN, "expand_once", once)
+            monkeypatch.setitem(fused_proj._RECOMPUTE, "check", True)
+            monkeypatch.setitem(fused_proj._RECOMPUTE, "mismatches", [])
+            torch.cuda.manual_seed(9)
+            results.append(_attention_step(attn, x, pe, grad))
+            assert fused_proj._RECOMPUTE["mismatches"] == []
+        (out0, dx0, g0), (out1, dx1, g1) = results
+        assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
+        assert all(torch.equal(a, b) for a, b in zip(g1, g0))
+    finally:
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
+
+
 @pytest.mark.parametrize("mlp_recompute", [False, True])
 def test_mlp_addmm_in_place_is_bitwise(layer_1p5b, monkeypatch, mlp_recompute):
     """The MLP's input gradient with its second GEMM adding into the first one's fp32 result in place

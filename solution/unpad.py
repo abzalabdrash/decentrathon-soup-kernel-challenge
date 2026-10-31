@@ -266,12 +266,15 @@ class _VarlenAttention(torch.autograd.Function):
             q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
             ctx.recompute = None
         grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+        # from fused_proj's recompute, k and v may come expanded to q's heads already
+        # (SOUP_SOLUTION_EXPAND_KV_ONCE): expanded here only when they are compact
+        kv = q.shape[2] // groups
         grad_q, grad_k, grad_v, _ = _efficient_backward(
-            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
-            seed, offset, scale)
+            grad_out, q, _expand_heads(k, q.shape[2] // k.shape[2]),
+            _expand_heads(v, q.shape[2] // v.shape[2]), out, cu, max_len, lse, seed, offset, scale)
         if groups > 1:  # the expansion's backward: the sum over each kv head's q heads
-            grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
-            grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
+            grad_k = grad_k.unflatten(2, (kv, groups)).sum(3)
+            grad_v = grad_v.unflatten(2, (kv, groups)).sum(3)
         return grad_q, grad_k, grad_v, None, None, None, None
 
 
