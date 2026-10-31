@@ -96,7 +96,9 @@ SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest 
 SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1: the thread `start_early` starts for triton's key also creates
 triton's CUDA driver (`_prepare_triton`: torch's CUDA init on the current device and the build of
 triton's cuda_utils module with the C compiler), during apply()'s imports, so that the warm-up does
-not begin with it; the warm-up waits for that thread before it touches the driver.
+not begin with it; the warm-up waits for the driver before it touches it. With =libs that thread
+then also runs the CUDA-library warm-ups (FIRST: cublas, step_ops) on a stream of its own, which the
+workers then skip; the warm-up counts as done only once that thread has ended too.
 Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
 the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
 launch is compile time the first step never needed.
@@ -530,7 +532,7 @@ def _prepare_triton():
     early = _EARLY["thread"]
     if early is not None and early is not threading.current_thread():
         begin = time.perf_counter()
-        early.join(EXIT_TIMEOUT)  # SOUP_SOLUTION_WARMUP_DRIVER_EARLY: never two driver creations at once
+        _EARLY["driver"].wait(EXIT_TIMEOUT)  # SOUP_SOLUTION_WARMUP_DRIVER_EARLY: never two creations at once
         _EARLY["waited"] = time.perf_counter() - begin
     from triton.runtime.driver import driver
 
@@ -538,25 +540,51 @@ def _prepare_triton():
     _triton_key()
 
 
-_EARLY = {"thread": None, "seconds": None, "waited": None, "error": None}
+_EARLY = {"thread": None, "seconds": None, "waited": None, "error": None, "libs": (),
+          "driver": threading.Event()}
 
 
-def _early_key_and_driver(driver_too):
-    """The thread `start_early` starts: triton's key, and with SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1
-    triton's CUDA driver too (see the module docstring)."""
+def _early_key_and_driver(driver_too, libs=()):
+    """The thread `start_early` starts: triton's key, and with SOUP_SOLUTION_WARMUP_DRIVER_EARLY
+    triton's CUDA driver too, then the registrations named in `libs` (see the module docstring)."""
     begin = time.perf_counter()
-    _triton_key()
-    if driver_too:
-        try:
-            import torch
+    try:
+        _triton_key()
+        if driver_too:
+            try:
+                import torch
 
-            if torch.cuda.is_available():
-                from triton.runtime.driver import driver
+                if torch.cuda.is_available():
+                    from triton.runtime.driver import driver
 
-                driver.active.get_current_device()
-        except Exception as exc:  # noqa: BLE001 - the warm-up creates it then
-            _EARLY["error"] = repr(exc)
-    _EARLY["seconds"] = time.perf_counter() - begin
+                    driver.active.get_current_device()
+            except Exception as exc:  # noqa: BLE001 - the warm-up creates it then
+                _EARLY["error"] = repr(exc)
+    finally:
+        _EARLY["driver"].set()
+        _EARLY["seconds"] = time.perf_counter() - begin
+    if not libs or _EARLY["error"] is not None:
+        return
+    try:
+        import torch
+
+        _STATE["idents"].add(threading.get_ident())
+        device = torch.cuda.current_device()
+        stream = torch.cuda.Stream(device)
+        torch.cuda.set_stream(stream)  # off the main thread's stream, as in _worker
+        found = dict(WARMUPS)
+        for name in libs:
+            if _STOP.is_set() or name not in found:
+                continue
+            start = time.perf_counter()
+            try:
+                skipped = found[name]() == SKIPPED
+                _STATE["results"][name] = SKIPPED if skipped else round(time.perf_counter() - start, 3)
+            except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
+                _STATE["errors"][name] = repr(exc)
+        stream.synchronize()
+    except Exception as exc:  # noqa: BLE001
+        _STATE["errors"]["(early)"] = repr(exc)
 
 
 def _setting(name, default, kind):
@@ -579,7 +607,7 @@ def _shutdown():
     waiting for the whole warm-up would add its seconds. In a training run the warm-up is long
     done at exit: nothing to wait for."""
     _STOP.set()
-    for thread in (_STATE["thread"], _AHEAD["thread"]):  # the launchers ahead stop between two builds
+    for thread in (_STATE["thread"], _AHEAD["thread"], _EARLY["thread"]):  # (stop between two builds)
         if thread is not None and thread is not threading.current_thread():
             thread.join(EXIT_TIMEOUT)
 
@@ -653,6 +681,9 @@ def _run(device, log, workers, switch):
         if log:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
+        early = _EARLY["thread"]
+        if _EARLY["libs"] and early is not None and early is not threading.current_thread():
+            early.join(EXIT_TIMEOUT)  # DRIVER_EARLY=libs: done only with the CUDA-library warm-ups
         if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
             sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
@@ -949,11 +980,17 @@ def start_early(log=True):
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
     install_light_triton_key()  # SOUP_SOLUTION_TRITON_KEY=light: no sha256 of libtriton.so
-    driver_too = os.environ.get("SOUP_SOLUTION_WARMUP_DRIVER_EARLY", "0").strip().lower() not in (
-        "0", "false", "no", "")
-    early = threading.Thread(target=_early_key_and_driver, args=(driver_too,), name="solution-triton-key",
+    mode = os.environ.get("SOUP_SOLUTION_WARMUP_DRIVER_EARLY", "0").strip().lower()
+    driver_too = mode not in ("0", "false", "no", "") and _EARLY["thread"] is None
+    libs = ()
+    if driver_too and mode == "libs":
+        with _LOCK:  # the workers skip them (start_background_warmup queues only names not queued yet)
+            libs = tuple(name for name in FIRST if name not in _STATE["queued"])
+            _STATE["queued"].update(libs)
+        _EARLY["libs"] = libs
+    early = threading.Thread(target=_early_key_and_driver, args=(driver_too, libs), name="solution-triton-key",
                              daemon=True)
-    if driver_too and _EARLY["thread"] is None:
+    if driver_too:
         _EARLY["thread"] = early
     early.start()
     start_launchers_ahead()  # SOUP_SOLUTION_LAUNCHERS_EARLY=1: the launchers built during the imports

@@ -464,23 +464,28 @@ def test_audit_counts_training_launches_per_variant(fresh, monkeypatch, capsys):
     _forget_compiled()  # the counting caches stay with this test
 
 
-def test_driver_early_then_warmup_waits(tmp_path):
-    """SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1: start_early's thread creates triton's CUDA driver (a fresh
-    process, empty triton cache); the warm-up's _prepare_triton waits for that thread and then finds
-    the driver made."""
+@pytest.mark.parametrize("mode", ["1", "libs"])
+def test_driver_early_then_warmup_waits(tmp_path, mode):
+    """SOUP_SOLUTION_WARMUP_DRIVER_EARLY: start_early's thread creates triton's CUDA driver (a fresh
+    process, empty triton cache); the warm-up's _prepare_triton waits for it and then finds the driver
+    made. With =libs the same thread then runs cublas and step_ops, which the workers do not queue."""
     code = (
-        "import time\n"
         "from solution import warmup\n"
         "warmup.start_early(log=False)\n"
         "assert warmup._EARLY['thread'] is not None\n"
         "warmup._prepare_triton()\n"
-        "assert not warmup._EARLY['thread'].is_alive()\n"
         "assert warmup._EARLY['error'] is None, warmup._EARLY['error']\n"
         "assert warmup._EARLY['seconds'] is not None and warmup._EARLY['waited'] is not None\n"
         "from triton.runtime.driver import driver\n"
         "assert driver.active.utils is not None\n"
+        "warmup._EARLY['thread'].join(120)\n"
+        "assert not warmup._EARLY['thread'].is_alive()\n"
+        f"libs = {mode == 'libs'}\n"
+        "assert set(warmup._STATE['queued']) == ({'cublas', 'step_ops'} if libs else set())\n"
+        "assert set(warmup._STATE['results']) == ({'cublas', 'step_ops'} if libs else set()), warmup._STATE\n"
+        "assert not warmup._STATE['errors'], warmup._STATE['errors']\n"
         "print('ok', round(warmup._EARLY['seconds'], 3), round(warmup._EARLY['waited'], 3))\n")
-    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), SOUP_SOLUTION_WARMUP_DRIVER_EARLY="1")
+    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), SOUP_SOLUTION_WARMUP_DRIVER_EARLY=mode)
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env, capture_output=True, text=True,
                          timeout=300)
     print(out.stdout)
