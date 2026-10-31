@@ -41,6 +41,17 @@ the fill is joined: when the load returns (or raises), and before head_stream.py
 them to the GPU. If the thread fails, the main thread fills the buffer the same way at the join. Taken
 only for the embedding of a load handled here (its key read to the CPU, a safetensors slice of the
 embedding's shape, a float dtype, no thread pool or sharding) when its pinned buffer is there.
+
+SOUP_SOLUTION_LOAD_CODE_TABLE=1: bitsandbytes' `quantize_4bit` (functional.py:936) asks
+`get_4bit_type` for the 16-value NF4 table of every weight it quantizes (196 here), and that builds
+it again each time: `torch.tensor(list, device=cuda)`, a copy from pageable memory that makes the
+CPU wait until the GPU has finished the weight's own copy and cast, then three small kernels
+(functional.py:854-855). On the T4 those two lines were 0.44 s of the main thread in the tensor loop
+(soup-s1-diag0 profile), waits and GIL handoffs to the warm-up threads. While a load handled here
+runs, the first call per (type, CUDA device, block size) is the original one and keeps a copy of its
+result; later calls return a `clone()` of that copy: the same float32 values, a new tensor for each
+weight's quant state as before, one device copy queued on the current stream instead of a wait.
+Other devices, and anything outside these loads, take the original function.
 """
 
 import functools
@@ -305,6 +316,32 @@ def _handled(model, hf_quantizer, device_values):
     return _single_cuda_device(list(device_values))
 
 
+def _code_table(original):
+    """bitsandbytes' get_4bit_type for SOUP_SOLUTION_LOAD_CODE_TABLE (see the module docstring)."""
+    tables = {}
+
+    def get_4bit_type(typename, device=None, blocksize=64):
+        try:
+            where = torch.device("cuda" if device is None else device)
+            if where.type != "cuda":
+                return original(typename, device=device, blocksize=blocksize)
+            if where.index is None:
+                where = torch.device("cuda", torch.cuda.current_device())
+            key = (typename, where, blocksize)
+            table = tables.get(key)
+            if table is not None:
+                return table.clone()
+            made = original(typename, device=device, blocksize=blocksize)
+            if isinstance(made, torch.Tensor) and made.device == where:
+                tables[key] = made.clone()
+            return made
+        except (TypeError, ValueError, RuntimeError):
+            return original(typename, device=device, blocksize=blocksize)
+
+    get_4bit_type._soup_original = original
+    return get_4bit_type
+
+
 def _bind(fn, args, kwargs):
     try:
         return inspect.signature(fn).bind(*args, **kwargs).arguments
@@ -362,9 +399,22 @@ def _loader(original):
             return original(*args, **kwargs)
         _ACTIVE["load"] = load
         started = time.perf_counter()
+        functional = table = None
+        if _flag("SOUP_SOLUTION_LOAD_CODE_TABLE"):
+            try:
+                import bitsandbytes.functional as functional
+
+                plain = functional.get_4bit_type
+                if getattr(plain, "_soup_original", None) is None:
+                    table = _code_table(plain)
+                    functional.get_4bit_type = table
+            except Exception:  # noqa: BLE001 - bitsandbytes' own tables then
+                table = None
         try:
             return original(*args, **kwargs)
         finally:
+            if table is not None and functional.get_4bit_type is table:
+                functional.get_4bit_type = table._soup_original
             _ACTIVE["load"] = None
             LAST["load"] = load
             load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on

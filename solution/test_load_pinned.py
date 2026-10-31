@@ -628,13 +628,13 @@ def test_tiny_load_embedding_fill_bit_equal(patched, tiny_dir, monkeypatch, copi
     thread gives the load without it bit for bit (and transformers' own load), with and without the
     pinned copies of the other tensors, and no higher GPU peak."""
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", copies)
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_fill)  # first: the process's first load peaks higher
+    assert without["result"][1] is None
     monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
     ours = _load_in_setup(patched, tiny_dir, _with_fill)
     snapshot, outcome = ours["result"]
     assert outcome is not None and outcome["error"] is None and outcome["seconds"] is not None
-    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
-    without = _load_in_setup(patched, tiny_dir, _with_fill)
-    assert without["result"][1] is None
     _compare(snapshot, without["result"][0])
     plain = _load(tiny_dir)
     theirs = _snapshot(plain)
@@ -642,6 +642,33 @@ def test_tiny_load_embedding_fill_bit_equal(patched, tiny_dir, monkeypatch, copi
     gc.collect()
     _compare(snapshot, theirs)
     assert ours["peak"] <= without["peak"]
+
+
+def _codes(model):
+    """_snapshot and the identities of the 4-bit quant states' code tables."""
+    import bitsandbytes as bnb
+
+    ids = [id(m.weight.quant_state.code) for m in model.modules() if isinstance(m, bnb.nn.Linear4bit)]
+    return _snapshot(model), ids
+
+
+@cuda
+def test_tiny_load_code_table_bit_equal(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_CODE_TABLE=1 (load_stream.py): every quant state gets the same code values
+    as bitsandbytes' own get_4bit_type gives it, in a tensor of its own; the function is bitsandbytes'
+    own again after the load."""
+    import bitsandbytes.functional as functional
+
+    plain = functional.get_4bit_type
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_CODE_TABLE", "0")
+    without = _load_in_setup(patched, tiny_dir, _codes)  # first: the process's first load peaks higher
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_CODE_TABLE", "1")
+    ours = _load_in_setup(patched, tiny_dir, _codes)
+    assert functional.get_4bit_type is plain
+    snapshot, ids = ours["result"]
+    assert len(ids) == LAYERS * 7 and len(set(ids)) == len(ids)
+    _compare(snapshot, without["result"][0])
+    assert ours["peak"] <= without["peak"] + 512  # the kept table: 16 floats in one 512-byte block
 
 
 @cuda
