@@ -101,3 +101,30 @@ forward's `taken` and the backward's hook return on their first comparison. Reco
 merge the `unpad.py` hook and `attn_bwd.py` into main (no gain, more for the jury to read); this note
 and the bench numbers are the result. No full run with ATTN_BWD=math was made (the brief asked for it
 only after a passing microbench).
+
+## Fallback items after the no-go
+
+(i) Labelled-only backward of the final norm and the last MLP (review 1, last block): not taken. The
+last layer's MLP has no LoRA, so its backward is three input-gradient GEMMs plus SwiGLU (~3.2 ms per
+step at 830 tokens); rows whose head gradient is zero give zero there, so gathering the labelled rows
+would save (1 - labelled share) of that, ~0.1 s per run at best, below one session's noise, and it
+needs a gather/scatter through fused_proj's `_MLP`, the offload of gate|up and int8_bwd (C1's files
+today). Not worth the risk on the last day.
+
+(ii) `SOUP_SOLUTION_NORM_HALF=1` (review 2, section 4.2; R3's row "float16_copy"): the decoder
+layer's input norm and post-attention norm write their output's half copy in the same kernel
+(`rmsnorm.rms_norm_rows_fwd_half`), attached to the fp32 output; `_QKVRope` and `_MLP` take it through
+`rmsnorm.half_of` instead of `x.to(half)` (fused_proj.py: two lines and the import). The final norm
+does not write one (the head gathers and casts its own rows). Bitwise: the copy is the cast's value
+(round to nearest even of the same fp32 product), and the new kernel keeps rms_norm_rows_fwd's tile
+layout: left to itself Triton gives the half store 8-wide vectors, the tile becomes sizePerThread
+[1, 8] instead of [1, 4] and the sum of squares is added in another order (rstd and y then differ in
+the last bit); with stride_y16 not specialized the half store stays narrow and rstd/y are the
+original kernel's bits (tested: plain and fused-add norms; a tiny 4-bit Qwen2 with LoRA through the
+fused path gives equal hidden states, loss and every LoRA gradient with the switch on and off).
+`half_of` falls back to the cast when the output changed since the norm (version check), the dtype
+or shape differs, or no copy exists; `_MLP` keeps its single padded copy when there is none.
+Laptop (RTX 3050 Ti, per norm at 830 / 1,440 rows): norm + cast 157 / 230 us (plain), 199 / 320 us
+(with the add) against 110 / 169 and 165 / 250 us: -35..-70 us per norm, 56 norms per step, plus 56
+cast launches less. Warm-up: `rms_norm_rows_fwd_half` registered by `patch_qwen2_rmsnorm` (two
+classes, as rms_norm_rows_fwd).
