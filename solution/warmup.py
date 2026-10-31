@@ -256,7 +256,10 @@ def warm_cublas():
     import torch.nn.functional as F
 
     half = training_half_dtype()
-    x = torch.randn(64, 64, device="cuda", dtype=half)
+    # constants, not torch.randn: this runs beside Soup's seeding and model setup, and a draw from the
+    # global CUDA generator here would race with them (the first dropout mask would depend on thread
+    # scheduling); found by the Codex review (codex/review-1, 49c639b)
+    x = torch.ones(64, 64, device="cuda", dtype=half)
     F.linear(x, x, x[0]).sum().item()  # addmm with a bias: the cuBLASLt path
     (x @ x).sum().item()
 

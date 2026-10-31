@@ -43,7 +43,9 @@ offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOT
 SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARLEN_ATTN=0,
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
-SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0; diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
+SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
+SOUP_SOLUTION_EXIT_RELEASE=1 and SOUP_SOLUTION_EXIT_NOGC=1 (off by default, exit_release.py);
+diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
 import os
@@ -112,6 +114,10 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    if os.environ.get("SOUP_SOLUTION_EXIT_RELEASE", "0") not in ("0", "false", "no", ""):
+        from .exit_release import patch_soup_exit_release
+
+        patch_soup_exit_release()  # off by default: pinned host memory released at the last step's end
     from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
                           patch_soup_startup_profile)
 
@@ -124,6 +130,10 @@ def apply():
         from .diag import patch_soup_diag
 
         patch_soup_diag()  # off by default: memory marks, PCIe probe, one step's allocation history, a trace
+    if os.environ.get("SOUP_SOLUTION_CPU_PROFILE", "0") not in ("0", "false", "no", ""):
+        from .cpu_profile import patch_soup_cpu_profile
+
+        patch_soup_cpu_profile()  # off by default: the CPU side of training steps 5-12, see cpu_profile.py
     if _on("SOUP_SOLUTION_WARMUP"):
         from .warmup import patch_soup_warmup, start_background_warmup, watch_compiles
 

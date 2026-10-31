@@ -183,6 +183,31 @@ def prepin(megabytes):
     return thread
 
 
+def release_host_memory():
+    """Training is over (exit_release.py): the pinned slabs, spare and used, go back to the driver
+    (cudaFreeHost through torch's host allocator, whose cache holds them once unreferenced). An
+    offload that runs again pins new slabs on demand. Slabs still holding a live slot stay. Call it
+    with the device synchronized. Returns the bytes released."""
+    with _SPARE_LOCK:
+        if _PREPINNING[0]:
+            return 0  # a prepin thread is still pinning: leave everything as it is
+        spares = list(_SPARE)
+        _SPARE.clear()
+    released = sum(slab.numel() for slab in spares)
+    del spares
+    offloader = _ACTIVE["offloader"]
+    if offloader is not None:
+        with offloader.lock:
+            host = offloader.host
+            if host.live() == 0:
+                released += host.nbytes
+                host.released = (host.nbytes, len(host.slabs))  # for the summary
+                host.slabs, host.slots, host.nbytes = [], [], 0
+    if released:
+        torch._C._host_emptyCache()
+    return released
+
+
 # ----------------------------------------------------------------------------------------------
 # offload
 
@@ -204,6 +229,7 @@ class _HostStack:
         self.limit = limit_bytes
         self.nbytes = 0
         self.prepinned = 0  # slabs taken from prepin()
+        self.released = None  # (bytes, slabs) handed back by release_host_memory()
 
     def push(self, nbytes):
         """(slot, pinned uint8 view of nbytes <= SLAB_BYTES), or (None, None) at the cap."""
@@ -262,6 +288,13 @@ class Offloader:
                  host_limit=HOST_LIMIT_BYTES, weights=()):
         self.device = torch.device("cuda", torch.cuda.current_device()) if device is None else device
         self.stream = torch.cuda.Stream(self.device)
+        from .weight_stream import CurrentStream, SideStream
+
+        # the stream switches and current-stream reads of weight_stream.py (SOUP_SOLUTION_FAST_STREAMS),
+        # and one event, recorded again at every use, for the side stream's waits for the current one
+        self._side = SideStream(self.stream)
+        self._current = CurrentStream(self.device)
+        self._order = torch.cuda.Event()
         self.min_numel = _env_int("SOUP_SOLUTION_OFFLOAD_MIN_NUMEL", MIN_NUMEL) \
             if min_numel is None else min_numel
         layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0) + (6 if ATTN else 0)
@@ -336,13 +369,14 @@ class Offloader:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
-        home = torch.cuda.current_stream(tensor.device)
-        side.wait_event(home.record_event())
+        home = self._current()
+        self._order.record(home)
+        side.wait_event(self._order)
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
         host = host.view(tensor.dtype).view(tensor.shape)
-        with torch.cuda.stream(side):
+        with self._side():
             host.copy_(tensor, non_blocking=True)
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
@@ -366,7 +400,7 @@ class Offloader:
         if type(saved) is not _Saved:
             return saved
         with self.lock:
-            current = torch.cuda.current_stream(saved.device)
+            current = self._current() if saved.device == self.device else torch.cuda.current_stream(saved.device)
             tensor = saved.gpu
             if saved.unpacked:  # a kept residual, unpacked before in this backward
                 return tensor
@@ -409,9 +443,10 @@ class Offloader:
                 continue
             tensor = torch.empty(saved.shape, dtype=saved.dtype, device=saved.device)
             if not waited:
-                side.wait_event(current.record_event())
+                self._order.record(current)
+                side.wait_event(self._order)
                 waited = True
-            with torch.cuda.stream(side):
+            with self._side():
                 tensor.copy_(saved.host, non_blocking=True)
             saved.gpu, saved.ready, saved.home = tensor, side.record_event(), current
             self.stats["prefetched"] += 1
@@ -431,8 +466,9 @@ class Offloader:
                 f"{self.max_inflight} in flight, {self.prefetch} prefetched); back: "
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
-                f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
-                f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
+                f"pinned stack {(self.host.released or (self.host.nbytes,))[0] >> 20} MiB in "
+                f"{(self.host.released or (0, len(self.host.slabs)))[1]} slabs ({self.host.prepinned} prepinned"
+                f"{'; released after the last step' if self.host.released else ''}); kept on GPU over the cap {s['kept']}; "
                 f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
                 f"started early {s['early']}")
 

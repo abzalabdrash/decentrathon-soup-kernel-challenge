@@ -88,10 +88,93 @@ def ring_from_env():
     return value if value in RINGS else "layer"
 
 
+def _env_on(name, default):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
 # SOUP_SOLUTION_WEIGHT_RING_TIMING=1: the type ring also times its MLP matrices' copies and waits
-# (CUDA events, as for the attention group; 6 matrix spans per layer and pass cost CPU time, so off)
-_RING = {"timing": os.environ.get("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0").strip().lower()
-         not in ("0", "false", "no", "")}
+# (CUDA events, as for the attention group; 6 matrix spans per layer and pass cost CPU time, so off).
+# SOUP_SOLUTION_STREAM_TIMING=1: the attention group's (the layer ring: every layer's) copies and
+# waits are timed as well, and so are head_stream.py's chunks; off by default since the CPU-side
+# task C1 (two pairs of events per layer and pass and per head chunk, read back with queries: CPU
+# time on every step for numbers only the logs show)
+_RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),
+         "stream_timing": _env_on("SOUP_SOLUTION_STREAM_TIMING", "0")}
+
+# SOUP_SOLUTION_FAST_STREAMS=0: the copies select their side stream with torch.cuda.stream() and read
+# the current stream with torch.cuda.current_stream(), as before. On (the default) the side stream is
+# selected by torch's own C setter (what torch.cuda.stream() ends in, after about fifteen Python calls:
+# two current-stream objects, device compares) and the current stream is read as its id triple, its
+# Stream object reused while the triple stays the same. Laptop: 5.3 -> 0.3 us per stream switch,
+# 1.8 -> 0.06 us per current stream; the same CUDA calls in the same order
+_STREAMS = {"fast": _env_on("SOUP_SOLUTION_FAST_STREAMS", "1")}
+_current_ids = torch._C._cuda_getCurrentStream
+_select_stream = torch._C._cuda_setStream
+_current_device = torch._C._cuda_getDevice
+
+
+def _device_index(device):
+    device = torch.device(device) if not isinstance(device, torch.device) else device
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+class CurrentStream:
+    """torch.cuda.current_stream(device) for one device (of the calling thread, as torch's); the
+    Stream object is reused while the device's current stream stays the same."""
+
+    __slots__ = ("index", "cached")
+
+    def __init__(self, device):
+        self.index = _device_index(device)
+        self.cached = (None, None)  # (id triple, Stream), swapped as one
+
+    def __call__(self):
+        if not _STREAMS["fast"]:
+            return torch.cuda.current_stream(self.index)
+        ids = _current_ids(self.index)
+        cached = self.cached
+        if cached[0] != ids:
+            cached = (ids, torch.cuda.Stream(stream_id=ids[0], device_index=ids[1], device_type=ids[2]))
+            self.cached = cached
+        return cached[1]
+
+
+class _Selected:
+    __slots__ = ("stream", "ids", "prev", "ctx")
+
+    def __init__(self, stream, ids):
+        self.stream, self.ids, self.prev, self.ctx = stream, ids, None, None
+
+    def __enter__(self):
+        if _STREAMS["fast"] and _current_device() == self.ids[1]:
+            self.prev = _current_ids(self.ids[1])
+            _select_stream(*self.ids)
+        else:
+            self.ctx = torch.cuda.stream(self.stream)
+            self.ctx.__enter__()
+        return self.stream
+
+    def __exit__(self, *exc):
+        if self.prev is not None:
+            _select_stream(*self.prev)
+        else:
+            self.ctx.__exit__(*exc)
+        return False
+
+
+class SideStream:
+    """`with side():` makes `stream` the current stream until the block ends, as
+    `with torch.cuda.stream(stream):` does (a stream of another device than the current one goes
+    through torch.cuda.stream())."""
+
+    __slots__ = ("stream", "ids")
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.ids = (stream.stream_id, stream.device_index, stream.device_type)
+
+    def __call__(self):
+        return _Selected(self.stream, self.ids)
 
 
 class StreamSkip(Exception):
@@ -103,6 +186,23 @@ def _unregister(buffer):
         torch.cuda.cudart().cudaHostUnregister(buffer.data_ptr())
     except Exception:  # noqa: BLE001 - at interpreter exit CUDA may be gone already
         pass
+
+
+_PINNED = []  # the finalizers of the buffers pinned_host_buffer registered (dead ones are skipped)
+
+
+def unpin_all():
+    """Every buffer pinned_host_buffer registered goes back to pageable memory now (exit_release.py,
+    once training is over): its values stay, a copy from it stays correct, only slower; its finalizer
+    is spent, so nothing unregisters it again at exit. Returns the bytes unregistered."""
+    total = 0
+    while _PINNED:
+        finalizer = _PINNED.pop()
+        info = finalizer.peek()
+        if info is not None:
+            total += info[2][0].numel()
+            finalizer()
+    return total
 
 
 def pinned_host_buffer(nbytes, owner):
@@ -122,7 +222,9 @@ def pinned_host_buffer(nbytes, owner):
         if ok:
             _unregister(buffer)
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
-    return buffer, weakref.finalize(owner, _unregister, buffer)
+    finalizer = weakref.finalize(owner, _unregister, buffer)
+    _PINNED.append(finalizer)
+    return buffer, finalizer
 
 
 class PinnedBuffer:
@@ -354,9 +456,14 @@ def _ring_aware(mlp):
     return getattr(type(mlp).forward, "_soup_weight_ring", False) is True
 
 
+def _layer_backward(streamer, index):
+    """The gradient reached layer `index`'s output: its own backward comes next."""
+    streamer._use(index, -1)
+
+
 class _LayerExit(torch.autograd.Function):
     """Identity on a layer's output; its backward runs right before the layer's own backward and
-    brings the layer's weights into its slot."""
+    brings the layer's weights into its slot (SOUP_SOLUTION_LAYER_EXIT_HOOK=0)."""
 
     @staticmethod
     def forward(ctx, hidden, streamer, index):
@@ -365,8 +472,20 @@ class _LayerExit(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        ctx.streamer._use(ctx.index, -1)
+        _layer_backward(ctx.streamer, ctx.index)
         return grad, None, None
+
+
+# SOUP_SOLUTION_LAYER_EXIT_HOOK=1 (the default since task C1): the layer's backward marker is a hook
+# on its output tensor instead of _LayerExit. autograd calls a tensor's hooks when that tensor's
+# gradient is complete, right before the node that made it runs its backward, which is where
+# _LayerExit's backward ran (it consumed exactly that gradient and handed it on): the same order of
+# work, one Python autograd node less per layer each way
+_EXIT = {"hook": _env_on("SOUP_SOLUTION_LAYER_EXIT_HOOK", "1")}
+
+
+def _exit_hook(streamer, index, grad):
+    _layer_backward(streamer, index)
 
 
 class WeightStreamer:
@@ -381,9 +500,10 @@ class WeightStreamer:
 
     `ring`: "layer" (rings of whole layers) or "type" (see the module doc: the attention projections
     in `slots` slots by layer, one slot per MLP matrix type; a layer that does not split that way or
-    `only` given: the layer ring, with the reason in `ring_note`)."""
+    `only` given: the layer ring, with the reason in `ring_note`). `timing`: time the copies and
+    waits of the attention group (the layer ring: of every layer); None: SOUP_SOLUTION_STREAM_TIMING."""
 
-    def __init__(self, layers, slots=2, only=None, ring="layer"):
+    def __init__(self, layers, slots=2, only=None, ring="layer", timing=None):
         layers = list(layers)
         only = frozenset(only) if only else None
         if not torch.cuda.is_available():
@@ -460,6 +580,8 @@ class WeightStreamer:
         self._slots = [torch.empty(group.nbytes, dtype=torch.uint8, device=self.device)
                        for group in groups for _ in range(group.count)]
         self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._side = SideStream(self._copy_stream)
+        self._compute = CurrentStream(self.device)
         self._ready = [torch.cuda.Event() for _ in self._slots]  # copy into the slot done
         self._free = [torch.cuda.Event() for _ in self._slots]  # compute queued when a copy was issued
         for j in fresh:
@@ -495,6 +617,7 @@ class WeightStreamer:
                     self._matrices[module] = (g, j, groups[g].first)
         self._matrix_groups = tuple(range(1, len(groups)))
         self.matrix_timing = _RING["timing"]
+        self.timing = _RING["stream_timing"] if timing is None else bool(timing)
         # every copy's destination (its slot's first bytes) and source (the part of the layer's
         # pinned buffer), made once: views cost CPU time on every copy
         self._copies = [[(self._slots[group.first + j % group.count][:nbytes],
@@ -504,7 +627,7 @@ class WeightStreamer:
         self._held = set()
         for g, group in enumerate(groups):
             for j in range(group.count):
-                self._load(j, g)
+                self._load(j, g, timed=g == 0 or self.matrix_timing)  # the setup's bandwidth
         self._copy_stream.synchronize()
         self._harvest(block=True)
         # host -> GPU bandwidth of the first K layer copies, measured before anything else runs
@@ -573,29 +696,31 @@ class WeightStreamer:
             "waits_forward": self.waits[1] + self.waits[2],
             "waits_backward": self.waits[-1] + self.waits[-2],
             # of them, the waits for MLP matrices (type ring, timed with SOUP_SOLUTION_WEIGHT_RING_TIMING)
-            "matrix_timing": self.matrix_timing,
+            "timing": self.timing, "matrix_timing": self.matrix_timing,
             "matrix_wait_forward_ms": self.wait_ms[2], "matrix_wait_backward_ms": self.wait_ms[-2],
             "matrix_waits_forward": self.waits[2], "matrix_waits_backward": self.waits[-2],
         }
 
-    def _load(self, j, g=0):
+    def _load(self, j, g=0, timed=None):
         """Starts the copy of layer j's part of group g (the layer ring: the whole layer) into its
         slot on the copy stream, after the compute queued so far (which includes every use of the
         slot's previous layer)."""
         group = self._groups[g]
         s = group.first + j % group.count
         dst, src = self._copies[g][j]
-        timed = g == 0 or self.matrix_timing
-        self._free[s].record(torch.cuda.current_stream(self.device))
-        with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_event(self._free[s])
+        if timed is None:
+            timed = self.matrix_timing if g else self.timing
+        copy_stream = self._copy_stream
+        self._free[s].record(self._compute())
+        with self._side():
+            copy_stream.wait_event(self._free[s])
             if timed:
                 begin, end = self._event(), self._event()
-                begin.record(self._copy_stream)
+                begin.record(copy_stream)
             dst.copy_(src, non_blocking=True)
             if timed:
-                end.record(self._copy_stream)
-            self._ready[s].record(self._copy_stream)
+                end.record(copy_stream)
+            self._ready[s].record(copy_stream)
         if timed:
             self._spans.append(("copy", begin, end, dst.numel()))
         self._owner[s] = j
@@ -603,10 +728,11 @@ class WeightStreamer:
         self.group_loads[g] += 1
 
     def _wait(self, s, kind):
-        """The compute stream waits for the last copy into slot s (timed as `kind`; an MLP matrix's
-        wait, kind +-2, only with SOUP_SOLUTION_WEIGHT_RING_TIMING=1)."""
-        compute = torch.cuda.current_stream(self.device)
-        if kind in (2, -2) and not self.matrix_timing:
+        """The compute stream waits for the last copy into slot s (timed as `kind`: the attention
+        group's or a layer's, kind +-1, with SOUP_SOLUTION_STREAM_TIMING=1, an MLP matrix's, kind
+        +-2, with SOUP_SOLUTION_WEIGHT_RING_TIMING=1)."""
+        compute = self._compute()
+        if not (self.matrix_timing if kind in (2, -2) else self.timing):
             compute.wait_event(self._ready[s])
             return
         begin, end = self._event(), self._event()
@@ -689,6 +815,13 @@ class WeightStreamer:
 
     def _after(self, index, module, args, output):
         if not self.active:
+            return None
+        if _EXIT["hook"]:
+            target = output if torch.is_tensor(output) else (
+                output[0] if isinstance(output, tuple) and output and torch.is_tensor(output[0])
+                else None)
+            if target is not None and target.requires_grad:
+                target.register_hook(functools.partial(_exit_hook, self, index))
             return None
         if torch.is_tensor(output):
             return _LayerExit.apply(output, self, index) if output.requires_grad else None
@@ -838,6 +971,13 @@ def _report(ref, log):
         return
     copy = (f"{s['copy_ms'] / s['copies_timed']:.2f} ms per copy at {s['copy_gbps']:.1f} GB/s"
             if s["copies_timed"] and s["copy_gbps"] else "no timed copies")
+    if not s["timing"] and not s["matrix_timing"]:
+        log(f"[solution] weight streaming ({streamer.ring} ring): {s['loads']} copies"
+            + (f" ({', '.join(f'{name} {n}' for name, n in s['group_loads'].items())})"
+               if streamer.ring == "type" else "")
+            + f", {s['late_loads']} of them not prefetched; copies and waits untimed "
+            f"(SOUP_SOLUTION_STREAM_TIMING=1 times them)")
+        return
     if streamer.ring == "type":
         loads = ", ".join(f"{name} {n}" for name, n in s["group_loads"].items())
         if s["matrix_timing"]:

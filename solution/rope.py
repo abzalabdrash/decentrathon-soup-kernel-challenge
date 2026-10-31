@@ -97,6 +97,19 @@ def _launch(q, k, q_out, k_out, cos, sin, backward):
     )
 
 
+def _launch_strided(q, q_strides, k, k_strides, q_out, qo_strides, k_out, ko_strides, cos, sin, n,
+                    q_heads, kv_heads, head_dim, backward):
+    """_launch for one batch row, each operand given as a tensor that starts at its data and the
+    (batch, head, token) strides of its (1, H, N, D) view: the same kernel arguments as _launch on
+    those views, without making them."""
+    grid = (q_heads + kv_heads, triton.cdiv(n, BLOCK_TOKENS), 1)
+    rope_qk_kernel[grid](
+        q, k, q_out, k_out, cos, sin, *q_strides, *k_strides, *qo_strides, *ko_strides,
+        cos.stride(0) if cos.shape[0] > 1 else 0, cos.stride(1), n, q_heads,
+        HALF=head_dim // 2, BLOCK_N=BLOCK_TOKENS, BACKWARD=backward, num_warps=NUM_WARPS,
+    )
+
+
 def _last_dim_contiguous(x):
     return x if x.stride(-1) == 1 else x.contiguous()
 
