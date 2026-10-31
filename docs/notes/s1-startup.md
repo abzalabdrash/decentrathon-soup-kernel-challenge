@@ -251,3 +251,21 @@ Diagnostics added: SOUP_SOLUTION_WARMUP_AUDIT=1 (launches per compiled variant).
 - soup-s1-full2 (117f1a0): 10 of 10 checks, 46.1 s / 371 MiB against the base 87.5 s (a hot
   session: train loop 29.0 s; s 1.899, m 38.67), eval -0.014 %, own kernels 12.7 %, pytest 419
   passed, 5 skipped; first step +9.75 s after apply begin.
+
+### soup-s1-v11 (117f1a0, 3 ABBA rounds): first step new 9.36, DRIVER_EARLY=1 9.47, WARMUP_SWITCH_MS=5 9.32 s: both off.
+
+## State at the stop (31 Oct ~13:50, captain's order; no runs in flight)
+
+- In main already (0b1bba7 merged as d62e731): EMBED_ASYNC, TRITON_KEY=light, ENTRY_POINTS on.
+- In this branch after that, all off by default: WARMUP_AUDIT (diagnostics), WARMUP_DRIVER_EARLY=1|libs,
+  the launchers-ahead probe fix (nf4_dequant4), the early-probes tests unwrap ENTRY_POINTS (fixes the
+  red test on the T4: full2 pytest 419 passed), notes.
+- Rulings 31 and 13: this branch still has `sys.setswitchinterval` in warmup.py `_run` (inherited) and
+  CHEAP_FINGERPRINT/DATASET_HASH defaults as before. NOT merged with main 53349c8: when merging,
+  take main's `_run` (no switch interval) and main's trainer_build.py defaults; conflicts expected in
+  warmup.py (`_run` finally block: my DRIVER_EARLY join next to main's removed setswitchinterval;
+  `start_early`: my `_early_key_and_driver` thread vs A1's hash-thread registration; `_shutdown`
+  thread list) and test_warmup.py (my two tests appended at the end). The WARMUP_SWITCH_MS knob
+  must go with main's change.
+- Left: the torch cold-kernel warm-up (R3 item 5) not started; test_boundary::test_layer_slices_keep_the_lists
+  order dependence not investigated.
