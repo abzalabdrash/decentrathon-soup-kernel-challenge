@@ -1,5 +1,6 @@
 """The warm-up's kernel launchers built by one C compiler run instead of one per launcher
-(SOUP_SOLUTION_LAUNCHERS_ONE=1, off by default until measured).
+(SOUP_SOLUTION_LAUNCHERS_ONE: on by default since soup-l1-v2/v3/v4 on the T4, warm-up 7.0-7.4 -> 4.8-5.0 s,
+first step 0.38-0.52 s earlier, wall 0.18-0.62 s shorter; =0 takes triton's own builds).
 
 triton 3.6 launches a compiled kernel through a small C extension module generated for the kernel's
 signature (triton/backends/nvidia/driver.py `make_launcher`: argument parsing with the Python C API,
@@ -61,7 +62,7 @@ LAUNCHER = "__triton_launcher"
 
 
 def enabled():
-    return os.environ.get("SOUP_SOLUTION_LAUNCHERS_ONE", "0").strip().lower() not in ("0", "false", "no", "")
+    return os.environ.get("SOUP_SOLUTION_LAUNCHERS_ONE", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 def _key(text):

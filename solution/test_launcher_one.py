@@ -138,11 +138,11 @@ def test_file_scope_names_cover_template():
         assert name in names
 
 
-def test_switch_off_by_default(monkeypatch):
+def test_switch_on_by_default(monkeypatch):
     monkeypatch.delenv("SOUP_SOLUTION_LAUNCHERS_ONE", raising=False)
-    assert not launcher_one.enabled()
-    monkeypatch.setenv("SOUP_SOLUTION_LAUNCHERS_ONE", "1")
     assert launcher_one.enabled()
+    monkeypatch.setenv("SOUP_SOLUTION_LAUNCHERS_ONE", "0")
+    assert not launcher_one.enabled()
 
 
 def test_probe_takes_the_kernel_modules_warmups_only():

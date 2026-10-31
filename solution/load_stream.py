@@ -42,7 +42,9 @@ them to the GPU. If the thread fails, the main thread fills the buffer the same 
 only for the embedding of a load handled here (its key read to the CPU, a safetensors slice of the
 embedding's shape, a float dtype, no thread pool or sharding) when its pinned buffer is there.
 
-SOUP_SOLUTION_LOAD_CODE_TABLE=1: bitsandbytes' `quantize_4bit` (functional.py:936) asks
+SOUP_SOLUTION_LOAD_CODE_TABLE (on by default since soup-l1-v2/v4: with the warm-up shorter the main thread's
+load is on the way to the first step, -0.07..-0.27 s; =0 for bitsandbytes' own function): bitsandbytes'
+`quantize_4bit` (functional.py:936) asks
 `get_4bit_type` for the 16-value NF4 table of every weight it quantizes (196 here), and that builds
 it again each time: `torch.tensor(list, device=cuda)`, a copy from pageable memory that makes the
 CPU wait until the GPU has finished the weight's own copy and cast, then three small kernels
@@ -592,7 +594,7 @@ def _loader(original):
         _ACTIVE["load"] = load
         started = time.perf_counter()
         functional = table = None
-        if _flag("SOUP_SOLUTION_LOAD_CODE_TABLE"):
+        if _flag("SOUP_SOLUTION_LOAD_CODE_TABLE", "1"):
             try:
                 import bitsandbytes.functional as functional
 
