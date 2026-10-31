@@ -3,24 +3,27 @@ SOUP_SOLUTION_ATTN_BWD=math; the default `sdpa` keeps aten's memory-efficient ba
 
 unpad.py's variable-length attention runs `aten::_efficient_attention_backward` (CUTLASS fmha, sm_75)
 once per layer: ~0.8 ms on the T4 for four rows of ~200 tokens, a tiny problem for that kernel
-(2.7 GFLOP with the full squares). Here, for one layer, with B real sequences of the packed batch
-padded to LP rows (the longest, rounded up to 16), 12 query heads in 2 groups of R = 6 sharing a
-key/value head:
+(2.7 GFLOP with the full squares). Here, for one layer: the real sequences of the packed batch go
+into bins of LP rows (LP = the longest row rounded up to 16; first fit, longest first, so two short
+rows share one bin and its square), 12 query heads in 2 groups of R = 6 sharing a key/value head:
 
     gather   q, grad_out (H heads) and k, v (G heads), token-major (N, heads, D), into head-major
-             (B, heads, LP, D) buffers, zeros past each sequence (own kernel, one launch);
-    S  = Q K^T          per (sequence, kv group): (R*LP x D) @ (D x LP), fp32 out (bmm out_dtype);
-    P  = softmax(scale * S) under the causal mask of each row's own length (own kernel), fp16;
+             (bins, heads, LP, D) buffers, zeros in the rows no sequence fills (own kernel);
+    S  = Q K^T          per (bin, kv group): (R*LP x D) @ (D x LP), fp32 out (bmm out_dtype);
+    P  = softmax(scale * S), each row over its own sequence's keys up to itself (own kernel), fp16;
     dV = P^T dO         (LP x R*LP) @ (R*LP x D): the group's six heads summed inside the GEMM;
     dP = dO V^T         fp32 out, into S's buffer;
     dS = scale * P * (dP - delta), delta_i = sum_j P_ij dP_ij (own kernel; no O needed), over P;
     dQ = dS K, dK = dS^T Q (dK again summed over the group inside the GEMM);
     scatter  dQ, dK, dV back to token-major (N, heads, D), zeros for the alignment tail (own kernel).
 
-Five strided-batched GEMMs (B*G batches each) and four own launches per layer. The query heads of one
-kv group are consecutive rows of the head-major buffers, so the GQA expansion and the group sums of
-the original path disappear into the GEMMs' M and K dimensions. Padded rows and columns are zeros in
-every operand and masked to zero in P and dS, so they add nothing.
+Five strided-batched GEMMs (bins*G batches) and two own row kernels per chunk of (bin, kv group)
+entries, plus the gather and the scatter. The query heads of one kv group are consecutive rows of
+the head-major buffers, so the GQA expansion and the group sums of the original path disappear into
+the GEMMs' M and K dimensions. Empty rows and columns are zeros in every operand and masked to zero
+in P and dS, so they add nothing; nor do the other sequences of a bin (masked like the causal part).
+The maps between tokens and bin rows (`Plan`) are built once per step on the host and copied from
+pinned memory without a host wait.
 
 The alignment tail (unpad.varlen_model_forward) is not computed: its rows get exactly zero gradient
 in the original path too (their grad_out is zero: the tail is cut before the head, and no real token
@@ -37,11 +40,12 @@ sum of the causal halves); fp16/bf16 CUDA tensors of the expected shapes, contig
 (unpad's guards), the boundaries known from the forward. Anything else, or any error, takes the
 original path.
 
-Scratch: S (fp32) and P (fp16), B*H*LP^2 each, go into the free tail of fused_proj.py's shared
-dequantization buffer when it is there and large enough (in a layer's backward that buffer holds
-the q|k|v|o weights, 10.5 MiB of 26.25, which the o_proj and q/k/v backward read around this one;
-everything runs on the one compute stream), else they are allocated
-(SOUP_SOLUTION_ATTN_BWD_SCRATCH=own always allocates).
+Scratch: S (fp32) and P (fp16), R*LP^2 elements each per (bin, kv group) entry, go into the free
+tail of fused_proj.py's shared dequantization buffer (in a layer's backward that buffer holds the
+q|k|v|o weights, 10.5 MiB of 26.25, which the o_proj and q/k/v backward read around this one;
+everything runs on the one compute stream), as many entries per chunk as fit there (15.75 MiB: all 8
+entries at LP = 208, 3 at LP = 384, 1 at LP = 512); without that buffer, or with
+SOUP_SOLUTION_ATTN_BWD_SCRATCH=own, allocated chunks of at most SOUP_SOLUTION_ATTN_BWD_SCRATCH_MB (16).
 """
 
 import os
@@ -201,6 +205,12 @@ def _free_tail(device, dtype):
     return buf[end:] if end < buf.numel() else None
 
 
+def _balanced(entries, fit):
+    """Entries per chunk: as few chunks as `fit` allows, of near-equal size (8 at most 7: 4 + 4)."""
+    chunks = -(-entries // min(entries, fit))
+    return -(-entries // chunks)
+
+
 def _scratch(device, half, per_entry, entries):
     """(S fp32, P half, entries per chunk): flat buffers for the scores of as many (bin, kv group)
     entries as fit, per_entry elements each; in the shared buffer's free tail when one entry fits
@@ -209,11 +219,11 @@ def _scratch(device, half, per_entry, entries):
         tail = _free_tail(device, half)
         fit = tail.numel() // (3 * per_entry) if tail is not None else 0
         if fit >= 1:
-            m = min(entries, fit)
+            m = _balanced(entries, fit)
             _STATE["shared"] += 1
             return (tail[:2 * m * per_entry].view(torch.float32), tail[2 * m * per_entry:3 * m * per_entry],
                     m)
-    m = min(entries, max(1, (_STATE["scratch_mb"] << 20) // (6 * per_entry)))
+    m = _balanced(entries, max(1, (_STATE["scratch_mb"] << 20) // (6 * per_entry)))
     return (torch.empty(m * per_entry, dtype=torch.float32, device=device),
             torch.empty(m * per_entry, dtype=half, device=device), m)
 
