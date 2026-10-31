@@ -109,6 +109,15 @@ the same results. Two slots per type add nothing on top (+20 MiB); a deeper offl
 (+60 MiB). On the jury-like rows early release is neutral (above): their longer steps already hid most
 of these copies (113 ms of backward matrix waits per run there against 1.4 s here).
 
+**Head options, public rows (soup-p2-abba-head, b8d5902, 3 variants x 2 rounds + warm run):** early
+release 44.52 / 46.53 s (45.53), + `SOUP_SOLUTION_HEAD_SLOTS=3` 46.69 / 46.91 (46.80), +
+`SOUP_SOLUTION_HEAD_PREFETCH=embedding` 46.99 / 46.79 (46.89, peak 415). The session drifted by 2 s (the
+two early-release runs bracket it), but neither head option shows a gain: both out.
+
+**Full run of 55f4e3e (early release on; soup-p2-full, peagverr):** all 10 checks, 43.9 s against base
+82.8 (s = 1.89), 395 MiB, eval +0.005 %, loss curve 0.01 % / 0.06 %, own kernels 21.3 %; T4 `pytest
+solution` 484 passed, 5 skipped, 0 failed.
+
 What is left after early release (public): the head, 6.5 ms per step (~0.4 s per run): its 445 MB at
 11.5 GB/s take ~39 ms against ~32 ms of head compute, so it is bandwidth-bound from the first chunk on;
 only fewer bytes (H1's int8 head) or an earlier start of its copies help. The forward drain (81 ms per
