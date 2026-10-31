@@ -31,6 +31,29 @@ tokens). So the copy waits on the public rows are of the order of 10-20 ms per s
 gap between the profiler's compute sum and its wall is the CPU (the profiled steps are CPU-bound, and the
 public rows' short steps are CPU-bound unprofiled too, C1 section 1).
 
+**Attribution of the compute stream's idle time (tools/trace_waits.py, 11ea449; main 218c174 with early
+release off; CUDA-only trace of 0-based steps 9-12).** The first traces looked CPU-bound because the
+memory snapshot (step 10) was written inside the traced window (a 5 s gap, now skipped); without it the
+CUDA-only trace runs at near-unprofiled step times. Every gap between two kernels of the compute stream
+is split into "CPU" (the next kernel's launch call, runtime or Triton's driver `cuLaunchKernel`, had not
+returned when the gap began) and a dependency wait, charged to the copy that ended last inside it and to
+why that copy was late. Per step:
+
+| cause | public rows (steps 288-440 ms) | jury-like rows (504-594 ms) |
+|---|---|---|
+| CPU had not submitted the next kernel, forward | 56.3 ms | 21.3 ms |
+| CPU had not submitted the next kernel, backward | 41.1 ms | 0 |
+| head chunk queued behind the previous head chunk (bandwidth-bound head) | 12.8 ms | 0.8 ms (slot) |
+| backward activation H2D (int8 gate|up / layer input) queued behind NF4 copies (issue order) | 9.1 ms | 3.1 ms |
+| backward NF4 MLP matrix queued behind the previous matrix | 4.2 ms | 2.8 ms |
+| launch latency (gaps < 50 us right after submission) | 4.9 ms | 6.8 ms |
+| everything else | < 1.5 ms | < 0.5 ms |
+| total idle | ~129 ms | ~35 ms |
+
+So the brief's ~120 ms per step is three quarters CPU on the public rows (short steps are CPU-bound in both
+passes: a step with 147 ms of kernels had 152 ms of CPU idle), and the copy waits are ~26 ms per step there
+and ~7 on the jury-like rows.
+
 ## 2. Levers built (all behind switches)
 
 - `SOUP_SOLUTION_RING_EARLY_RELEASE` (default on): the int8 MLP backward releases each type-ring matrix
