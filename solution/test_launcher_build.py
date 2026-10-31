@@ -101,5 +101,5 @@ def test_warmup_order_longest(monkeypatch):
                 return out
 
     assert queued(None) == names
-    assert queued("longest") == ["rms_norm_rows_fwd", "head_stream_kernels", "unknown_kernel", "cublas",
+    assert queued("longest") == ["cublas", "rms_norm_rows_fwd", "head_stream_kernels", "unknown_kernel",
                                  "fused_proj_masked_pair_sum"]

@@ -133,7 +133,10 @@ WARMUPS = []  # [(name, fn)]: run in this order by the background thread
 # -O3 order is the same), for SOUP_SOLUTION_WARMUP_ORDER=longest: the workers take the longest
 # first, which shortens the warm-up when its tail is on the way to the first step (registration
 # order ends with head_stream_kernels and fused_proj_nf4_dequant3: 4.84 s against 4.57 s in a
-# two-worker simulation of these costs). Unknown names count as 0.5 s.
+# two-worker simulation of these costs). Unknown names count as 0.5 s. The two CUDA-library
+# warm-ups stay first (FIRST): sorted to the end they met the trainer build and the offload's
+# pinning and took 0.95 s instead of 0.27 (session 5, cublas).
+FIRST = ("cublas", "step_ops")
 COSTS = {"rms_norm_rows_fwd": 1.45, "head_stream_kernels": 1.35, "rope_qk_kernel": 1.12,
          "nf4_dequant_kernel": 0.75, "fused_proj_nf4_dequant3": 0.70, "rms_norm_rows_bwd": 0.64,
          "fused_ce_rows_kernel": 0.60, "rms_norm_rows_bwd_split": 0.53, "step_ops": 0.49,
@@ -642,7 +645,9 @@ def start_background_warmup(log=True, final=True):
         batch = [(name, fn) for name, fn in list(WARMUPS)
                  if name not in _STATE["queued"] and name not in skip]
         if os.environ.get("SOUP_SOLUTION_WARMUP_ORDER", "") == "longest":
-            batch.sort(key=lambda item: -COSTS.get(item[0], 0.5))  # stable: ties keep their order
+            # stable: ties keep their order; FIRST stays in front in its own order
+            batch.sort(key=lambda item: (item[0] not in FIRST, 0.0 if item[0] in FIRST
+                                         else -COSTS.get(item[0], 0.5)))
         for name, fn in batch:
             _STATE["queued"].add(name)
             _STATE["queue"].put((name, fn))
