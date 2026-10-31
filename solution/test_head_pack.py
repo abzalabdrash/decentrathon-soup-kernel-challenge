@@ -146,3 +146,34 @@ def test_streamed_head_packed_equals_fp16(n, rows):
         assert streamer.copy_bytes < streamer.n_chunks * rows * d * 2 * 2  # the packed head moved fewer
     finally:
         streamer.restore()
+
+
+def test_pack_max_rows_picks_the_ring_per_head():
+    """SOUP_SOLUTION_HEAD_PACK_MAX_ROWS: heads of more rows stream fp16, smaller ones the pack; the
+    values are the same either way."""
+    from solution.head_stream import HeadStreamer
+
+    rows, d = 2048, 1536
+    weight = _bf16_like(2 * rows + 100, d, seed=11).cuda()
+    param = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    streamer = HeadStreamer(param, rows=rows, slots=2)
+    try:
+        pack = streamer.start_pack(log=lambda *_: None)
+        pack.join()
+        streamer.pack_max_rows = 64
+        gen = torch.Generator(device="cuda").manual_seed(1)
+        outs = {}
+        for n in (200, 64):
+            hidden = torch.randn(n, d, device="cuda", generator=gen).half()
+            targets = torch.randint(0, weight.shape[0], (n,), device="cuda", generator=gen)
+            before = streamer.packed_heads
+            streamer.prefetch(n)  # as the final norm's hook does
+            outs[n] = streamer.head(hidden, targets, n, 1.0 / n)
+            assert streamer.packed_heads - before == (n <= 64)
+            streamer.pack_max_rows, saved = 0, streamer.pack_max_rows
+            other = streamer.head(hidden, targets, n, 1.0 / n)  # the other ring for 200, packed for 64
+            streamer.pack_max_rows = saved
+            for a, b in zip(outs[n], other):
+                assert torch.equal(a, b)
+    finally:
+        streamer.restore()

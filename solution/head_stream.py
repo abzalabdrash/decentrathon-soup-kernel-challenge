@@ -57,7 +57,8 @@ full, chunk by chunk, with the base's dtypes. Switches (environment): SOUP_SOLUT
 SOUP_SOLUTION_HEAD_ROWS (vocabulary rows per chunk), SOUP_SOLUTION_HEAD_SLOTS (ring slots, >= 2),
 SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head (where the first chunks start),
 SOUP_SOLUTION_HEAD_PACK=1 (the chunks cross PCIe in a lossless 12-bit form and are decoded on the GPU
-by our kernel, head_pack.py; off by default).
+by our kernel, head_pack.py; off by default) with SOUP_SOLUTION_HEAD_PACK_MAX_ROWS (only for heads of
+at most that many rows; 0 = all).
 """
 
 import atexit
@@ -277,8 +278,11 @@ class HeadStreamer:
         self._spans = collections.deque()
         self._spare_events = []
         self.loads = self.late_loads = self.heads = self.copies_timed = self.packed_heads = 0
-        # head_pack.HeadPack (SOUP_SOLUTION_HEAD_PACK=1), and the one the current ring holds chunks of
+        # head_pack.HeadPack (SOUP_SOLUTION_HEAD_PACK=1), and the one the current ring holds chunks of;
+        # heads of more rows than pack_max_rows (SOUP_SOLUTION_HEAD_PACK_MAX_ROWS, 0 = any) stream fp16:
+        # there the GEMMs hide the copies and the decode would only add its time
         self._pack = self._ring_pack = None
+        self.pack_max_rows = max(_env_int("SOUP_SOLUTION_HEAD_PACK_MAX_ROWS", 0), 0)
         self.copy_ms = self.wait_ms = 0.0
         self.copy_bytes = 0
         self.param_ref = weakref.ref(param)
@@ -391,12 +395,15 @@ class HeadStreamer:
         self._owner[s] = c
         self.loads += 1
 
-    def prefetch(self):
+    def prefetch(self, n=None):
         """Allocates the ring (on the compute stream) and starts the copies of the first chunks. The
-        ring holds packed chunks when the pack is ready (decided here, once per head), else fp16."""
+        ring holds packed chunks when the pack is ready and the head has at most pack_max_rows rows
+        (`n`, when known; decided here, once per head), else fp16."""
         if self._ring is None:
             pack = self._pack
             if pack is not None and not (pack.ready and pack.rows == self.rows and pack.n_chunks == self.n_chunks):
+                pack = None
+            if pack is not None and self.pack_max_rows and n is not None and n > self.pack_max_rows:
                 pack = None
             self._ring_pack = pack
             if pack is None:
@@ -452,7 +459,7 @@ class HeadStreamer:
         buffer = torch.empty(n * self.rows, dtype=dtype, device=dev)
         if self.fp32_out is None:
             self.fp32_out = _fp32_out_gemm_works(self.device)
-        self.prefetch()  # a no-op for the chunks prefetched at the final norm (or the embedding)
+        self.prefetch(n)  # a no-op for the chunks prefetched at the final norm (or the embedding)
         pack = self._ring_pack
         # packed ring: each chunk is decoded into one fp16 buffer right before its GEMMs (same stream)
         decoded = None if pack is None else torch.empty(self.rows, self.hidden, dtype=self.dtype, device=dev)
@@ -601,7 +608,7 @@ def _embedding_forward(streamer_ref, module, input):
         return torch.nn.Embedding.forward(module, input)
     out = streamer.lookup(input)
     if streamer.prefetch_at == "embedding" and module.training and torch.is_grad_enabled():
-        streamer.prefetch()  # a training forward ends in the fused head: start its first chunks
+        streamer.prefetch(input.numel())  # a training forward ends in the fused head: its first chunks
     return out
 
 
@@ -616,7 +623,8 @@ def _prefetch_hook(streamer_ref, module, args):
 
         if DRAIN_HEAD:
             drain_inflight()  # the last layer's (gate|up) leaves before the head's ring is made
-        streamer.prefetch()
+        hidden = args[0] if args and isinstance(args[0], torch.Tensor) else None
+        streamer.prefetch(None if hidden is None else hidden.numel() // streamer.hidden)
 
 
 def _lm_head_forward(streamer_ref, module, input):
