@@ -280,6 +280,9 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
+    if _mma_bwd(inter, d) and mma_gemm.int8_scaled_mm_usable(d, 2 * inter):
+        # the product and both scalings in one kernel (mma_gemm.py), the same values
+        return mma_gemm.int8_scaled_mm(dgu_q, w_gu_t, amax / 127.0, scale_gu)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
     grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])
     return grad_x
@@ -309,6 +312,11 @@ def _warm():
                        tokens, HIDDEN, BLOCK_I=bi, BLOCK_T=bt, BLOCK_K=bk, GROUP_I=group,
                        num_warps=warps, num_stages=1)
         groups = INTERMEDIATE // bi
+        if mma_gemm.int8_scaled_mm_usable(HIDDEN, 2 * INTERMEDIATE):
+            bm, bn, bk, warps, group = mma_gemm.SCALED_MM_CFG
+            compile_kernel(mma_gemm.tc_int8_scaled_mm_kernel, i8, i8, f32, f32, f32, tokens, HIDDEN,
+                           2 * INTERMEDIATE, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=group,
+                           num_warps=warps, num_stages=1)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=groups,
                    TR=TQ_R, TM=TQ_M)
     return None

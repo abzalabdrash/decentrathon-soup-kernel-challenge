@@ -284,6 +284,58 @@ def int8_swiglu_bwd(w_down_t, g_q, w_scale, g_scale, gate_up, cfg=SWIGLU_BWD_CFG
     return pmax
 
 
+@triton.jit
+def tc_int8_scaled_mm_kernel(a_ptr, b_ptr, sa_ptr, sb_ptr, c_ptr, M, N, K,
+                             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                             GROUP_M: tl.constexpr):
+    """int8_bwd.py's step 7 in one kernel: C (M, N) fp32 = (A (M, K) int8 @ B^T) * sa[m] * sb[n] with
+    B (N, K) int8 row-major, the int32 product in registers; the two scalings in the order of the
+    torch ops they replace (acc.float().mul_(sa[:, None]).mul_(sb[None, :])), so bit for bit."""
+    pid = tl.program_id(0)
+    num_m = tl.cdiv(M, BLOCK_M)
+    num_n = N // BLOCK_N
+    group = GROUP_M * num_n
+    first_m = (pid // group) * GROUP_M
+    size_m = min(num_m - first_m, GROUP_M)
+    pid_m = first_m + (pid % group) % size_m
+    pid_n = (pid % group) // size_m
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + (rm % M)[:, None].to(tl.int64) * K + rk[None, :]
+    b_ptrs = b_ptr + rn[None, :].to(tl.int64) * K + rk[:, None]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for _ in range(0, K // BLOCK_K):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc, out_dtype=tl.int32)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    live = rm < M
+    c = acc.to(tl.float32) * tl.load(sa_ptr + rm, mask=live, other=0.0)[:, None]
+    c = c * tl.load(sb_ptr + rn)[None, :]
+    tl.store(c_ptr + rm[:, None].to(tl.int64) * N + rn[None, :], c, mask=live[:, None])
+
+
+# (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, GROUP_M) of tc_int8_scaled_mm_kernel
+SCALED_MM_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_SMM_CFG", "64x128x64x4x8")))
+
+
+def int8_scaled_mm(a, b, sa, sb, cfg=SCALED_MM_CFG):
+    """a (M, K) int8 row-major, b (N, K) int8 row-major, sa (M,), sb (N,) fp32 -> (M, N) fp32."""
+    install()
+    bm, bn, bk, warps, group = cfg
+    m, k = a.shape
+    n = b.shape[0]
+    out = torch.empty((m, n), dtype=torch.float32, device=a.device)
+    tc_int8_scaled_mm_kernel[(triton.cdiv(m, bm) * (n // bn),)](
+        a, b, sa, sb, out, m, n, k, BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=group,
+        num_warps=warps, num_stages=1)
+    return out
+
+
+def int8_scaled_mm_usable(n, k, cfg=SCALED_MM_CFG):
+    return n % cfg[1] == 0 and k % cfg[2] == 0
+
+
 def int8_swiglu_bwd_usable(inter, d, cfg=SWIGLU_BWD_CFG):
     return inter % cfg[0] == 0 and d % cfg[2] == 0
 

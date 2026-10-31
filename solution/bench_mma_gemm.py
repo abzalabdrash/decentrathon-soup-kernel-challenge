@@ -228,6 +228,50 @@ def bench_swiglu_bwd(ms, iters, rounds, gen, results):
             print("    ", entry, flush=True)
 
 
+CFGSMM = [(128, 128, 128, 8, 8), (128, 128, 64, 8, 8), (64, 128, 128, 4, 8), (128, 64, 128, 4, 8),
+          (64, 64, 128, 4, 8), (256, 128, 64, 8, 8), (128, 256, 64, 8, 8), (64, 128, 64, 4, 8)]
+
+
+def bench_scaled_mm(ms, iters, rounds, gen, results):
+    """int8_bwd.py step 7: torch._int_mm + .float().mul_().mul_() against the fused kernel."""
+    inter2, d = 2 * 8960, 1536
+    for m in ms:
+        a = torch.randint(-127, 128, (m, inter2), device="cuda", dtype=torch.int8, generator=gen)
+        b = torch.randint(-127, 128, (d, inter2), device="cuda", dtype=torch.int8, generator=gen)
+        sa = torch.rand(m, device="cuda", generator=gen) * 1e-3
+        sb = torch.rand(d, device="cuda", generator=gen) * 1e-3
+
+        def today():
+            return torch._int_mm(a, b.t()).float().mul_(sa[:, None]).mul_(sb[None, :])
+
+        ref = today()
+        log, best = [], (float("inf"), None)
+        with _Clock() as clock:
+            us_today = _time(today, iters, rounds)
+            for cfg in CFGSMM:
+                try:
+                    out = mma_gemm.int8_scaled_mm(a, b, sa, sb, cfg)
+                    torch.cuda.synchronize()
+                    same = bool(torch.equal(out, ref))
+                    us = _time(lambda: mma_gemm.int8_scaled_mm(a, b, sa, sb, cfg), iters, rounds)
+                except Exception as exc:  # noqa: BLE001
+                    log.append({"cfg": cfg, "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+                    continue
+                log.append({"cfg": cfg, "us": round(us, 1), "bitwise": same})
+                if us < best[0]:
+                    best = (us, cfg)
+            us_today2 = _time(today, iters, rounds)
+        tod = min(us_today, us_today2)
+        mhz, watts = clock.mean()
+        row = {"kind": "scaled_mm", "m": m, "today_us": round(tod, 1), "fused_us": round(best[0], 1),
+               "cfg": best[1], "gain_us": round(tod - best[0], 1), "mhz": mhz, "configs": log}
+        results.append(row)
+        print(f"scaled_mm M={m:5d}  _int_mm+torch {tod:8.1f} us | fused {best[0]:8.1f} us cfg {best[1]} | "
+              f"gain {row['gain_us']} us | {mhz} MHz", flush=True)
+        for entry in log:
+            print("    ", entry, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[512, 832, 1440, 2048])
@@ -249,6 +293,8 @@ def main():
             bench_fp16(args.m, args.iters, args.rounds, gen, results)
         if "nf4" in parts:
             bench_nf4(args.m, args.iters, args.rounds, gen, results)
+        if "smm" in parts:
+            bench_scaled_mm(args.m, args.iters, args.rounds, gen, results)
         if "bwd" in parts:
             bench_swiglu_bwd(args.m, args.iters, args.rounds, gen, results)
         if "int8" in parts:

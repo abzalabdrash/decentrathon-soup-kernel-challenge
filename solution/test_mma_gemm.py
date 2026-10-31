@@ -68,6 +68,17 @@ def test_int8_swiglu_bwd_bitwise(tokens):
 
 
 @cuda
+def test_int8_scaled_mm_bitwise():
+    gen = torch.Generator("cuda").manual_seed(2)
+    a = torch.randint(-127, 128, (400, 17920), device="cuda", dtype=torch.int8, generator=gen)
+    b = torch.randint(-127, 128, (1536, 17920), device="cuda", dtype=torch.int8, generator=gen)
+    sa = torch.rand(400, device="cuda", generator=gen) * 1e-3
+    sb = torch.rand(1536, device="cuda", generator=gen) * 1e-3
+    ref = torch._int_mm(a, b.t()).float().mul_(sa[:, None]).mul_(sb[None, :])
+    assert torch.equal(mma_gemm.int8_scaled_mm(a, b, sa, sb), ref)
+
+
+@cuda
 def test_mlp_backward_same_with_and_without_mma(monkeypatch):
     """int8_bwd.mlp_backward with SOUP_SOLUTION_MMA_INT8_BWD on and off: the same dL/dx bit for bit
     (on a T4 the tensor-core kernel runs; elsewhere both runs take the two-kernel path)."""
@@ -79,6 +90,10 @@ def test_mlp_backward_same_with_and_without_mma(monkeypatch):
     monkeypatch.setenv("SOUP_SOLUTION_FUSED_GU_SPLIT", "1")
     monkeypatch.setitem(int8_bwd._STATE, "on", True)
     int8_bwd.compile_now()
+    # chosen on the T4 only; elsewhere tl.dot takes Triton's own MMA and the same kernels run
+    real = torch.cuda.get_device_capability
+    monkeypatch.setattr(int8_bwd, "_mma_bwd", lambda inter, d: int8_bwd._STATE["mma"] and real() >= (7, 5)
+                        and mma_gemm.int8_swiglu_bwd_usable(inter, d))
     mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=22).cuda().train()
     gen = torch.Generator("cuda").manual_seed(8)
     x = torch.randn(1, 832, 1536, device="cuda", generator=gen)
