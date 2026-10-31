@@ -124,7 +124,8 @@ def main():
         max_len = max(b - a for a, b in zip(bounds[:-1], bounds[1:]))
         out, lse, seed, offset = varlen_forward(q, k, v, cu, max_len, SCALE)
         run_o = lambda: original(q, k, v, dout, cu, bounds, out, lse, seed, offset)  # noqa: E731
-        run_m = lambda: attn_bwd.math_backward(dout, q, k, v, cu, bounds, n_seq, SCALE)  # noqa: E731
+        plan = attn_bwd.Plan(bounds, n_seq, q.device)
+        run_m = lambda: attn_bwd.math_backward(dout, q, k, v, plan, SCALE)  # noqa: E731
         want = reference(q, k, v, dout, bounds, n_seq)
         got_o, got_m = run_o(), run_m()
         tail_zero = all(bool((t[:, bounds[n_seq]:] == 0).all()) for t in got_m)
@@ -134,7 +135,7 @@ def main():
         mo, mm = peak_mib(run_o), peak_mib(run_m)
         print(f"{name:16s} {bounds[-1]:5d} {to:8.3f} {tm:8.3f} {ho:5.2f}/{hm:5.2f} {mo:5.1f}/{mm:5.1f}  "
               f"{eo[0]:.1e} {eo[1]:.1e} {eo[2]:.1e} | {em[0]:.1e} {em[1]:.1e} {em[2]:.1e}"
-              f"{'' if tail_zero else '  TAIL NOT ZERO'}  lse {tuple(lse.shape)}", flush=True)
+              f"{'' if tail_zero else '  TAIL NOT ZERO'}  bins {plan.bins} lp {plan.lp}", flush=True)
 
     # bmm with an fp32 output against a half bmm and a cast (the scores' shape at L=208)
     a = torch.randn(8, 6 * 208, 128, device="cuda").half()
@@ -148,7 +149,8 @@ def main():
 
     # per-launch breakdown at L=208 (each launch timed alone)
     q, k, v, dout, cu, bounds, n_seq = batch([208, 204, 196, 188])
-    lp = 208
+    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    lp = plan.lp
     rq, rk = n_seq * H * lp * D, n_seq * G * lp * D
     work = torch.empty(2 * rq + 3 * rk, dtype=torch.half, device="cuda")
     qp, gp = work[:rq], work[rq:2 * rq]
@@ -163,11 +165,12 @@ def main():
     rows = n_seq * H * lp
     gq, gk, gv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     steps = [
-        ("gather", lambda: attn_bwd.attn_bwd_gather_kernel[(n_seq, lp)](
-            q, k, v, dout, cu, qp, kp, vp, gp, lp, H=H, G=G, D=D, HB=16, GB=2, num_warps=4)),
+        ("gather", lambda: attn_bwd.attn_bwd_gather_kernel[(n_seq * lp,)](
+            q, k, v, dout, plan.rowmap, qp, kp, vp, gp, lp, H=H, G=G, D=D, HB=16, GB=2, num_warps=4)),
         ("S = QK^T", lambda: torch.bmm(qg, kg.transpose(1, 2), out_dtype=torch.float32, out=s3)),
         ("probs", lambda: attn_bwd.attn_bwd_probs_kernel[(rows,)](
-            s, p, cu, lp, H, SCALE * 1.4426950408889634, BLOCK=256, num_warps=attn_bwd.NUM_WARPS_ROWS)),
+            s, p, plan.seg, 0, lp, H, SCALE * 1.4426950408889634, BLOCK=256,
+            num_warps=attn_bwd.NUM_WARPS_ROWS)),
         ("dV = P^T dO", lambda: torch.bmm(p3.transpose(1, 2), gg, out=dvg)),
         ("dP = dO V^T", lambda: torch.bmm(gg, vg.transpose(1, 2), out_dtype=torch.float32, out=s3)),
         ("dS", lambda: attn_bwd.attn_bwd_dscores_kernel[(rows,)](
@@ -175,7 +178,7 @@ def main():
         ("dQ = dS K", lambda: torch.bmm(p3, kg, out=gg)),
         ("dK = dS^T Q", lambda: torch.bmm(p3.transpose(1, 2), qg, out=vg)),
         ("scatter", lambda: attn_bwd.attn_bwd_scatter_kernel[(bounds[-1],)](
-            gp, vp, dvp, cu, n_seq, gq, gk, gv, lp, H=H, G=G, D=D, HB=16, GB=2, SB=8, num_warps=4)),
+            gp, vp, dvp, plan.inv, gq, gk, gv, lp, H=H, G=G, D=D, HB=16, GB=2, num_warps=4)),
     ]
     total = 0.0
     for label, fn in steps:
@@ -185,7 +188,7 @@ def main():
     print(f"  sum          {total:.3f} ms", flush=True)
     for warps in (1, 2, 4, 8):
         tp = gpu_ms(lambda: attn_bwd.attn_bwd_probs_kernel[(rows,)](
-            s, p, cu, lp, H, SCALE * 1.4426950408889634, BLOCK=256, num_warps=warps), iters)
+            s, p, plan.seg, 0, lp, H, SCALE * 1.4426950408889634, BLOCK=256, num_warps=warps), iters)
         td = gpu_ms(lambda: attn_bwd.attn_bwd_dscores_kernel[(rows,)](
             p, s, lp, SCALE, BLOCK=256, num_warps=warps), iters)
         print(f"  row kernels num_warps={warps}: probs {tp:.3f} ms, dS {td:.3f} ms", flush=True)

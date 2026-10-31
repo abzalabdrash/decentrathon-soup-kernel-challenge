@@ -63,6 +63,7 @@ _STATE = {
     "min_tokens": _env_int("SOUP_SOLUTION_ATTN_BWD_MIN_TOKENS", 600),
     "max_len": _env_int("SOUP_SOLUTION_ATTN_BWD_MAX_LEN", 256),
     "scratch": os.environ.get("SOUP_SOLUTION_ATTN_BWD_SCRATCH", "nf4").strip().lower(),
+    "scratch_mb": _env_int("SOUP_SOLUTION_ATTN_BWD_SCRATCH_MB", 16),
     "calls": 0, "fallbacks": 0, "shared": 0, "error": None,
 }
 ALIGN = 16  # padded sequence length: a multiple of this (16-byte aligned fp16 rows for cuBLAS)
@@ -78,45 +79,47 @@ def enabled():
 
 
 @triton.jit
-def attn_bwd_gather_kernel(q_ptr, k_ptr, v_ptr, g_ptr, cu_ptr, qp_ptr, kp_ptr, vp_ptr, gp_ptr, LP,
+def attn_bwd_gather_kernel(q_ptr, k_ptr, v_ptr, g_ptr, rowmap_ptr, qp_ptr, kp_ptr, vp_ptr, gp_ptr, LP,
                            H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
                            HB: tl.constexpr, GB: tl.constexpr):
-    """Padded row `i` of sequence `b`: the H query and grad_out rows and the G key and value rows of
-    token start_b + i, token-major (N, heads, D) -> head-major (B, heads, LP, D); zeros past the
-    sequence's end."""
-    b = tl.program_id(0)
-    i = tl.program_id(1)
-    start = tl.load(cu_ptr + b)
-    end = tl.load(cu_ptr + b + 1)
-    live = start + i < end
-    tok = (start + i).to(tl.int64)
+    """Row r of bin `bin` (program bin * LP + r): the H query and grad_out rows and the G key and
+    value rows of the token rowmap[bin * LP + r] (-1: none, zeros), token-major (N, heads, D) ->
+    head-major (bins, heads, LP, D)."""
+    at = tl.program_id(0)
+    bin = at // LP
+    r = at % LP
+    tok = tl.load(rowmap_ptr + at)
+    live = tok >= 0
+    tok = tl.where(live, tok, 0).to(tl.int64)
     col = tl.arange(0, D)[None, :]
     hq = tl.arange(0, HB)[:, None]
     in_q = hq < H
     src = tok * (H * D) + hq * D + col
-    dst = ((b * H + hq) * LP + i).to(tl.int64) * D + col
+    dst = ((bin * H + hq) * LP + r).to(tl.int64) * D + col
     tl.store(qp_ptr + dst, tl.load(q_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     tl.store(gp_ptr + dst, tl.load(g_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     hk = tl.arange(0, GB)[:, None]
     in_k = hk < G
     src = tok * (G * D) + hk * D + col
-    dst = ((b * G + hk) * LP + i).to(tl.int64) * D + col
+    dst = ((bin * G + hk) * LP + r).to(tl.int64) * D + col
     tl.store(kp_ptr + dst, tl.load(k_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
     tl.store(vp_ptr + dst, tl.load(v_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
 
 
 @triton.jit
-def attn_bwd_probs_kernel(s_ptr, p_ptr, cu_ptr, LP, H, scale_log2e, BLOCK: tl.constexpr):
-    """One row of P = softmax(scale * S) for query row i of head h of sequence b (row (b*H + h)*LP + i
-    of the (B*H*LP, LP) scores): keys 0..i only, a row past the sequence all zeros."""
-    row = tl.program_id(0)
-    i = row % LP
-    b = row // (H * LP)
-    length = tl.load(cu_ptr + b + 1) - tl.load(cu_ptr + b)
+def attn_bwd_probs_kernel(s_ptr, p_ptr, seg_ptr, row0, LP, H, scale_log2e, BLOCK: tl.constexpr):
+    """One row of P = softmax(scale * S): local row `pid` of this chunk's scores is global row
+    row0 + pid = (bin * H + h) * LP + r, query row r of a bin; its keys are its own sequence's from
+    seg[bin * LP + r] (the sequence's first row in the bin; -1: no sequence, a zero row) to r."""
+    pid = tl.program_id(0)
+    row = row0 + pid
+    r = row % LP
+    bin = row // (H * LP)
+    first = tl.load(seg_ptr + bin * LP + r)
     j = tl.arange(0, BLOCK)
-    alive = i < length
-    keep = (j <= i) & alive
-    at = row.to(tl.int64) * LP + j
+    alive = first >= 0
+    keep = (j <= r) & (j >= first) & alive
+    at = pid.to(tl.int64) * LP + j
     x = tl.load(s_ptr + at, mask=keep, other=float("-inf"))
     top = tl.where(alive, tl.max(x, axis=0), 0.0)
     e = tl.exp2((x - top) * scale_log2e)
@@ -141,26 +144,26 @@ def attn_bwd_dscores_kernel(p_ptr, dp_ptr, LP, scale, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def attn_bwd_scatter_kernel(dqp_ptr, dkp_ptr, dvp_ptr, cu_ptr, n_seq, dq_ptr, dk_ptr, dv_ptr, LP,
+def attn_bwd_scatter_kernel(dqp_ptr, dkp_ptr, dvp_ptr, inv_ptr, dq_ptr, dk_ptr, dv_ptr, LP,
                             H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
-                            HB: tl.constexpr, GB: tl.constexpr, SB: tl.constexpr):
-    """Token `tok`: its rows of dQ (H heads), dK and dV (G heads) from the head-major padded buffers
-    into the token-major gradients; zeros for a token after the last computed sequence (the tail)."""
+                            HB: tl.constexpr, GB: tl.constexpr):
+    """Token `tok`: its rows of dQ (H heads), dK and dV (G heads) from bin row inv[tok] of the
+    head-major buffers into the token-major gradients; zeros where inv is -1 (the tail)."""
     tok = tl.program_id(0)
-    s = tl.arange(0, SB)
-    ends = tl.load(cu_ptr + 1 + s, mask=s < n_seq, other=2147483647)
-    b = tl.sum((ends <= tok).to(tl.int32), axis=0)
-    live = b < n_seq
-    i = tok - tl.load(cu_ptr + b)
+    at = tl.load(inv_ptr + tok)
+    live = at >= 0
+    at = tl.where(live, at, 0)
+    bin = at // LP
+    r = at % LP
     col = tl.arange(0, D)[None, :]
     hq = tl.arange(0, HB)[:, None]
     in_q = hq < H
-    src = ((b * H + hq) * LP + i).to(tl.int64) * D + col
+    src = ((bin * H + hq) * LP + r).to(tl.int64) * D + col
     dst = tok.to(tl.int64) * (H * D) + hq * D + col
     tl.store(dq_ptr + dst, tl.load(dqp_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     hk = tl.arange(0, GB)[:, None]
     in_k = hk < G
-    src = ((b * G + hk) * LP + i).to(tl.int64) * D + col
+    src = ((bin * G + hk) * LP + r).to(tl.int64) * D + col
     dst = tok.to(tl.int64) * (G * D) + hk * D + col
     tl.store(dk_ptr + dst, tl.load(dkp_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
     tl.store(dv_ptr + dst, tl.load(dvp_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
@@ -174,9 +177,9 @@ def _pow2(n):
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
-def _shared_tail(device, dtype, numel):
-    """A (numel,) view of the free end of fused_proj.py's shared dequantization buffer: the elements
-    after everything it holds now (_HELD's views), None when it is missing or too short."""
+def _free_tail(device, dtype):
+    """A view of the free end of fused_proj.py's shared dequantization buffer: the elements after
+    everything it holds now (_HELD's views, 128-byte aligned), None when there is no such buffer."""
     try:
         from . import fused_proj
     except ImportError:
@@ -194,70 +197,126 @@ def _shared_tail(device, dtype, numel):
             if item.untyped_storage().data_ptr() != buf.untyped_storage().data_ptr():
                 return None
             end = max(end, item.storage_offset() + item.numel())
-    end = -(-end // 64) * 64  # 128-byte aligned start
-    if buf.numel() - end < numel:
-        return None
-    return buf[end:end + numel]
+    end = -(-end // 64) * 64
+    return buf[end:] if end < buf.numel() else None
 
 
-def _scratch(device, half, elems):
-    """(S fp32, P half) flat buffers of `elems` elements: in the shared buffer's free tail when they
-    fit there, else allocated."""
-    if _STATE["scratch"] == "nf4" and half in (torch.float16, torch.bfloat16):
-        tail = _shared_tail(device, half, 3 * elems)
-        if tail is not None:
+def _scratch(device, half, per_entry, entries):
+    """(S fp32, P half, entries per chunk): flat buffers for the scores of as many (bin, kv group)
+    entries as fit, per_entry elements each; in the shared buffer's free tail when one entry fits
+    there, else allocated (at most SOUP_SOLUTION_ATTN_BWD_SCRATCH_MB, one entry at least)."""
+    if _STATE["scratch"] == "nf4":
+        tail = _free_tail(device, half)
+        fit = tail.numel() // (3 * per_entry) if tail is not None else 0
+        if fit >= 1:
+            m = min(entries, fit)
             _STATE["shared"] += 1
-            return tail[:2 * elems].view(torch.float32), tail[2 * elems:]
-    return (torch.empty(elems, dtype=torch.float32, device=device),
-            torch.empty(elems, dtype=half, device=device))
+            return (tail[:2 * m * per_entry].view(torch.float32), tail[2 * m * per_entry:3 * m * per_entry],
+                    m)
+    m = min(entries, max(1, (_STATE["scratch_mb"] << 20) // (6 * per_entry)))
+    return (torch.empty(m * per_entry, dtype=torch.float32, device=device),
+            torch.empty(m * per_entry, dtype=half, device=device), m)
 
 
-def math_backward(grad_out, q, k, v, cu, bounds, n_seq, scale):
-    """(grad_q, grad_k, grad_v) of causal attention within the first `n_seq` sequences of `bounds`
-    (host ints; `cu` the same boundaries as int32 on the GPU), zeros for the tokens after them.
-    grad_out, q: (1, N, H, D); k, v: (1, N, G, D); all contiguous, one half dtype."""
+class Plan:
+    """One step's layout for the math path: the real sequences (bounds[:n_seq + 1]) packed into
+    bins of LP rows (first fit, longest first: short rows share a bin, so the squares the GEMMs
+    compute are fewer), and on the GPU one int32 tensor of three maps: rowmap (bin row -> token,
+    -1 none), seg (bin row -> its sequence's first row in the bin, -1 none) and inv (token -> bin
+    row, -1 for the tail). Built once per step, copied from pinned memory without a host wait."""
+
+    __slots__ = ("bounds", "n_seq", "lp", "bins", "where", "host", "maps", "rowmap", "seg", "inv")
+
+    def __init__(self, bounds, n_seq, device):
+        self.bounds, self.n_seq = bounds, n_seq
+        lens = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
+        self.lp = lp = -(-max(lens) // ALIGN) * ALIGN
+        used, where = [], [None] * n_seq
+        for b in sorted(range(n_seq), key=lambda i: -lens[i]):
+            for i, u in enumerate(used):
+                if u + lens[b] <= lp:
+                    where[b] = (i, u)
+                    used[i] += lens[b]
+                    break
+            else:
+                where[b] = (len(used), 0)
+                used.append(lens[b])
+        self.bins, self.where = len(used), tuple(where)
+        n, rows = bounds[-1], len(used) * lp
+        try:
+            host = torch.empty(2 * rows + n, dtype=torch.int32, pin_memory=True)
+        except RuntimeError:
+            host = torch.empty(2 * rows + n, dtype=torch.int32)
+        host.fill_(-1)
+        rowmap, seg, inv = host[:rows], host[rows:2 * rows], host[2 * rows:]
+        for b, (bin, off) in enumerate(where):
+            base, start, length = bin * lp + off, bounds[b], lens[b]
+            rowmap[base:base + length] = torch.arange(start, start + length, dtype=torch.int32)
+            seg[base:base + length] = off
+            inv[start:start + length] = torch.arange(base, base + length, dtype=torch.int32)
+        self.host = host  # kept until the step's backward is done (the copy reads it)
+        self.maps = host.to(device, non_blocking=host.is_pinned())
+        self.rowmap, self.seg, self.inv = self.maps[:rows], self.maps[rows:2 * rows], self.maps[2 * rows:]
+
+
+_PLAN = {"key": None, "plan": None}
+
+
+def plan_for(bounds, n_seq, device):
+    """The step's Plan, built at the first layer that asks and shared by the others."""
+    key = (bounds, n_seq, device)
+    if _PLAN["key"] != key:
+        _PLAN["key"], _PLAN["plan"] = key, Plan(bounds, n_seq, device)
+    return _PLAN["plan"]
+
+
+def math_backward(grad_out, q, k, v, plan, scale):
+    """(grad_q, grad_k, grad_v) of causal attention within each real sequence of `plan`, zeros for
+    the tokens after them. grad_out, q: (1, N, H, D); k, v: (1, N, G, D); contiguous, one half dtype."""
     _, n, heads, dim = q.shape
     groups = k.shape[2]
     per = heads // groups
-    lmax = max(bounds[i + 1] - bounds[i] for i in range(n_seq))
-    lp = -(-lmax // ALIGN) * ALIGN
+    lp, bins = plan.lp, plan.bins
     half, device = q.dtype, q.device
-    rq, rk = n_seq * heads * lp * dim, n_seq * groups * lp * dim
+    rq, rk = bins * heads * lp * dim, bins * groups * lp * dim
     work = torch.empty(2 * rq + 3 * rk, dtype=half, device=device)
     qp, gp = work[:rq], work[rq:2 * rq]
     kp, vp, dvp = work[2 * rq:2 * rq + rk], work[2 * rq + rk:2 * rq + 2 * rk], work[2 * rq + 2 * rk:]
-    elems = n_seq * heads * lp * lp
-    s, p = _scratch(device, half, elems)
     hb, gb = _pow2(heads), _pow2(groups)
-    attn_bwd_gather_kernel[(n_seq, lp)](q, k, v, grad_out, cu, qp, kp, vp, gp, lp,
-                                        H=heads, G=groups, D=dim, HB=hb, GB=gb, num_warps=4)
-    batch = n_seq * groups
-    qg, gg = qp.view(batch, per * lp, dim), gp.view(batch, per * lp, dim)
-    kg, vg, dvg = kp.view(batch, lp, dim), vp.view(batch, lp, dim), dvp.view(batch, lp, dim)
-    s3, p3 = s.view(batch, per * lp, lp), p.view(batch, per * lp, lp)
+    attn_bwd_gather_kernel[(bins * lp,)](q, k, v, grad_out, plan.rowmap, qp, kp, vp, gp, lp,
+                                         H=heads, G=groups, D=dim, HB=hb, GB=gb, num_warps=4)
+    entries = bins * groups
+    qg, gg = qp.view(entries, per * lp, dim), gp.view(entries, per * lp, dim)
+    kg, vg, dvg = kp.view(entries, lp, dim), vp.view(entries, lp, dim), dvp.view(entries, lp, dim)
+    per_entry = per * lp * lp
+    s, p, chunk = _scratch(device, half, per_entry, entries)
     block = _pow2(lp)
-    rows = n_seq * heads * lp
-    torch.bmm(qg, kg.transpose(1, 2), out_dtype=torch.float32, out=s3)
-    attn_bwd_probs_kernel[(rows,)](s, p, cu, lp, heads, scale * 1.4426950408889634, BLOCK=block,
-                                   num_warps=NUM_WARPS_ROWS)
-    torch.bmm(p3.transpose(1, 2), gg, out=dvg)
-    torch.bmm(gg, vg.transpose(1, 2), out_dtype=torch.float32, out=s3)
-    attn_bwd_dscores_kernel[(rows,)](p, s, lp, scale, BLOCK=block, num_warps=NUM_WARPS_ROWS)
-    torch.bmm(p3, kg, out=gg)  # dQ, over grad_out's buffer (read by the two GEMMs above only)
-    torch.bmm(p3.transpose(1, 2), qg, out=vg)  # dK, over v's buffer (read by dP only)
+    log2e_scale = scale * 1.4426950408889634
+    for e0 in range(0, entries, chunk):
+        e1 = min(entries, e0 + chunk)
+        m = e1 - e0
+        s3, p3 = s[:m * per_entry].view(m, per * lp, lp), p[:m * per_entry].view(m, per * lp, lp)
+        rows = m * per * lp
+        torch.bmm(qg[e0:e1], kg[e0:e1].transpose(1, 2), out_dtype=torch.float32, out=s3)
+        attn_bwd_probs_kernel[(rows,)](s3, p3, plan.seg, e0 * per * lp, lp, heads, log2e_scale,
+                                       BLOCK=block, num_warps=NUM_WARPS_ROWS)
+        torch.bmm(p3.transpose(1, 2), gg[e0:e1], out=dvg[e0:e1])
+        torch.bmm(gg[e0:e1], vg[e0:e1].transpose(1, 2), out_dtype=torch.float32, out=s3)
+        attn_bwd_dscores_kernel[(rows,)](p3, s3, lp, scale, BLOCK=block, num_warps=NUM_WARPS_ROWS)
+        torch.bmm(p3, kg[e0:e1], out=gg[e0:e1])  # dQ over these entries' grad_out (read above only)
+        torch.bmm(p3.transpose(1, 2), qg[e0:e1], out=vg[e0:e1])  # dK over their v (read by dP only)
     grad_q = torch.empty_like(q)
     grad_k = torch.empty_like(k)
     grad_v = torch.empty_like(v)
-    attn_bwd_scatter_kernel[(n,)](gp, vp, dvp, cu, n_seq, grad_q, grad_k, grad_v, lp,
-                                  H=heads, G=groups, D=dim, HB=hb, GB=gb, SB=_pow2(len(bounds)),
-                                  num_warps=4)
+    attn_bwd_scatter_kernel[(n,)](gp, vp, dvp, plan.inv, grad_q, grad_k, grad_v, lp,
+                                  H=heads, G=groups, D=dim, HB=hb, GB=gb, num_warps=4)
     return grad_q, grad_k, grad_v
 
 
 def taken(cu):
-    """In _VarlenAttention.forward (inside unpad.varlen): (bounds, the number of real sequences) of
-    this step's packed batch for the backward when the math path is on, else None."""
-    if _STATE["mode"] != "math":
+    """In _VarlenAttention.forward (inside unpad.varlen): the step's Plan when the math path is on
+    and the step's lengths fit it, else None."""
+    if _STATE["mode"] != "math" or _STATE["error"] is not None:
         return None
     from .unpad import _CTX
 
@@ -266,12 +325,20 @@ def taken(cu):
         return None
     bounds = cached[0]
     real = len(spans)
-    if real >= len(bounds) or bounds[real] != spans[-1][1]:
+    if real >= len(bounds) or bounds[real] != spans[-1][1] or bounds[0] != 0:
         return None
-    return bounds, real
+    if not _lengths_fit(bounds, real):
+        return None
+    return plan_for(bounds, real, cu.device)
 
 
-def _fits(grad_out, q, k, v, cu, bounds, n_seq):
+def _lengths_fit(bounds, n_seq):
+    lengths = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
+    return (min(lengths) > 0 and max(lengths) <= _STATE["max_len"]
+            and bounds[n_seq] >= _STATE["min_tokens"])
+
+
+def _fits(grad_out, q, k, v, plan):
     if not (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)):
         return False
     if q.dim() != 4 or k.dim() != 4 or q.shape[0] != 1 or k.shape != v.shape or grad_out.shape != q.shape:
@@ -284,27 +351,22 @@ def _fits(grad_out, q, k, v, cu, bounds, n_seq):
     if any(t.dtype != q.dtype or t.device != q.device or not t.is_contiguous()
            for t in (grad_out, k, v)) or not q.is_contiguous():
         return False
-    if cu.dtype != torch.int32 or cu.device != q.device or cu.numel() != len(bounds):
+    if plan.bounds[-1] != n or plan.maps.device != q.device:
         return False
-    if bounds[0] != 0 or bounds[-1] != n or not 0 < n_seq < len(bounds) or len(bounds) > 64:
-        return False
-    lengths = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
-    if min(lengths) <= 0 or max(lengths) > _STATE["max_len"]:
-        return False
-    return bounds[n_seq] >= _STATE["min_tokens"]
+    return _lengths_fit(plan.bounds, plan.n_seq)
 
 
-def backward(grad_out, q, k, v, cu, seqs, scale):
+def backward(grad_out, q, k, v, cu, plan, scale):
     """_VarlenAttention.backward's gradients (grad_q, grad_k, grad_v) by the math path when this step
-    fits it (see the module doc), else None (the caller runs the original backward)."""
-    if seqs is None or _STATE["mode"] != "math" or _STATE["error"] is not None:
+    fits it (see the module doc), else None (the caller runs the original backward). `plan`: what
+    `taken` gave the forward."""
+    if plan is None or _STATE["mode"] != "math" or _STATE["error"] is not None:
         return None
-    bounds, n_seq = seqs
-    if not _fits(grad_out, q, k, v, cu, bounds, n_seq):
+    if not _fits(grad_out, q, k, v, plan):
         _STATE["fallbacks"] += 1
         return None
     try:
-        grads = math_backward(grad_out, q, k, v, cu, bounds, n_seq, scale)
+        grads = math_backward(grad_out, q, k, v, plan, scale)
     except (RuntimeError, TypeError, ValueError) as exc:  # e.g. a torch without bmm's out_dtype
         _STATE["error"] = repr(exc)
         print(f"[solution] attention math backward off: {exc!r}", flush=True)
@@ -319,27 +381,23 @@ def stats():
 
 def _warm():
     """warmup.py registration: the four kernels as training launches them (fp16 on the T4; the rows
-    kernels for each power-of-two block up to SOUP_SOLUTION_ATTN_BWD_MAX_LEN)."""
+    kernels for each power-of-two block a fitting step can take)."""
     from .warmup import HEAD_DIM, KV_HEADS, Q_HEADS, compile_kernel, training_half_dtype
 
     half = training_half_dtype()
     i32, f32 = torch.int32, torch.float32
+    heads = dict(H=Q_HEADS, G=KV_HEADS, D=HEAD_DIM, HB=_pow2(Q_HEADS), GB=_pow2(KV_HEADS), num_warps=4)
     compile_kernel(attn_bwd_gather_kernel, half, half, half, half, i32, half, half, half, half, 208,
-                   H=Q_HEADS, G=KV_HEADS, D=HEAD_DIM, HB=_pow2(Q_HEADS), GB=_pow2(KV_HEADS),
-                   num_warps=4)
+                   **heads)
+    compile_kernel(attn_bwd_scatter_kernel, half, half, half, i32, half, half, half, 208, **heads)
     # a batch of 4 rows with at least min_tokens has a row of min_tokens / 4 or more
-    shortest = -(-max(1, _STATE["min_tokens"] // 4) // ALIGN) * ALIGN
-    block = _pow2(shortest)
+    block = _pow2(-(-max(1, _STATE["min_tokens"] // 4) // ALIGN) * ALIGN)
     while block <= _pow2(-(-_STATE["max_len"] // ALIGN) * ALIGN):
-        compile_kernel(attn_bwd_probs_kernel, f32, half, i32, 208, Q_HEADS, 0.1, BLOCK=block,
+        compile_kernel(attn_bwd_probs_kernel, f32, half, i32, 0, 208, Q_HEADS, 0.1, BLOCK=block,
                        num_warps=NUM_WARPS_ROWS)
         compile_kernel(attn_bwd_dscores_kernel, half, f32, 208, 0.1, BLOCK=block,
                        num_warps=NUM_WARPS_ROWS)
         block *= 2
-    for sb in (4, 8):
-        compile_kernel(attn_bwd_scatter_kernel, half, half, half, i32, 4, half, half, half, 208,
-                       H=Q_HEADS, G=KV_HEADS, D=HEAD_DIM, HB=_pow2(Q_HEADS), GB=_pow2(KV_HEADS),
-                       SB=sb, num_warps=4)
 
 
 def _report():

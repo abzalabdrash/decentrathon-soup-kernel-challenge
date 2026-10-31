@@ -18,6 +18,8 @@ PATTERNS = {
     "one long, short ones": [256, 17, 1, 70],
     "one row": [160],
 }
+# first fit, longest first, into bins of the longest row rounded up to 16
+BINS = {"4 rows of ~200 and the tail": 4, "uneven, no tail": 3, "one long, short ones": 2, "one row": 1}
 
 
 @pytest.fixture
@@ -79,7 +81,9 @@ def _max_rel(a, b):
 @pytest.mark.parametrize("tail", [True, False])
 def test_math_backward_matches_reference_and_original(pattern, tail):
     q, k, v, dout, cu, bounds, n_seq = _batch(PATTERNS[pattern], tail=tail)
-    got = attn_bwd.math_backward(dout, q, k, v, cu, bounds, n_seq, SCALE)
+    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    assert plan.bins == BINS[pattern]
+    got = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
     want = _reference(q, k, v, dout, bounds, n_seq)
     orig = _original(q, k, v, dout, cu, bounds)
     for name, g, w, o in zip("qkv", got, want, orig):
@@ -91,38 +95,57 @@ def test_math_backward_matches_reference_and_original(pattern, tail):
         assert (g[:, bounds[n_seq]:] == 0).all() and (o[:, bounds[n_seq]:] == 0).all(), name
 
 
-def test_scratch_in_the_shared_buffer(math_on):
-    """S and P go after what fused_proj's buffer holds, the held weights stay untouched, and the
-    gradients are the same as with allocated scratch."""
+def test_scratch_in_the_shared_buffer_and_chunks(math_on):
+    """S and P go after what fused_proj's buffer holds (the held weights stay untouched), in chunks
+    of as many (bin, kv group) entries as fit there; the gradients are those of one chunk."""
     from solution import fused_proj
 
     q, k, v, dout, cu, bounds, n_seq = _batch(PATTERNS["4 rows of ~200 and the tail"])
-    own = attn_bwd.math_backward(dout, q, k, v, cu, bounds, n_seq, SCALE)
+    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    own = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)  # one chunk (16 MiB cap)
     key = (q.device, torch.float16)
     saved_buf, saved_held = fused_proj._BUFFERS.get(key), dict(fused_proj._HELD)
+    per_entry = 6 * plan.lp * plan.lp
     try:
-        buf = torch.randn(26_250_000 // 2 * 2, device="cuda").half()
+        buf = torch.randn(13_125_000, device="cuda").half()
         fused_proj._BUFFERS[key] = buf
         held = (buf[:5_000_000].view(-1, 1000), buf[5_000_000:5_500_000].view(-1, 500))
         fused_proj._HELD.update(key="test", views=held)
         before = buf[:5_500_000].clone()
-        tail = attn_bwd._shared_tail(q.device, torch.float16, 100)
+        tail = attn_bwd._free_tail(q.device, torch.float16)
         assert tail is not None and tail.storage_offset() >= 5_500_000
         attn_bwd._STATE.update(scratch="nf4", shared=0)
-        shared = attn_bwd.math_backward(dout, q, k, v, cu, bounds, n_seq, SCALE)
+        shared = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)  # 8 entries fit: one chunk
         assert attn_bwd._STATE["shared"] == 1
         assert torch.equal(buf[:5_500_000], before)
         for a, b in zip(shared, own):
             assert torch.equal(a, b)
-        # too short a free tail: allocated scratch
+        # room for 3 entries: chunks of 3, 3, 2
+        fused_proj._HELD.update(views=(buf[:buf.numel() - 3 * 3 * per_entry - 100],))
+        chunked = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
+        assert attn_bwd._STATE["shared"] == 2
+        for a, b in zip(chunked, own):
+            assert _max_rel(a, b) < 1e-3
+        # not even one entry: allocated scratch
         fused_proj._HELD.update(views=(buf[:buf.numel() - 1000],))
-        assert attn_bwd._shared_tail(q.device, torch.float16, 3 * 4 * 12 * 208 * 208) is None
+        attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
+        assert attn_bwd._STATE["shared"] == 2
     finally:
         if saved_buf is None:
             fused_proj._BUFFERS.pop(key, None)
         else:
             fused_proj._BUFFERS[key] = saved_buf
         fused_proj._HELD.update(saved_held)
+
+
+def test_own_scratch_cap_chunks(math_on):
+    q, k, v, dout, cu, bounds, n_seq = _batch(PATTERNS["uneven, no tail"], tail=False)
+    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    whole = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
+    attn_bwd._STATE.update(scratch_mb=1)  # under one entry: one entry per chunk
+    single = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
+    for a, b in zip(single, whole):
+        assert _max_rel(a, b) < 1e-3
 
 
 def _through_varlen(lengths, q, k, v, dout):
@@ -158,7 +181,7 @@ def test_varlen_attention_uses_math_path_and_falls_back(math_on):
         attn_bwd._STATE.update(mode="math", calls=0, fallbacks=0, max_len=256, min_tokens=0)
         attn_bwd._STATE.update(change)
         _, grads2 = _through_varlen(lengths, q, k, v, dout)
-        assert attn_bwd._STATE["calls"] == 0 and attn_bwd._STATE["fallbacks"] == 1
+        assert attn_bwd._STATE["calls"] == 0  # the forward's `taken` gave no plan
         for a, b in zip(grads2, grads0):
             # aten's dq is not bit-reproducible run to run with several key splits (T16): compare
             # dk, dv bitwise and dq to rounding
@@ -181,20 +204,19 @@ def test_outside_varlen_or_off_takes_the_original(math_on):
 
 def test_guards(math_on):
     q, k, v, dout, cu, bounds, n_seq = _batch([200, 190, 180, 170])
-    ok = attn_bwd._fits(dout, q, k, v, cu, bounds, n_seq)
-    assert ok
-    assert not attn_bwd._fits(dout.float(), q.float(), k.float(), v.float(), cu, bounds, n_seq)
-    assert not attn_bwd._fits(dout, q, k, v, cu.long(), bounds, n_seq)
-    assert not attn_bwd._fits(dout, q.transpose(1, 2).contiguous().transpose(1, 2), k, v, cu, bounds,
-                              n_seq)
-    assert not attn_bwd._fits(dout, q, k, v, cu, bounds[:-1], n_seq)
+    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    assert attn_bwd._fits(dout, q, k, v, plan)
+    assert not attn_bwd._fits(dout.float(), q.float(), k.float(), v.float(), plan)
+    assert not attn_bwd._fits(dout, q.transpose(1, 2).contiguous().transpose(1, 2), k, v, plan)
+    assert not attn_bwd._fits(dout[:, :-16], q[:, :-16], k[:, :-16], v[:, :-16], plan)
     assert not attn_bwd._fits(dout, q[..., :96].contiguous(), k[..., :96].contiguous(),
-                              v[..., :96].contiguous(), cu, bounds, n_seq)
+                              v[..., :96].contiguous(), plan)
     attn_bwd._STATE.update(min_tokens=1000)
-    assert not attn_bwd._fits(dout, q, k, v, cu, bounds, n_seq)
+    assert not attn_bwd._fits(dout, q, k, v, plan)
     attn_bwd._STATE.update(min_tokens=0, max_len=199)
-    assert not attn_bwd._fits(dout, q, k, v, cu, bounds, n_seq)
-    assert attn_bwd.backward(dout, q, k, v, cu, (bounds, n_seq), SCALE) is None
+    assert not attn_bwd._fits(dout, q, k, v, plan)
+    assert attn_bwd.backward(dout, q, k, v, cu, plan, SCALE) is None
+    assert attn_bwd.backward(dout, q, k, v, cu, None, SCALE) is None
 
 
 def test_warmup_compiles(math_on):
