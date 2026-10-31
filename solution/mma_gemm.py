@@ -208,6 +208,76 @@ def tc_nf4_matmul_kernel(a_ptr, w_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offs
     tl.store(c_ptrs, acc.to(tl.float16), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
+@triton.jit
+def tc_int8_swiglu_bwd_kernel(w_ptr, g_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, pmax_ptr,
+                              inter, tokens, D,
+                              BLOCK_I: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+                              GROUP_I: tl.constexpr):
+    """int8_bwd.py's steps 3 and 4 in one kernel: the int32 product dL/dhidden^T (I, tokens) =
+    W_down^T_q (I, D) @ g_q^T (g_q (tokens, D) row-major) on the tensor cores, kept in registers,
+    then int8_swiglu_bwd_kernel's epilogue on the tile: the same fp32 operations in the same order
+    (scales, the SwiGLU derivative with the saved (gate|up), half results written over (gate|up)), and
+    the tile's per-token absmax to pmax[feature tile, token]. The int32 product is exact, so every
+    output is bit-for-bit the two-kernel path's; the (I, tokens) int32 buffer is never allocated."""
+    pid = tl.program_id(0)
+    num_i = inter // BLOCK_I
+    num_t = tl.cdiv(tokens, BLOCK_T)
+    group = GROUP_I * num_t
+    first_i = (pid // group) * GROUP_I
+    size_i = min(num_i - first_i, GROUP_I)
+    pid_i = first_i + (pid % group) % size_i
+    pid_t = (pid % group) // size_i
+    ri = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    rt = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    rk = tl.arange(0, BLOCK_K)
+    a_ptrs = w_ptr + ri[:, None] * D + rk[None, :]
+    b_ptrs = g_ptr + (rt % tokens)[None, :] * D + rk[:, None]
+    acc = tl.zeros((BLOCK_I, BLOCK_T), dtype=tl.int32)
+    for _ in range(0, D // BLOCK_K):
+        acc = tl.dot(tl.load(a_ptrs), tl.load(b_ptrs), acc, out_dtype=tl.int32)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K
+    live = rt < tokens
+    s_tok = tl.load(g_scale_ptr + rt, mask=live, other=0.0)
+    dhid = acc.to(tl.float32)
+    dhid = dhid * tl.load(w_scale_ptr + ri)[:, None] * s_tok[None, :]
+    at = ri[:, None].to(tl.int64) * tokens + rt[None, :]
+    up_shift = inter.to(tl.int64) * tokens
+    g = tl.load(gate_up_ptr + at, mask=live[None, :], other=0.0).to(tl.float32)
+    u = tl.load(gate_up_ptr + up_shift + at, mask=live[None, :], other=0.0).to(tl.float32)
+    sig = tl.sigmoid(g)
+    silu = g * sig
+    d_u = (dhid * silu).to(gate_up_ptr.dtype.element_ty)
+    d_g = (dhid * u * (sig + silu * (1.0 - sig))).to(gate_up_ptr.dtype.element_ty)
+    tl.store(gate_up_ptr + at, d_g, mask=live[None, :])
+    tl.store(gate_up_ptr + up_shift + at, d_u, mask=live[None, :])
+    peak = tl.maximum(tl.abs(d_g.to(tl.float32)), tl.abs(d_u.to(tl.float32)))
+    tl.store(pmax_ptr + pid_i * tokens + rt, tl.max(peak, axis=0), mask=live)
+
+
+# (BLOCK_I, BLOCK_T, BLOCK_K, num_warps, GROUP_I) of tc_int8_swiglu_bwd_kernel
+SWIGLU_BWD_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_BWD_CFG", "128x128x64x8x8")))
+
+
+def int8_swiglu_bwd(w_down_t, g_q, w_scale, g_scale, gate_up, cfg=SWIGLU_BWD_CFG):
+    """Steps 3-4 of int8_bwd.mlp_backward: w_down_t (I, D) int8, g_q (tokens, D) int8, w_scale (I,)
+    and g_scale (tokens,) fp32, gate_up (2I, tokens) half (overwritten with its gradient). Returns
+    pmax (I / BLOCK_I, tokens) fp32, the per-tile token maxima."""
+    install()
+    bi, bt, bk, warps, group = cfg
+    inter, d = w_down_t.shape
+    tokens = g_q.shape[0]
+    pmax = torch.empty((inter // bi, tokens), dtype=torch.float32, device=g_q.device)
+    tc_int8_swiglu_bwd_kernel[(inter // bi * triton.cdiv(tokens, bt),)](
+        w_down_t, g_q, w_scale, g_scale, gate_up, pmax, inter, tokens, d,
+        BLOCK_I=bi, BLOCK_T=bt, BLOCK_K=bk, GROUP_I=group, num_warps=warps, num_stages=1)
+    return pmax
+
+
+def int8_swiglu_bwd_usable(inter, d, cfg=SWIGLU_BWD_CFG):
+    return inter % cfg[0] == 0 and d % cfg[2] == 0
+
+
 def _grid(M, N, bm, bn):
     return (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
 

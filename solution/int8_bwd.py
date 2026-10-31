@@ -41,11 +41,15 @@ import torch
 import triton
 import triton.language as tl
 
-from . import nf4
+from . import mma_gemm, nf4
 
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "1").strip().lower()
           not in ("0", "false", "no", ""), "thread": None, "calls": 0}
+# SOUP_SOLUTION_MMA_INT8_BWD=1: steps 3 and 4 below in one tensor-core kernel of mma_gemm.py (B3:
+# Triton's own Turing MMA lowering for our kernels; off until the organizers answer the wave-3
+# question): bit-for-bit the same gradients, without the (I, tokens) int32 product in memory
+_STATE["mma"] = os.environ.get("SOUP_SOLUTION_MMA_INT8_BWD", "0").strip().lower() not in ("0", "false", "no", "")
 # The three kernels are compiled by a thread started at the first MLP backward, not by the warm-up
 # (the first step waits for it: five kernels there put the first step 1.5 s later on the T4). The
 # first START_CALLS MLP backwards of the run (four steps of the 28-layer model) take the fp16 path
@@ -232,6 +236,12 @@ def usable(plan, tokens):
     return _READY.is_set()
 
 
+def _mma_bwd(inter, d):
+    """Whether steps 3-4 take mma_gemm.py's tensor-core kernel (switch, sm_75, its tile sizes)."""
+    return (_STATE["mma"] and torch.cuda.get_device_capability() == (7, 5)
+            and mma_gemm.int8_swiglu_bwd_usable(inter, d))
+
+
 def mlp_backward(plan, gate_up, grad16, buffer):
     """The fused MLP's backward from dL/dout (tokens, D) half and the saved (gate|up) (2I, tokens):
     returns dL/dx (tokens, D) fp32; (gate|up) is overwritten with its gradient. `buffer` is
@@ -246,17 +256,21 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
     _decode_t(plan.down, inv_d, w_down_t, d, 0)
-    acc_h = torch._int_mm(w_down_t, g_q.t())
-    # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group
-    pmax = torch.empty((GROUPS, tokens), dtype=torch.float32, device=device)
-    int8_swiglu_bwd_kernel[(triton.cdiv(tokens, TILE_M), GROUPS)](
-        acc_h, scale_d, s_g, gate_up, pmax, inter, tokens, inter // GROUPS, TI=TILE_I, TM=TILE_M)
-    del acc_h
+    if _mma_bwd(inter, d):
+        # 3-4 in one kernel (mma_gemm.py): the int32 product stays in registers; pmax per feature tile
+        pmax = mma_gemm.int8_swiglu_bwd(w_down_t, g_q, scale_d, s_g, gate_up)
+    else:
+        acc_h = torch._int_mm(w_down_t, g_q.t())
+        # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group
+        pmax = torch.empty((GROUPS, tokens), dtype=torch.float32, device=device)
+        int8_swiglu_bwd_kernel[(triton.cdiv(tokens, TILE_M), GROUPS)](
+            acc_h, scale_d, s_g, gate_up, pmax, inter, tokens, inter // GROUPS, TI=TILE_I, TM=TILE_M)
+        del acc_h
     # 5. dL/d(gate|up) per token, transposed to (tokens, 2I)
     amax = torch.empty(tokens, dtype=torch.float32, device=device)
     dgu_q = torch.empty((tokens, 2 * inter), dtype=torch.int8, device=device)
     quant_t_int8_kernel[(2 * inter // TQ_R, triton.cdiv(tokens, TQ_M))](
-        gate_up, pmax, amax, dgu_q, 2 * inter, tokens, GROUPS=GROUPS, TR=TQ_R, TM=TQ_M)
+        gate_up, pmax, amax, dgu_q, 2 * inter, tokens, GROUPS=pmax.shape[0], TR=TQ_R, TM=TQ_M)
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
     inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
     inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
@@ -287,6 +301,14 @@ def _warm():
                            ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
     compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, f32, INTERMEDIATE, tokens,
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M)
-    compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
+    groups = GROUPS
+    if _mma_bwd(INTERMEDIATE, HIDDEN):
+        mma_gemm.install()
+        bi, bt, bk, warps, group = mma_gemm.SWIGLU_BWD_CFG
+        compile_kernel(mma_gemm.tc_int8_swiglu_bwd_kernel, i8, i8, f32, f32, half, f32, INTERMEDIATE,
+                       tokens, HIDDEN, BLOCK_I=bi, BLOCK_T=bt, BLOCK_K=bk, GROUP_I=group,
+                       num_warps=warps, num_stages=1)
+        groups = INTERMEDIATE // bi
+    compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=groups,
                    TR=TQ_R, TM=TQ_M)
     return None

@@ -167,6 +167,67 @@ def bench_int8(ms, iters, rounds, gen, results):
                 print("    ", entry, flush=True)
 
 
+CFGBWD = [(128, 128, 64, 8, 8), (128, 128, 64, 4, 8), (256, 128, 64, 8, 8), (128, 256, 64, 8, 8),
+          (64, 128, 64, 4, 8), (128, 64, 64, 4, 8)]
+
+
+def bench_swiglu_bwd(ms, iters, rounds, gen, results):
+    """int8_bwd.py steps 3-4: torch._int_mm + int8_swiglu_bwd_kernel against the fused kernel."""
+    import triton
+
+    from . import int8_bwd
+
+    inter, d = 8960, 1536
+    for m in ms:
+        w = torch.randint(-127, 128, (inter, d), device="cuda", dtype=torch.int8, generator=gen)
+        g = torch.randint(-127, 128, (m, d), device="cuda", dtype=torch.int8, generator=gen)
+        w_scale = torch.rand(inter, device="cuda", generator=gen) * 1e-3
+        g_scale = torch.rand(m, device="cuda", generator=gen) * 1e-3
+        gate_up0 = (torch.randn(2 * inter, m, device="cuda", generator=gen) * 2).half()
+        gate_up = gate_up0.clone()
+        groups = int8_bwd.GROUPS
+        pmax = torch.empty((groups, m), dtype=torch.float32, device="cuda")
+
+        def today():
+            acc = torch._int_mm(w, g.t())
+            int8_bwd.int8_swiglu_bwd_kernel[(triton.cdiv(m, int8_bwd.TILE_M), groups)](
+                acc, w_scale, g_scale, gate_up, pmax, inter, m, inter // groups,
+                TI=int8_bwd.TILE_I, TM=int8_bwd.TILE_M)
+
+        ref = gate_up0.clone()
+        gate_up.copy_(gate_up0)
+        today()
+        ref.copy_(gate_up)
+        log, best = [], (float("inf"), None)
+        with _Clock() as clock:
+            us_today = _time(today, iters, rounds)
+            for cfg in CFGBWD:
+                try:
+                    gate_up.copy_(gate_up0)
+                    mma_gemm.int8_swiglu_bwd(w, g, w_scale, g_scale, gate_up, cfg)
+                    torch.cuda.synchronize()
+                    same = bool(torch.equal(gate_up.view(torch.int16), ref.view(torch.int16)))
+                    us = _time(lambda: mma_gemm.int8_swiglu_bwd(w, g, w_scale, g_scale, gate_up, cfg),
+                               iters, rounds)
+                except Exception as exc:  # noqa: BLE001
+                    log.append({"cfg": cfg, "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+                    continue
+                log.append({"cfg": cfg, "us": round(us, 1), "bitwise": same})
+                if us < best[0]:
+                    best = (us, cfg)
+            us_today2 = _time(today, iters, rounds)
+        tod = min(us_today, us_today2)
+        mhz, watts = clock.mean()
+        row = {"kind": "swiglu_bwd", "m": m, "today_us": round(tod, 1), "fused_us": round(best[0], 1),
+               "cfg": best[1], "gain_us": round(tod - best[0], 1), "int32_mib": round(inter * m * 4 / 2**20, 1),
+               "mhz": mhz, "configs": log}
+        results.append(row)
+        print(f"swiglu_bwd M={m:5d}  _int_mm+kernel {tod:8.1f} us | fused {best[0]:8.1f} us cfg {best[1]} | "
+              f"gain {row['gain_us']} us | int32 buffer saved {row['int32_mib']} MiB | {mhz} MHz", flush=True)
+        for entry in log:
+            print("    ", entry, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[512, 832, 1440, 2048])
@@ -188,6 +249,8 @@ def main():
             bench_fp16(args.m, args.iters, args.rounds, gen, results)
         if "nf4" in parts:
             bench_nf4(args.m, args.iters, args.rounds, gen, results)
+        if "bwd" in parts:
+            bench_swiglu_bwd(args.m, args.iters, args.rounds, gen, results)
         if "int8" in parts:
             bench_int8([m for m in args.m if m >= 832] or args.m, args.iters, args.rounds, gen, results)
     finally:
