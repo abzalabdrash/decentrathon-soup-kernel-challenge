@@ -116,6 +116,13 @@ def _gate_up_split():
 # into it); _weights / _attn_weights set it after their launch.
 _HELD = {"key": None, "views": None}
 _VIEWS = {}  # views of the shared buffers by (device, dtype, what), dropped when a buffer is replaced
+_T_OF = {}  # id(view) -> (view, view.t()) for the weight views kept in _VIEWS
+
+
+def _t(w):
+    """w.t(): made once for a weight view the shared buffer keeps (_VIEWS), else now."""
+    found = _T_OF.get(id(w))
+    return found[1] if found is not None and found[0] is w else w.t()
 
 
 def _buffer(device, dtype, numel):
@@ -126,6 +133,7 @@ def _buffer(device, dtype, numel):
         buf = torch.empty(numel, dtype=dtype, device=device)
         _BUFFERS[key] = buf
         _VIEWS.clear()
+        _T_OF.clear()
     return buf
 
 
@@ -180,6 +188,7 @@ def _weights(bases, dtype, device, offset=0):
                     parts.append(w[row:row + n])
                     row += n
                 views = _VIEWS[vkey] = (w, parts)
+                _T_OF[id(w)] = (w, w.t())
             if len(found) == 3:
                 _launch_many([f[1] for f in found], views[0])
             else:
@@ -210,10 +219,21 @@ def _attn_weights(plan, device):
         return None
     half = plan.half
     bases = plan.bases + (plan.o_base,)
-    found = [_nf4_args(base, half) for base in bases]
-    if None in found:
-        return None
-    key = (device, half, "attn", tuple(f[0] for f in found))
+    # the operands and key, kept on the plan (one layer's forward and backward of a step) while the
+    # four Params4bit and their quant states are the same objects: _nf4_args' checks once per plan
+    weights = tuple(base.weight for base in bases)
+    memo = getattr(plan, "weights", None)
+    if (memo is not None and memo[0] == device
+            and all(a is b for a, b in zip(memo[1], weights))
+            and all(w.quant_state is state for w, state in zip(weights, memo[2]))):
+        key, operands = memo[3], memo[4]
+    else:
+        found = [_nf4_args(base, half) for base in bases]
+        if None in found:
+            return None
+        key = (device, half, "attn", tuple(f[0] for f in found))
+        operands = [f[1] for f in found]
+        plan.weights = (device, weights, tuple(w.quant_state for w in weights), key, operands)
     views = _held(key)
     if views is not None:
         return views
@@ -226,7 +246,9 @@ def _attn_weights(plan, device):
     if views is None:
         views = _VIEWS[vkey] = (flat[:qkv].view(rows, q.in_features),
                                 flat[qkv:qkv + out].view(o.out_features, o.in_features))
-    _launch_many([f[1] for f in found], views[0])
+        for w in views:
+            _T_OF[id(w)] = (w, w.t())
+    _launch_many(operands, views[0])
     _HELD["key"], _HELD["views"] = key, views
     return views
 
@@ -593,7 +615,7 @@ def _half_for(x, half):
 
 class _AttnPlan:
     __slots__ = ("bases", "o_base", "lora_q", "lora_v", "p", "scaling", "half", "heads", "kv_heads",
-                 "head_dim", "bias", "spans", "bounds", "n_tokens")
+                 "head_dim", "bias", "spans", "bounds", "n_tokens", "weights")
 
 
 def _attention_plan(attn, x, position_embeddings, attention_mask, past_key_values):
@@ -752,7 +774,8 @@ class _AdapterHalves:
         return tuple((p.data_ptr(), p._version) for p in params)
 
     def halves(self, owner, params, half):
-        """(a16, b16) for the layer `owner` with params (A_q, A_v, B_q, B_v)."""
+        """(a16, b16, their views: _adapter_views) for the layer `owner` with params (A_q, A_v,
+        B_q, B_v)."""
         entry = self._layers.get(owner)
         shapes = tuple(tuple(p.shape) for p in params)
         if (entry is None or entry["shapes"] != shapes or entry["dtype"] != half
@@ -763,11 +786,11 @@ class _AdapterHalves:
             b16 = torch.empty((nq + nv, r), dtype=half, device=params[0].device)
             entry = {"params": params, "shapes": shapes, "dtype": half, "device": params[0].device,
                      "a16": a16, "b16": b16, "views": [a16[:r], a16[r:], b16[:nq], b16[nq:]],
-                     "stamp": None}
+                     "derived": _adapter_views(a16, b16, r, nq), "stamp": None}
             self._layers[owner] = entry
         if entry["stamp"] != self._stamp(params):
             self._refresh(entry)
-        return entry["a16"], entry["b16"]
+        return entry["a16"], entry["b16"], entry["derived"]
 
     def _refresh(self, first):
         dst, src, done = [], [], []
@@ -785,6 +808,14 @@ class _AdapterHalves:
 
 
 _ADAPTERS = _AdapterHalves()
+
+
+def _adapter_views(a16, b16, r, nq):
+    """The views the LoRA products read of the half adapters: A as (2, r, D) and its transpose, A^T,
+    B_q, B_v and their transposes (kept with the buffers of _AdapterHalves: made once per layer)."""
+    a3 = a16.view(2, r, a16.shape[1])
+    bq, bv = b16[:nq], b16[nq:]
+    return a3, a3.transpose(1, 2), a16.t(), bq, bv, bq.t(), bv.t()
 
 
 def _generator(device):
@@ -824,9 +855,28 @@ class _QKVRope(torch.autograd.Function):
         return (*_qkv_backward(ctx, ctx.saved_tensors, grad_q, grad_k, grad_v), None, None, None, None)
 
 
-def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute):
+def _rope_token_major(qkv, n, plan, cos, sin):
+    """q and k of a q|k|v product (N, nq + nk + nv) rotated into buffers of their own, and the
+    attention kernel's token-major (1, N, H, D) q, k, v (v a view of qkv): the same rope launch and
+    the same three tensors (pointers, sizes, strides) as _heads + rope._launch +
+    unpad.kernel_operands, without the head-major views in between."""
+    half, dim = plan.half, plan.head_dim
+    nq, nk = plan.bases[0].out_features, plan.bases[1].out_features
+    row = qkv.stride(0)
+    q_buf = torch.empty((n, nq), dtype=half, device=qkv.device)
+    k_buf = torch.empty((n, nk), dtype=half, device=qkv.device)
+    rope._launch_strided(qkv, (n * row, dim, row), qkv[:, nq:], (n * row, dim, row),
+                         q_buf, (n * nq, dim, nq), k_buf, (n * nk, dim, nk), cos, sin, n,
+                         plan.heads, plan.kv_heads, dim, backward=False)
+    v = qkv.as_strided((1, n, plan.kv_heads, dim), (n * row, row, dim, 1),
+                       qkv.storage_offset() + nq + nk)
+    return q_buf.view(1, n, plan.heads, dim), k_buf.view(1, n, plan.kv_heads, dim), v
+
+
+def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, token_major=False):
     """_QKVRope's forward (also the first part of _AttnBlock's): (q4, k4, v4, the tensors to save);
-    the rest of what the backward reads goes on `ctx`."""
+    the rest of what the backward reads goes on `ctx`. `token_major` (_AttnBlock): q, k, v as the
+    attention kernel takes them, (1, N, H, D) (_rope_token_major), instead of (1, H, N, D) views."""
     half, n, d = plan.half, plan.n_tokens, x.shape[-1]
     q_base, k_base, v_base = plan.bases
     nq, nk, nv = q_base.out_features, k_base.out_features, v_base.out_features
@@ -836,40 +886,46 @@ def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute):
 
     pair = _attn_weights(plan, x.device)  # q|k|v and o in one launch (o_proj reads it later)
     w = pair[0] if pair is not None else _weights(plan.bases, half, x.device)
-    qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
+    w_t = _t(w)
+    qkv = torch.addmm(plan.bias, x16, w_t) if plan.bias is not None else torch.mm(x16, w_t)
 
     # the four adapter matrices in half: kept per layer and refreshed for every layer in one
     # multi-tensor launch after the optimizer step (else one launch per layer, as before)
     if _CPU["diet"]:
-        a16, b16 = _ADAPTERS.halves(plan.lora_q[0], (a_q, a_v, b_q, b_v), half)
+        a16, b16, derived = _ADAPTERS.halves(plan.lora_q[0], (a_q, a_v, b_q, b_v), half)
     else:
         a16 = torch.empty((2 * r, d), dtype=half, device=x.device)
         b16 = torch.empty((nq + nv, r), dtype=half, device=x.device)
         torch._foreach_copy_([a16[:r], a16[r:], b16[:nq], b16[nq:]], [a_q, a_v, b_q, b_v])
+        derived = _adapter_views(a16, b16, r, nq)
+    a3, a3_t, a_t, _, _, bq_t, bv_t = derived
     rng = None
     if plan.p > 0.0:
         rng = _get_rng_state(x.device)
         dropped, _ = torch.native_dropout(x16.expand(2, n, d), plan.p, True)
-        h = torch.bmm(dropped, a16.view(2, r, d).transpose(1, 2))  # (2, N, r)
+        h = torch.bmm(dropped, a3_t)  # (2, N, r)
         h_q, h_v = h[0], h[1]
         del dropped
     else:
-        h = torch.mm(x16, a16.t())  # (N, 2r)
+        h = torch.mm(x16, a_t)  # (N, 2r)
         h_q, h_v = h[:, :r], h[:, r:]
-    qkv[:, :nq].addmm_(h_q, b16[:nq].t(), alpha=plan.scaling)
-    qkv[:, nq + nk:].addmm_(h_v, b16[nq:].t(), alpha=plan.scaling)
+    qkv[:, :nq].addmm_(h_q, bq_t, alpha=plan.scaling)
+    qkv[:, nq + nk:].addmm_(h_v, bv_t, alpha=plan.scaling)
 
     # rotated q and k in their own token-major buffers: attention keeps q and k for the backward,
     # and a view of qkv would keep all of qkv alive with them; v leaves as a view of qkv and
     # attention saves a compact copy of it, so qkv dies after the attention forward
     cos, sin = _tables(cos, sin)
-    q4 = _heads(torch.empty((n, nq), dtype=half, device=x.device), n, plan.heads, plan.head_dim)
-    k4 = _heads(torch.empty((n, nk), dtype=half, device=x.device), n, plan.kv_heads,
-                plan.head_dim)
-    rope._launch(_heads(qkv[:, :nq], n, plan.heads, plan.head_dim),
-                 _heads(qkv[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim), q4, k4, cos, sin,
-                 backward=False)
-    v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
+    if token_major:
+        q4, k4, v4 = _rope_token_major(qkv, n, plan, cos, sin)
+    else:
+        q4 = _heads(torch.empty((n, nq), dtype=half, device=x.device), n, plan.heads, plan.head_dim)
+        k4 = _heads(torch.empty((n, nk), dtype=half, device=x.device), n, plan.kv_heads,
+                    plan.head_dim)
+        rope._launch(_heads(qkv[:, :nq], n, plan.heads, plan.head_dim),
+                     _heads(qkv[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim), q4, k4, cos, sin,
+                     backward=False)
+        v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
 
     # x16 is x rounded to half, and x is the output of the input norm (rmsnorm.py), which keeps
     # its own input and rstd for its backward anyway: the backward rebuilds x16 from those, bit
@@ -878,16 +934,17 @@ def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute):
     keep = (h, a16, b16, cos, sin) if source is not None else (h, a16, b16, cos, sin, x16)
     ctx.source = source
     if recompute is not None:  # what the attention recompute starts from (kept here anyway)
-        recompute.qkv_taken(source, x16, h, b16, cos, sin)
-    ctx.recompute = recompute
+        recompute.qkv_taken(source, x16, h, b16, cos, sin, derived)
+    ctx.recompute, ctx.derived = recompute, derived
     ctx.plan, ctx.rng, ctx.x_shape, ctx.x_dtype = plan, rng, x.shape, x.dtype
     ctx.dims = (n, d, nq, nk, nv, r)
     return q4, k4, v4, keep
 
 
-def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
+def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False):
     """_QKVRope's backward (also the last part of _AttnBlock's) from the tensors _qkv_forward saved:
-    the gradients of x, A_q, B_q, A_v, B_v."""
+    the gradients of x, A_q, B_q, A_v, B_v. `token_major` (_AttnBlock): the gradients of q, k, v as
+    the attention backward gives them, (1, N, H, D), instead of (1, H, N, D) views of those."""
     h, a16, b16, cos, sin, *kept = saved
     plan = ctx.plan
     n, d, nq, nk, nv, r = ctx.dims
@@ -903,11 +960,20 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
     device = x16.device
 
     g = torch.empty((n, nq + nk + nv), dtype=half, device=device)
-    gq4 = _heads(g[:, :nq], n, plan.heads, plan.head_dim)
-    gk4 = _heads(g[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim)
-    rope._launch(_last_dim_contiguous(grad_q), _last_dim_contiguous(grad_k), gq4, gk4, cos, sin,
-                 backward=True)
-    _heads(g[:, nq + nk:], n, plan.kv_heads, plan.head_dim).copy_(grad_v)
+    if token_major:  # rope._launch's arguments on the views below, without making them
+        grad_q, grad_k = _last_dim_contiguous(grad_q), _last_dim_contiguous(grad_k)
+        sq, sk, row, dim = grad_q.stride(), grad_k.stride(), g.stride(0), plan.head_dim
+        rope._launch_strided(grad_q, (sq[0], sq[2], sq[1]), grad_k, (sk[0], sk[2], sk[1]),
+                             g, (n * row, dim, row), g[:, nq:], (n * row, dim, row), cos, sin, n,
+                             plan.heads, plan.kv_heads, dim, backward=True)
+        g.as_strided((1, n, plan.kv_heads, dim), (n * row, row, dim, 1),
+                     g.storage_offset() + nq + nk).copy_(grad_v)
+    else:
+        gq4 = _heads(g[:, :nq], n, plan.heads, plan.head_dim)
+        gk4 = _heads(g[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim)
+        rope._launch(_last_dim_contiguous(grad_q), _last_dim_contiguous(grad_k), gq4, gk4, cos,
+                     sin, backward=True)
+        _heads(g[:, nq + nk:], n, plan.kv_heads, plan.head_dim).copy_(grad_v)
     g_q, g_v = g[:, :nq], g[:, nq + nk:]
 
     need_x, need_a = ctx.needs_input_grad[0], ctx.needs_input_grad[1] or ctx.needs_input_grad[3]
@@ -915,10 +981,11 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
     # dL/dh = scaling * g @ B for both adapters; its dropout part keeps the masks' scale for the
     # addmm's beta at the end
     beta = 1.0
+    a3, _, _, bq, bv, _, _ = ctx.derived  # views of a16 and b16 (saved: their versions checked)
     if p > 0.0:
         gh = torch.empty((2, n, r), dtype=half, device=device)
-        _scaled_mm(g_q, b16[:nq], s, gh[0])
-        _scaled_mm(g_v, b16[nq:], s, gh[1])
+        _scaled_mm(g_q, bq, s, gh[0])
+        _scaled_mm(g_v, bv, s, gh[1])
         current = _get_rng_state(device)
         _set_rng_state(ctx.rng, device)
         try:
@@ -928,7 +995,7 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
         grad_a = torch.bmm(gh.transpose(1, 2), dropped, out_dtype=torch.float32) if need_a else None
         del dropped
         if need_x:
-            g_drop = torch.bmm(gh, a16.view(2, r, d))  # (2, N, D), half like the base's
+            g_drop = torch.bmm(gh, a3)  # (2, N, D), half like the base's
             lora_x = _masked_pair_sum(g_drop, mask)
             beta = 1.0 / (1.0 - p)
             del g_drop
@@ -936,8 +1003,8 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
         h_q, h_v = h[0], h[1]
     else:
         gh = torch.empty((n, 2 * r), dtype=half, device=device)
-        _scaled_mm(g_q, b16[:nq], s, gh[:, :r])
-        _scaled_mm(g_v, b16[nq:], s, gh[:, r:])
+        _scaled_mm(g_q, bq, s, gh[:, :r])
+        _scaled_mm(g_v, bv, s, gh[:, r:])
         grad_a = torch.mm(gh.t(), x16, out_dtype=torch.float32) if need_a else None
         if need_x:
             lora_x = torch.mm(gh, a16, out_dtype=torch.float32)
@@ -1001,10 +1068,9 @@ class _AttnBlock(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, scale, o_bias):
-        q4, k4, v4, keep = _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute)
-        # unpad.attention and _VarlenAttention.forward
-        q, k, v = kernel_operands(q4, k4, v4, plan.half)
-        del q4, k4, v4
+        q, k, v, keep = _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute,
+                                     token_major=True)
+        # unpad.attention and _VarlenAttention.forward (q, k, v as unpad.kernel_operands makes them)
         bounds = plan.bounds
         max_len = max(end - start for start, end in zip(bounds[:-1], bounds[1:]))
         cu = _cu_seqlens(bounds, q.device)
@@ -1020,7 +1086,8 @@ class _AttnBlock(torch.autograd.Function):
         del out
         pair = _attn_weights(plan, o.device) if o.dtype == plan.half else None
         w = pair[1] if pair is not None else _weights((plan.o_base,), o.dtype, o.device)
-        return torch.addmm(o_bias, o, w.t()) if o_bias is not None else torch.mm(o, w.t())
+        w_t = _t(w)
+        return torch.addmm(o_bias, o, w_t) if o_bias is not None else torch.mm(o, w_t)
 
     @staticmethod
     @torch.autograd.function.once_differentiable
@@ -1046,9 +1113,8 @@ class _AttnBlock(torch.autograd.Function):
             grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
             grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
         del grad_out, q, k, v, out, lse
-        # _QKVRope.backward: the kernel's operands were token-major transposes of q4, k4, v4
-        grads = _qkv_backward(ctx, saved[:ctx.qkv_count], grad_q.transpose(1, 2),
-                              grad_k.transpose(1, 2), grad_v.transpose(1, 2))
+        # _QKVRope.backward (it took the transposes of these: the gradients of its q4, k4, v4)
+        grads = _qkv_backward(ctx, saved[:ctx.qkv_count], grad_q, grad_k, grad_v, token_major=True)
         return (*grads, None, None, None, None, None, None)
 
 
@@ -1119,7 +1185,7 @@ class _AttnRecompute:
 
     def __init__(self, plan):
         self.plan = plan
-        self.source = self.x16 = self.h = self.b16 = self.cos = self.sin = None
+        self.source = self.x16 = self.h = self.b16 = self.cos = self.sin = self.derived = None
         self.cu = self.max_len = self.scale = None
         self.armed = False  # the variable-length attention took it: it keeps nothing of its own
         self.out_key = None
@@ -1127,8 +1193,9 @@ class _AttnRecompute:
         self.check = {} if _RECOMPUTE["check"] else None
 
     # forward
-    def qkv_taken(self, source, x16, h, b16, cos, sin):
+    def qkv_taken(self, source, x16, h, b16, cos, sin, derived=None):
         self.source, self.h, self.b16, self.cos, self.sin = source, h, b16, cos, sin
+        self.derived = derived
         self.x16 = x16 if source is None else None  # without a source, _QKVRope keeps x16 itself
         if self.check is not None:
             self.check["x16"] = x16.clone()
@@ -1157,19 +1224,26 @@ class _AttnRecompute:
         x16 = x16.view(n, -1)
         pair = _attn_weights(plan, x16.device)  # read again by the o_proj and q/k/v backward
         w = pair[0] if pair is not None else _weights(plan.bases, half, x16.device)
-        qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
+        w_t = _t(w)
+        qkv = torch.addmm(plan.bias, x16, w_t) if plan.bias is not None else torch.mm(x16, w_t)
         h, b16, r = self.h, self.b16, plan.lora_q[0].weight.shape[0]
         h_q, h_v = (h[0], h[1]) if h.dim() == 3 else (h[:, :r], h[:, r:])
-        qkv[:, :nq].addmm_(h_q, b16[:nq].t(), alpha=plan.scaling)
-        qkv[:, nq + nk:].addmm_(h_v, b16[nq:].t(), alpha=plan.scaling)
-        q4 = _heads(torch.empty((n, nq), dtype=half, device=x16.device), n, plan.heads, plan.head_dim)
-        k4 = _heads(torch.empty((n, nk), dtype=half, device=x16.device), n, plan.kv_heads,
-                    plan.head_dim)
-        rope._launch(_heads(qkv[:, :nq], n, plan.heads, plan.head_dim),
-                     _heads(qkv[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim), q4, k4,
-                     self.cos, self.sin, backward=False)
-        v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
-        q, k, v = kernel_operands(q4, k4, v4, half)
+        bq_t, bv_t = (self.derived[5], self.derived[6]) if self.derived is not None else (
+            b16[:nq].t(), b16[nq:].t())
+        qkv[:, :nq].addmm_(h_q, bq_t, alpha=plan.scaling)
+        qkv[:, nq + nk:].addmm_(h_v, bv_t, alpha=plan.scaling)
+        if _ATTN["one_function"]:  # the same rope launch and kernel operands, fewer views
+            q, k, v = _rope_token_major(qkv, n, plan, self.cos, self.sin)
+        else:
+            q4 = _heads(torch.empty((n, nq), dtype=half, device=x16.device), n, plan.heads,
+                        plan.head_dim)
+            k4 = _heads(torch.empty((n, nk), dtype=half, device=x16.device), n, plan.kv_heads,
+                        plan.head_dim)
+            rope._launch(_heads(qkv[:, :nq], n, plan.heads, plan.head_dim),
+                         _heads(qkv[:, nq:nq + nk], n, plan.kv_heads, plan.head_dim), q4, k4,
+                         self.cos, self.sin, backward=False)
+            v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
+            q, k, v = kernel_operands(q4, k4, v4, half)
         out, lse, seed, offset = varlen_forward(q, k, v, self.cu, self.max_len, self.scale)
         self.tensors = (_compact(q), _compact(k), _compact(v), out, lse, seed, offset)
         self.x16 = x16
@@ -1177,7 +1251,8 @@ class _AttnRecompute:
             o = out.reshape(n, plan.heads * plan.head_dim)
             w = pair[1] if pair is not None else _weights((plan.o_base,), half, x16.device)
             bias = _cached_bias(plan.o_base, (plan.o_base,), half)
-            self.branch_out = torch.addmm(bias, o, w.t()) if bias is not None else torch.mm(o, w.t())
+            w_t = _t(w)
+            self.branch_out = torch.addmm(bias, o, w_t) if bias is not None else torch.mm(o, w_t)
         if self.check is not None:
             got = dict(zip(("q", "k", "v", "out", "lse"), self.tensors[:5]), x16=x16,
                        branch=self.branch_out)
@@ -1216,6 +1291,7 @@ class _AttnRecompute:
 
     def release(self):
         self.source = self.x16 = self.h = self.b16 = self.cos = self.sin = self.cu = None
+        self.derived = None
         self.tensors = self.branch_out = self.check = None
 
 
@@ -1228,7 +1304,8 @@ class _Linear4bitHalf(torch.autograd.Function):
     def forward(ctx, x16, base, bias, plan=None):
         pair = _attn_weights(plan, x16.device) if plan is not None and x16.dtype == plan.half else None
         w = pair[1] if pair is not None else _weights((base,), x16.dtype, x16.device)
-        out = torch.addmm(bias, x16, w.t()) if bias is not None else torch.mm(x16, w.t())
+        w_t = _t(w)
+        out = torch.addmm(bias, x16, w_t) if bias is not None else torch.mm(x16, w_t)
         ctx.base, ctx.plan = base, plan
         return out
 
@@ -1449,7 +1526,7 @@ class _MLP(torch.autograd.Function):
         example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
             gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
         w = _ring_weights(plan, (plan.down,), x.device, 1)
-        out = torch.mm(hidden.t(), w.t())  # (padded, D)
+        out = torch.mm(hidden.t(), _t(w))  # (padded, D)
         # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
         # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
         ctx.source = (norm_source(x) if plan.recompute and n == padded and _ATTN["rebuild_x16"]
@@ -1480,7 +1557,7 @@ class _MLP(torch.autograd.Function):
                 grad_x = grad_x.to(ctx.x_dtype)
             return grad_x.view(ctx.x_shape), None
         w = _ring_weights(plan, (plan.down,), grad.device, -1)
-        grad_hidden = torch.mm(w.t(), grad16.t())  # (I, padded)
+        grad_hidden = torch.mm(_t(w), grad16.t())  # (I, padded)
         if plan.recompute:
             grad_x = _recompute_backward(plan, saved, grad_hidden, padded)
         else:

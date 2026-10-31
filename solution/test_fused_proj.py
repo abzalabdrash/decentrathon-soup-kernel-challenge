@@ -847,7 +847,7 @@ def test_adapter_halves_refresh_every_layer_in_one_copy(monkeypatch):
                                                                    foreach(dst, src)))
 
     def check(owner, ps):
-        a16, b16 = cache.halves(owner, ps, torch.float16)
+        a16, b16, _ = cache.halves(owner, ps, torch.float16)
         assert torch.equal(a16, torch.cat([ps[0], ps[1]]).half())
         assert torch.equal(b16, torch.cat([ps[2], ps[3]]).half())
 

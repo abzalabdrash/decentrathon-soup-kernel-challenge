@@ -45,7 +45,11 @@ there: the forward runs ahead of the GPU), 25 ms `_QKVRope.forward`, 22 ms `nf4.
   Dropout RNG state through the generator itself.
 - `SOUP_SOLUTION_ATTN_ONE_FUNCTION=1` (fused_proj.py): a recomputing layer's `_QKVRope`, varlen
   attention and o_proj as one autograd node (`_AttnBlock`), the same ops in the same order; two
-  Python round trips into autograd and five view nodes less per layer and direction.
+  Python round trips into autograd and five view nodes less per layer and direction. In that path
+  and in the recompute, q, k, v are built in the kernel's token-major layout directly and rope is
+  launched from strides (`rope._launch_strided`: the same kernel arguments), ~30 view ops less per
+  layer and step; the transposes of the shared buffer's weight views and the adapter halves' views
+  are made once (kept with the buffers); the q/k/v/o operands of a layer are checked once per plan.
 - `SOUP_SOLUTION_MLP_ADDMM_INPLACE=1` (fused_proj.py): the MLP input gradient's second GEMM adds into
   the first's fp32 result in place (torch's out-of-place addmm copied it first): 28 D2D copies and
   one N x 1536 fp32 buffer per layer less.
@@ -67,4 +71,26 @@ Soup's 79 with apply().
 
 ## Step 3: T4
 
-(pending)
+**Where the GPU waits** (timeline, soup-c1-prof2, 9e72037 = the first half of the cuts; mean per step
+size, outside the profiled steps): steps under 600 tokens are CPU-bound in both passes (the GPU's
+lag stays at 0-3 ms: 4.0 ms of CPU per layer forward, 4.2 ms backward); 600-900 and longer steps are
+GPU-bound in both passes (lag grows to 20 / 44 ms). The head is PCIe-bound (lag 30 ms at its end),
+drained by the metrics sync before the backward (B1). Main's path in the same session, short steps:
+forward 4.2 ms/layer, backward 5.1 ms/layer, step 332 ms; with the cuts 296 ms.
+
+**ABBA 1** (peagverr, soup-c1-abba1, 9e72037: DEQUANT_REUSE + FAST_STREAMS + STREAM_TIMING=0 against
+the same commit with them off = main's path; 2 rounds + warm run):
+
+| variant | wall s | steps 3+ s | median | <600 tok ms | 600-900 ms | >=900 ms | nvidia-smi | reserved | eval |
+|---|---|---|---|---|---|---|---|---|---|
+| main path | 45.69 / 45.59 | 27.93 / 27.60 | 0.432 | 331.8 | 398.3 | 600.0 | 401 | 272 | 2.04937 / 2.04938 |
+| C1 (9e72037) | 45.04 / 45.14 | 27.19 / 27.12 | 0.426 | 304.6 | 392.3 | 594.6 | **381** | 252 | 2.04935 / 2.04940 |
+
+Per step C1 - main: -9.8 ms mean (faster in 58 of 62 steps): -28 ms on steps under 600 tokens,
+-6 ms on 600-900, -5 ms on longer ones. Wall -0.55 s, steps 3+ -0.61 s. Allocated peak the same
+(234.6 MiB); reserved one 20 MiB segment less (29 segment allocations instead of 30: the shared
+dequantization buffer now first grows to the q|k|v|o size), so nvidia-smi 401 -> 381 MiB; seen in
+both sessions (prof2 too). Checks 3, 4, 9 pass in every run (own kernels 12.9 %). T4 pytest of
+9e72037: 342 passed, 1 failed (the new reuse test assumed an empty buffer; fixed in b951367).
+
+**ABBA 2** (b951367 = + one-node attention, in-place accumulate, hook marker): (pending)
