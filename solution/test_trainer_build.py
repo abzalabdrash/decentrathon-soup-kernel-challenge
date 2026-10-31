@@ -285,7 +285,11 @@ def test_early_probes_serve_same_answers(monkeypatch):
     import importlib.metadata as metadata
 
     accelerate_state = pytest.importorskip("accelerate.state")
-    saved_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    current_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    # startup.py's SOUP_SOLUTION_ENTRY_POINTS (on by default) wraps entry_points in any process that
+    # ran apply() before this test; the probes are tested on the original, as they would be installed
+    saved_ep = getattr(current_ep, "_soup_original", current_ep)
+    metadata.entry_points = saved_ep
     saved_flag = trainer_build._PROBES["patched"]
     trainer_build._PROBES["patched"] = False
     try:
@@ -306,7 +310,7 @@ def test_early_probes_serve_same_answers(monkeypatch):
         assert metadata.entry_points(group="console_scripts") == expected_group  # the original again
     finally:
         trainer_build._PROBES["current"] = None
-        metadata.entry_points = saved_ep
+        metadata.entry_points = current_ep
         accelerate_state.check_cuda_p2p_ib_support = saved_p2p
         trainer_build._PROBES["patched"] = saved_flag
 
@@ -477,7 +481,9 @@ def test_early_probes_p2p_only(monkeypatch):
 
     accelerate_state = pytest.importorskip("accelerate.state")
     torch = pytest.importorskip("torch")
-    saved_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    current_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    saved_ep = getattr(current_ep, "_soup_original", current_ep)  # as above: without ENTRY_POINTS' wrapper
+    metadata.entry_points = saved_ep
     saved_flag = trainer_build._PROBES["patched"]
     trainer_build._PROBES["patched"] = False
     monkeypatch.setenv("SOUP_SOLUTION_EARLY_PROBES", "p2p")
@@ -497,6 +503,6 @@ def test_early_probes_p2p_only(monkeypatch):
         assert sorted(metadata.entry_points(group="console_scripts")) == sorted(saved_ep(group="console_scripts"))
     finally:
         trainer_build._PROBES["current"] = None
-        metadata.entry_points = saved_ep
+        metadata.entry_points = current_ep
         accelerate_state.check_cuda_p2p_ib_support = saved_p2p
         trainer_build._PROBES["patched"] = saved_flag
