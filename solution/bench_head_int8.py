@@ -75,10 +75,18 @@ def bench_gemms(n, n_lab, rows=4096, d=1536, chunks=37, reps=5):
     return res
 
 
+def _hidden(streamer, n, gen):
+    """Hidden rows shaped like the final RMSNorm's output, gamma * x / rms(x) (the smoothing assumes it)."""
+    dev, d = streamer.device, streamer.hidden
+    gamma = getattr(getattr(streamer, "norm", None), "weight", None)
+    x = torch.randn(n, d, device=dev, generator=gen)
+    return (x * gamma.to(dev) if gamma is not None else x * 2.0).half()
+
+
 def time_heads(streamer, n, frac, reps, resident):
     dev, d = streamer.device, streamer.hidden
     gen = torch.Generator(device=dev).manual_seed(n)
-    hidden = (torch.randn(n, d, device=dev, generator=gen) * 2.0).half()
+    hidden = _hidden(streamer, n, gen)
     targets = torch.randint(0, streamer.vocab, (n,), device=dev, generator=gen)
     targets[torch.rand(n, device=dev, generator=gen) >= frac] = -100
     order = torch.argsort((targets != -100).to(torch.int8), descending=True, stable=True)
@@ -129,7 +137,7 @@ def profile_heads(streamer, n, frac, resident, label):
 
     dev, d = streamer.device, streamer.hidden
     gen = torch.Generator(device=dev).manual_seed(n)
-    hidden = (torch.randn(n, d, device=dev, generator=gen) * 2.0).half()
+    hidden = _hidden(streamer, n, gen)
     targets = torch.randint(0, streamer.vocab, (n,), device=dev, generator=gen)
     targets[torch.rand(n, device=dev, generator=gen) >= frac] = -100
     order = torch.argsort((targets != -100).to(torch.int8), descending=True, stable=True)
@@ -163,11 +171,11 @@ def profile_heads(streamer, n, frac, resident, label):
 
 
 def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
-    """One head's worth of each chunk kernel variant on synthetic chunks, ms (FIRST=False launches)."""
+    """One head's worth of each chunk kernel variant on synthetic chunks, ms (not the first chunk)."""
     import triton
 
     from .fused_ce import IGNORE_INDEX
-    from .head_int8 import head_i8_chunk_kernel, head_i8_rows_kernel, int8_transpose_kernel
+    from .head_int8 import head_i8_chunk_kernel, int8_transpose_kernel
     from .head_stream import BLOCK_D, head_chunk_kernel
 
     dev = "cuda"
@@ -189,7 +197,6 @@ def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
     w16 = torch.randn(rows, d, device=dev, generator=gen).half()
     wt = torch.empty(n_lab, d, dtype=torch.float16, device=dev)
     acc = torch.zeros(n_lab, d, device=dev)
-    svm = sv.max().reshape(1).repeat(4)
     qt = torch.empty(d, rows, dtype=torch.int8, device=dev)
     block = triton.next_power_of_2(rows)
     m, s_, e, best, xt = state
@@ -201,29 +208,17 @@ def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
                                     0, rows, n_lab, d, FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block,
                                     BLOCK_D=BLOCK_D, num_warps=w)
 
-    def one(w, pb):
+    def one(w):
         for _ in range(chunks):
             head_i8_chunk_kernel[(n,)](l32, rows, 0, pq, rows, sh, sv, targets, m, s_, e, best, xt, idx,
-                                       asp[0], asp[1], q, d, wt, d, svm, 1, 0, rows, n_lab, d,
-                                       FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D,
-                                       PBOUND=pb, num_warps=w)
-
-    def multi(r, w, pb):
-        for _ in range(chunks):
-            head_i8_rows_kernel[(triton.cdiv(n, r),)](
-                l32, rows, 0, n, pq, rows, sh, sv, targets, m, s_, e, best, xt, idx, asp[0], asp[1],
-                q, d, wt, d, svm, 1, 0, rows, n_lab, d, FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block,
-                BLOCK_D=BLOCK_D, PBOUND=pb, R=r, num_warps=w)
+                                       asp[0], asp[1], q, d, wt, d, 0, 0, rows, n_lab, d,
+                                       IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, num_warps=w)
 
     for w in (8, 16):
         res[f"fp16 kernel w{w}"] = _timed(lambda: fp16(w), reps)
-    for w in (4, 8, 16):
-        for pb in (False, True):
-            res[f"int8 1 row w{w}{' pbound' if pb else ''}"] = _timed(lambda: one(w, pb), reps)
-    for r, w in ((2, 8), (2, 16), (4, 16), (4, 32), (8, 32)):
-        for pb in (False, True):
-            res[f"int8 {r} rows w{w}{' pbound' if pb else ''}"] = _timed(lambda: multi(r, w, pb), reps)
-    for t, w in ((32, 4), (64, 4), (64, 8), (128, 8), (128, 16)):
+    for w in (8, 16, 32):
+        res[f"int8 kernel w{w}"] = _timed(lambda: one(w), reps)
+    for t, w in ((64, 4), (128, 8), (128, 16)):
         res[f"transpose T{t} w{w}"] = _timed(lambda: [int8_transpose_kernel[(triton.cdiv(rows, t), triton.cdiv(d, t))](
             q, qt, rows, d, T=t, num_warps=w) for _ in range(chunks)], reps)
     return res
@@ -275,13 +270,10 @@ def main():
     print(f"int8 copy ready {int8.ready} ({int8.error}) in {time.perf_counter() - started:.2f} s "
           f"(build + compile in the thread {int8.seconds:.2f} s), smoothing {int8.col is not None}", flush=True)
     fwd_rows = [int(x) for x in re.split(r"[,/]", args.fwd_rows)]
-    configs = [(f"ring of 2, forward in {r}-row blocks", 2, False, r, False) for r in fwd_rows]
-    configs.append((f"ring of 2, forward in {fwd_rows[0]}-row blocks, transpose on a side stream", 2, False,
-                    fwd_rows[0], True))
-    configs.append(("resident", streamer.n_chunks, False, fwd_rows[0], False))
-    configs.append(("resident, transpose on a side stream", streamer.n_chunks, False, fwd_rows[0], True))
-    for label, slots, nn, rows, tstream in configs:
-        head_int8.NN, head_int8.FWD_ROWS, head_int8.TSTREAM = nn, rows, tstream
+    configs = [(f"ring of 2, forward in {r}-row blocks", 2, r) for r in fwd_rows]
+    configs.append(("resident", streamer.n_chunks, fwd_rows[0]))
+    for label, slots, rows in configs:
+        head_int8.FWD_ROWS = rows
         streamer.configure(rows=args.rows, slots=slots)
         for n in tokens:
             for frac in fracs:
@@ -293,7 +285,6 @@ def main():
                       f"{times['int8']:7.2f} ms ({times['int8'] - times['fp16']:+.2f}); memory above the start "
                       f"fp16 {peak['fp16']:.1f} MiB, int8 {peak['int8']:.1f} MiB; int8 vs fp16: loss "
                       f"{loss_rel * 100:+.3f}%, entropy {ent_rel * 100:+.3f}%, dh {dh_err:.4f}", flush=True)
-    head_int8.NN, head_int8.FWD_ROWS = False, 1024
     streamer.configure(rows=args.rows, slots=2)
     print(streamer.stats(), flush=True)
     streamer.restore()

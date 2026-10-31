@@ -210,61 +210,29 @@ def test_nonfinite_hidden_stays_nonfinite(streamed):
     assert torch.isfinite(loss[[0, 1, 2, 4, 6]]).all() and torch.isfinite(dh[[0, 1, 2, 4, 6]]).all()
 
 
-def test_bounded_p_scale(streamed, monkeypatch):
-    """PBOUND: P's scale from exp(c_max - m_new) * max s_v of the chunk (no reduction)."""
+def test_build_deferred_to_the_first_head(streamed, monkeypatch):
+    """SOUP_SOLUTION_HEAD_INT8_AT=head: the thread starts at the first take(); head START_HEADS + 1
+    waits for it, so the switch point stays fixed."""
     from solution import head_int8
+    from solution.head_int8 import HeadInt8
 
-    _, streamer, int8 = streamed
-    q, sv = _int8_weight(int8)
-    monkeypatch.setattr(head_int8, "PBOUND", True)
-    for n, frac, scale in ((826, 0.6, 1.0), (354, 0.3, 3.0)):
-        h16, t, n_lab = _sorted_inputs(n, frac, scale, seed=n)
-        out = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-        ref_loss, _, _, ref_dh, _ = _reference(h16, t, n_lab, 1.0 / n_lab, q, sv)
-        assert torch.allclose(out[0].double(), ref_loss, rtol=1e-4, atol=1e-4)
-        err = ((out[3][:n_lab].double() - ref_dh).norm() / ref_dh.norm()).item()
-        assert err < 2e-2, err
-
-
-@pytest.mark.parametrize("rpp,pbound", [(2, False), (4, True), (8, False)])
-def test_rows_per_program_kernel(streamed, monkeypatch, rpp, pbound):
-    """head_i8_rows_kernel (R rows per program) gives head_i8_chunk_kernel's bits."""
-    from solution import head_int8
-
-    _, streamer, int8 = streamed
-    h16, t, n_lab = _sorted_inputs(701, 0.6, 2.0, seed=rpp)
-    monkeypatch.setattr(head_int8, "PBOUND", pbound)
-    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-    monkeypatch.setattr(head_int8, "RPP", rpp)
-    monkeypatch.setattr(head_int8, "FWD_ROWS", 256)
-    b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-    for name, x, y in zip(("loss", "entropy", "correct", "dh"), a, b):
-        assert torch.allclose(x.float(), y.float(), rtol=1e-6, atol=1e-6), name
-
-
-def test_transpose_on_a_side_stream(streamed, monkeypatch):
-    from solution import head_int8
-
-    _, streamer, int8 = streamed
-    h16, t, n_lab = _sorted_inputs(640, 0.6, 1.0, seed=17)
-    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-    monkeypatch.setattr(head_int8, "TSTREAM", True)
-    for _ in range(3):
-        b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-        for x, y in zip(a, b):
-            assert torch.equal(x, y)
-
-
-def test_nn_backward_matches_transposed(streamed, monkeypatch):
-    from solution import head_int8
-
-    _, streamer, int8 = streamed
-    h16, t, n_lab = _sorted_inputs(400, 0.7, 1.0, seed=21)
-    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-    monkeypatch.setattr(head_int8, "NN", True)
-    b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
-    for x, y in zip(a, b):
-        assert torch.equal(x, y)
+    _, streamer, plain = streamed
+    monkeypatch.setattr(head_int8, "START_HEADS", 1)
+    late = HeadInt8(streamer).start(defer=True)
+    assert late._thread is None and not late.ready
+    h16, t, n_lab = _sorted_inputs(300, 0.5, 1.0, seed=8)
+    taken = []
+    try:
+        streamer._int8 = late
+        for _ in range(3):
+            before = streamer.int8_heads
+            streamer.prefetch(300)
+            streamer.head(h16, t, n_lab, 1.0 / n_lab)
+            taken.append(streamer.int8_heads - before)
+    finally:
+        streamer._int8 = plain
+    assert taken == [0, 1, 1] and late.ready
+    late.stop()
 
 
 def test_forward_row_blocks_change_nothing(streamed, monkeypatch):
