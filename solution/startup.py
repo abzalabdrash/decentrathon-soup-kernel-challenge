@@ -204,6 +204,13 @@ def _import(name, seconds):
     seconds[name] = round(time.perf_counter() - start, 3)
 
 
+def _early_start():
+    """SOUP_SOLUTION_LOAD_EARLY_START: when load_early.py's read begins: `apply_begin` (default, next to the
+    imports) or `imports_done` (after them: on a host where the read and the pinning slow the imports)."""
+    value = os.environ.get("SOUP_SOLUTION_LOAD_EARLY_START", "apply_begin").strip().lower()
+    return value if value in ("apply_begin", "imports_done") else "apply_begin"
+
+
 def prepare_imports(log=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
     Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
@@ -211,7 +218,8 @@ def prepare_imports(log=True):
     try:
         from .load_early import start as start_early_read
 
-        start_early_read()  # SOUP_SOLUTION_LOAD_EARLY: the checkpoint read into pinned memory during the imports
+        if _early_start() == "apply_begin":
+            start_early_read()  # SOUP_SOLUTION_LOAD_EARLY: the checkpoint read into pinned memory during the imports
     except Exception:  # noqa: BLE001 - the loader stages as before
         pass
     if _flag("SOUP_SOLUTION_ENTRY_POINTS", "1"):
@@ -249,6 +257,10 @@ def prepare_imports(log=True):
     try:
         from .load_spec import start as start_spec
 
+        if _early_start() == "imports_done":
+            from .load_early import start as start_early_read
+
+            start_early_read()  # SOUP_SOLUTION_LOAD_EARLY_START=imports_done: the read after the imports
         start_spec()  # SOUP_SOLUTION_LOAD_SPEC: the layers' NF4 quantization ahead, now that bitsandbytes is imported
     except Exception:  # noqa: BLE001 - the loop quantizes as usual
         pass
