@@ -15,7 +15,7 @@
 - A1 `claude/a1-jury-audit`: закончен и влит целиком; план финальной серии в заметке, раздел 6.
 - R3: закончен и влит (`docs/notes/research-r3-methods.md`).
 
-**Kaggle: три аккаунта.** 1 = namedesign (`kaggle1.token`), 2 = peagverr (`kaggle2.token`), 3 = slerfas (`kaggle3.token`, добавлен 12:45; датасет `slerfas/soup-secrets` создан; первый прогон `soup-acc3-smoke` покажет, есть ли у аккаунта GPU). Все токены в `C:\Users\User\Downloads\Telegram Desktop\`. Обёртка `bash tools/kaggle_win.sh <1|2|3> ...`, по два GPU-ноутбука на аккаунт.
+**Kaggle: три аккаунта.** 1 = namedesign (`kaggle1.token`), 2 = peagverr (`kaggle2.token`), 3 = slerfas (`kaggle3.token`, добавлен 12:45; датасет `slerfas/soup-secrets` создан; проба `soup-acc3-smoke` прошла: T4 есть, 41,3 с / 371 MiB). Все токены в `C:\Users\User\Downloads\Telegram Desktop\`. Обёртка `bash tools/kaggle_win.sh <1|2|3> ...`, по два GPU-ноутбука на аккаунт.
 
 **Порядок до конца дня.**
 1. До ~16:30 собрать отчёты E1 и S1; вливать только измеренное (ABBA в одной сессии, пик ≤ 371 MiB); после каждого влития полный прогон и прогон жюри на новом seed (не использованы: 67, 89, 107, 109, 113).
