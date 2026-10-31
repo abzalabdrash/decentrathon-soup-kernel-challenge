@@ -125,6 +125,23 @@ byte of PCIe at any memory cost buys at most ~1.8 s on the public rows: the NF4 
 Astra's 1 s bar: partial NF4 residency is not worth memory), the head ~0.1 s, the activations ~1 s
 (I1's side). The rest of the step's idle time is the CPU.
 
+**Where early release's waits went (soup-p2-trace2-pub, 11ea449, CUDA-only traces of the same eight
+steps, 0-based 9-16, early release off and on, one session):** per step on the public rows
+
+| cause | off | on |
+|---|---|---|
+| backward copy waits (activations behind NF4, NF4 behind NF4) | 31.3 ms | 0.3 ms |
+| head chunk queued behind the previous head chunk | 17.1 ms | 16.1 ms |
+| CPU had not submitted the next kernel, forward | 37.5 ms | 48.8 ms |
+| CPU had not submitted the next kernel, backward | 6.3 ms | 26.3 ms |
+| launch latency | 5.2 ms | 5.2 ms |
+
+The backward's copy waits disappear and come back almost one for one as CPU waits: with the copies out of
+the way the GPU catches up with the CPU in the backward too, so the wall moves ~7 ms per step. After early
+release the public step is bound by the CPU's issue rate (and the head's bandwidth): no copy order or
+depth in weight_stream / head_stream can move it further. The levers left are the CPU (CUDA graphs, less
+Python per layer) and the head's bytes (H1's int8 head).
+
 **Head options, public rows (soup-p2-abba-head, b8d5902, 3 variants x 2 rounds + warm run):** early
 release 44.52 / 46.53 s (45.53), + `SOUP_SOLUTION_HEAD_SLOTS=3` 46.69 / 46.91 (46.80), +
 `SOUP_SOLUTION_HEAD_PREFETCH=embedding` 46.99 / 46.79 (46.89, peak 415). The session drifted by 2 s (the
