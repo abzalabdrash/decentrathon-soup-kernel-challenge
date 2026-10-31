@@ -61,6 +61,7 @@ def main():
     weight = (torch.randn(V, D, device="cuda") * 0.02).half()
     param = torch.nn.Parameter(weight.clone(), requires_grad=False)
     streamer = HeadStreamer(param, rows=args.rows[0], slots=args.slots)
+    streamer.timing = True  # the copy bandwidth and the PCIe wait below (SOUP_SOLUTION_STREAM_TIMING)
     print(f"{torch.cuda.get_device_name()}; weight to pinned host memory in {streamer.setup_seconds:.2f} s; "
           f"fp32-output GEMM: {streamer.fp32_out}")
     print("| tokens | head | ms | peak above inputs, MiB | PCIe wait, ms | chunk copy GB/s |")

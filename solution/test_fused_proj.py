@@ -939,6 +939,7 @@ def test_attention_weights_one_launch_and_reuse(layer_1p5b, cpu_diet, monkeypatc
     device = torch.device("cuda")
     ref_qkv = torch.cat([dequantize_nf4(b.weight, b.weight.quant_state, torch.float16) for b in bases])
     ref_o = dequantize_nf4(attn.o_proj.weight, attn.o_proj.weight.quant_state, torch.float16)
+    fused_proj._buffer(device, torch.float16, 16)  # whatever an earlier test left in the buffer
     qkv, o = fused_proj._attn_weights(plan, device)
     assert launches == [4] and torch.equal(qkv, ref_qkv) and torch.equal(o, ref_o)
     again = fused_proj._attn_weights(plan, device)

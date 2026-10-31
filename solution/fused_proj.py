@@ -961,7 +961,8 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v):
             grad_x = grad_x.to(ctx.x_dtype)
     grads = [grad_aq, grad_bq, grad_av, grad_bv]
     params = [m.weight for m in plan.lora_q + plan.lora_v]
-    grads = [None if g_ is None else g_.to(p_.dtype) for g_, p_ in zip(grads, params)]
+    grads = [g_ if g_ is None or g_.dtype == p_.dtype else g_.to(p_.dtype)
+             for g_, p_ in zip(grads, params)]
     return (grad_x, *grads)
 
 

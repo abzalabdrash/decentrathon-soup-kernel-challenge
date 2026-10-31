@@ -65,7 +65,7 @@ def main():
     rows.append(("resident", resident, torch.cuda.max_memory_allocated(), None, None))
     layer_bytes = None
     for slots in (2, 3):
-        streamer = WeightStreamer(blocks, slots=slots)
+        streamer = WeightStreamer(blocks, slots=slots, timing=True)
         layer_bytes = streamer.layer_bytes[0]
         try:
             torch.cuda.reset_peak_memory_stats()
