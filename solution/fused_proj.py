@@ -1555,12 +1555,16 @@ class _MLP(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
+        from .offload_int8 import raw
+
         plan, n, padded = ctx.plan, ctx.n, ctx.padded
+        int8 = not plan.recompute and int8_bwd.usable(plan, padded)
+        with raw(int8):  # an int8-offloaded (gate|up) comes back as is for int8_bwd to read
+            saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
         half = plan.half
         inter = plan.gate.out_features
         grad16 = _padded_half(grad.reshape(n, grad.shape[-1]), n, padded, half)
-        if not plan.recompute and int8_bwd.usable(plan, padded):
+        if int8:
             # SOUP_SOLUTION_INT8_BWD=1: both input-gradient GEMMs on int8 tensor cores, the int8
             # weights in the shared buffer, (gate|up) overwritten with its gradient
             buffer = _buffer(grad.device, half, plan.down.out_features * plan.down.in_features)

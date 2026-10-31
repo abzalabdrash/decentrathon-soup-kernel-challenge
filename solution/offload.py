@@ -472,8 +472,8 @@ class Offloader:
                 except ValueError:
                     pass
                 self.stats["still_on_gpu"] += 1
-            if saved.codec is not None:  # the half tensor from the int8 buffer, on current
-                tensor = saved.codec.decode(tensor)
+            if saved.codec is not None:  # the half tensor rebuilt from the int8 buffer on current,
+                tensor = saved.codec.unpacked(tensor)  # or the buffer for a raw reader
             if saved.keep:  # its other readers in this layer's backward get the same tensor
                 saved.gpu, saved.unpacked = tensor, True
             else:  # read: out of the prefetch window (a node unpacking several handles in

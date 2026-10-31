@@ -24,6 +24,7 @@ done, so which offloads go int8 never depends on timing (int8_bwd.py does the sa
 """
 
 import atexit
+import contextlib
 import os
 import threading
 
@@ -39,6 +40,10 @@ START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "112"
 # features per scale (64, 128 or 256 divide Qwen2.5-1.5B's 8960); tokens per program
 GROUP = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_GROUP", "128"))
 TILE_M = 64 if GROUP <= 128 else 32
+# SOUP_SOLUTION_OFFLOAD_INT8_FUSED=1: the int8 MLP backward (int8_bwd.py) reads the int8 form itself
+# inside its SwiGLU backward (raw), no rebuild pass; "now" while fused_proj's backward unpacks for it
+RAW = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_FUSED", "1").strip().lower()
+       not in ("0", "false", "no", ""), "now": False}
 _READY = threading.Event()
 HALF_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -107,6 +112,10 @@ class Codec:
     def __init__(self, shape, dtype):
         self.shape, self.dtype = shape, dtype
 
+    def unpacked(self, wire):
+        """What the unpack hands over: the uint8 buffer itself inside raw(True), else decode(wire)."""
+        return wire if RAW["now"] else self.decode(wire)
+
     def decode(self, wire):
         """The half (rows, tokens) tensor from its int8 buffer on the GPU, on the current stream."""
         rows, tokens = self.shape
@@ -114,6 +123,18 @@ class Codec:
         out = torch.empty(self.shape, dtype=self.dtype, device=wire.device)
         gu_dequant_kernel[_grid(rows, tokens)](q, s, out, tokens, GROUP=GROUP, TM=TILE_M, num_warps=4)
         return out
+
+
+@contextlib.contextmanager
+def raw(on):
+    """While active with `on` (and SOUP_SOLUTION_OFFLOAD_INT8_FUSED), the unpack of an int8 handle
+    returns its uint8 buffer (wire_bytes of its shape) instead of the rebuilt half tensor."""
+    previous = RAW["now"]
+    RAW["now"] = bool(on) and RAW["on"]
+    try:
+        yield
+    finally:
+        RAW["now"] = previous
 
 
 def encode(tensor):

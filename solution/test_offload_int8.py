@@ -274,3 +274,57 @@ def test_no_record_stream_and_no_cpu_wait_on_the_int8_path(int8_on, monkeypatch)
     assert s["int8"] == k and s["prefetch_hits"] == k - 1, off.summary()
     for x, v in zip(xs, values):
         assert torch.equal(x.grad, _roundtrip(int8_on, v))
+
+
+def test_raw_unpack_feeds_the_int8_backward_directly(int8_on, monkeypatch, restore_classes):
+    """SOUP_SOLUTION_OFFLOAD_INT8_FUSED: with the int8 MLP backward the unpack hands over the int8
+    form and int8_swiglu_bwd_kernel reads it; the result is bit for bit that of the rebuild pass."""
+    bnb = pytest.importorskip("bitsandbytes")
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+
+    from solution import int8_bwd, offload
+    from solution.fused_proj import patch_qwen2_mlp_fused, set_mlp_recompute
+
+    monkeypatch.setattr(offload, "EARLY", True)
+    monkeypatch.setitem(int8_bwd._STATE, "on", True)
+    int8_bwd.compile_now()
+    patch_qwen2_mlp_fused()
+    set_mlp_recompute(False)
+    torch.manual_seed(1)
+    config = Qwen2Config(hidden_size=1536, intermediate_size=8960)
+    layers = []
+    for _ in range(2):
+        with torch.device("meta"):
+            mlp = Qwen2MLP(config)
+        for name, (n_in, n_out) in (("gate_proj", (1536, 8960)), ("up_proj", (1536, 8960)),
+                                    ("down_proj", (8960, 1536))):
+            layer = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
+                                      compress_statistics=True, quant_type="nf4")
+            layer.weight.requires_grad_(False)
+            setattr(mlp, name, layer)
+        layers.append(mlp.cuda())
+    x0 = torch.randn(1, 640, 1536, device="cuda")
+    grad = torch.randn_like(x0) * 1e-2
+    decoded = []
+    original = int8_on.Codec.decode
+    monkeypatch.setattr(int8_on.Codec, "decode", lambda self, w: decoded.append(1) or original(self, w))
+
+    def go(fused):
+        monkeypatch.setitem(int8_on.RAW, "on", fused)
+        decoded.clear()
+        x = x0.clone().requires_grad_(True)
+        with offload.offload_saved_tensors(weights=[p for m in layers for p in m.parameters()]) as off, \
+                torch.autocast("cuda", dtype=torch.float16):
+            h = x
+            for mlp in layers:
+                h = h + mlp(h)
+            h.backward(grad)
+        torch.cuda.synchronize()
+        assert off.stats["int8"] == len(layers)
+        return x.grad, len(decoded)
+
+    ref, rebuilt = go(False)
+    got, rebuilt_fused = go(True)
+    assert rebuilt == len(layers) and rebuilt_fused == 0
+    assert torch.equal(got, ref)
