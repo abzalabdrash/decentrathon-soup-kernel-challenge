@@ -370,9 +370,9 @@ def patch_step_pipeline():
             from .trainer_patch import flush_deferred
 
             flush_deferred(self)
-            _report(self, flipped, undo is not None, single)
             if restore_timing is not None:
                 restore_timing()
+            _report(self, flipped, undo is not None, single)
 
     @functools.wraps(training_step)
     def _training_step(self, model, inputs, *args, **kwargs):

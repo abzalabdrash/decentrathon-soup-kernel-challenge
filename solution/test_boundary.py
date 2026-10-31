@@ -105,3 +105,16 @@ def test_registration_drops_the_lists(boundary_on):
     model.base_model.model.extra = torch.nn.Linear(2, 2).cuda()  # a module registered anywhere
     assert boundary_on._entry(model) is not entry
     assert any(m is model.base_model.model.extra for m in boundary_on._entry(model)["modules"])
+
+
+def test_layer_slices_keep_the_lists(boundary_on):
+    """Every forward slices `layers[:num_hidden_layers]` (unpad.varlen_model_forward, HF's
+    Qwen2Model), and a sliced ModuleList registers the layers into a new ModuleList: that must not
+    drop the lists (it rebuilt them every step, 8.8 ms of the FLOP counter's call on the T4)."""
+    model = _peft_model()
+    entry = boundary_on._entry(model)
+    decoder = model.base_model.model.model
+    builds = boundary_on._STATE["builds"]
+    sliced = decoder.layers[: decoder.config.num_hidden_layers]
+    assert len(sliced) == decoder.config.num_hidden_layers
+    assert boundary_on._entry(model) is entry and boundary_on._STATE["builds"] == builds
