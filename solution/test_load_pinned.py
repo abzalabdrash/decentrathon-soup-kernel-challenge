@@ -1070,6 +1070,8 @@ def test_early_files_from_config_and_cache(tmp_path, monkeypatch):
     assert load_early.checkpoint_files("Org/Other") == []  # no snapshot in the cache
     assert load_early._config_base(["soup", "train"]) is None
     monkeypatch.delenv("SOUP_SOLUTION_LOAD_EARLY", raising=False)
+    assert load_early.enabled()  # on by default since soup-recon-abba1
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
     assert not load_early.enabled()
 
 

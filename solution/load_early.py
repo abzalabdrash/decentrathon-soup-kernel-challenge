@@ -1,5 +1,5 @@
 """The checkpoint's tensor bytes read into pinned host memory by a thread from the start of apply(),
-while the main thread imports (SOUP_SOLUTION_LOAD_EARLY=1, off by default until measured; the
+while the main thread imports (SOUP_SOLUTION_LOAD_EARLY=1, on by default since soup-recon-abba1: staging wait 0.46-0.63 -> 0.12 s, first step -0.10..-0.14 s; =0 turns it off; the
 organizers allow reading the weight files in a thread during the imports when Soup then builds the
 model as usual, answer 48).
 
@@ -51,7 +51,7 @@ _LOCK = threading.Lock()
 
 
 def enabled():
-    return os.environ.get("SOUP_SOLUTION_LOAD_EARLY", "0").strip().lower() not in ("0", "false", "no", "")
+    return os.environ.get("SOUP_SOLUTION_LOAD_EARLY", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 class _Chunk:

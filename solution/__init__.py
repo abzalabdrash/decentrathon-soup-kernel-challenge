@@ -44,7 +44,7 @@ SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARL
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
-SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache, =late starts after Soup's final save),
+SOUP_SOLUTION_EXIT_RELEASE=late (the default, exit_release.py: starts after Soup's final save; =1 at the last step, =0 turns off, =all also empties the cache),
 SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; on by default, answer 29),
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
@@ -62,7 +62,7 @@ def apply():
     mark("apply begin")
     # Defaults of switches that other modules read at import time (int8_bwd.py reads its own when
     # fused_proj imports it), so they come before any patch import; an environment value wins.
-    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # E1: pinned host memory handed back on a thread at the last step; not "all" (check 9)
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "late")  # E1: pinned host memory handed back on a thread after Soup's final save (soup-recon-abba1: save tail 0.93 -> 0.52 s, net -0.21 s); not "all" (check 9)
     # answer 29 (chat, 31 Oct): int8 tensor cores for the frozen linear layers in the forward and the backward by
     # input, and for lm_head, are allowed when all 10 checks pass; the MLP backward int8 (int8_bwd.py) measured
     # 10/10 on the public rows (43.1 s / 395 MiB) and on the jury rows (s 1.91 against 1.80-1.85 without it).

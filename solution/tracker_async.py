@@ -1,5 +1,5 @@
 """Soup's per-log SQLite writes in a thread of the training process (SOUP_SOLUTION_TRACKER_THREAD=1,
-off by default until measured; the organizers allow it, answer 16 of the second wave).
+on by default since soup-recon-abba1: step-boundary gaps 0.36 -> 0.14 s per run; =0 turns it off; the organizers allow it, answer 16 of the second wave).
 
 Soup's `ExperimentTracker.log_metrics` (soup_cli/experiment/tracker.py:379-410) runs on the main thread
 at every training log (logging_steps 1: 64 times a run): an INSERT and a `commit()` on a WAL database
@@ -37,7 +37,7 @@ LAST = {"queued": 0, "written": 0, "error": None}
 
 
 def enabled():
-    return os.environ.get("SOUP_SOLUTION_TRACKER_THREAD", "0").strip().lower() not in ("0", "false", "no", "")
+    return os.environ.get("SOUP_SOLUTION_TRACKER_THREAD", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 class _Writer:

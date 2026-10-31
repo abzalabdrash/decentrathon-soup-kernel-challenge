@@ -61,6 +61,8 @@ def test_writer_error_raised_by_the_next_call(tmp_path, monkeypatch):
         tracker_async.unpatch_tracker()
 
 
-def test_off_by_default(monkeypatch):
+def test_on_by_default(monkeypatch):
     monkeypatch.delenv("SOUP_SOLUTION_TRACKER_THREAD", raising=False)
+    assert tracker_async.enabled()  # on by default since soup-recon-abba1
+    monkeypatch.setenv("SOUP_SOLUTION_TRACKER_THREAD", "0")
     assert not tracker_async.enabled()
