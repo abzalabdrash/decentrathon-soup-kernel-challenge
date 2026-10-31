@@ -168,6 +168,55 @@ def test_known_values_follow_the_tensor_object():
     assert key not in step_pipeline._KNOWN
 
 
+class _IdsModel(torch.nn.Module):
+    """What unpad.varlen_model_forward reads of a Qwen2Model, no layers; the embedding records the
+    ids it gets and the host copy recorded for them."""
+
+    def __init__(self):
+        super().__init__()
+        self.config = types.SimpleNamespace(num_hidden_layers=0)
+        self.layers = torch.nn.ModuleList()
+        self.seen = []
+        model = self
+
+        class Embed(torch.nn.Module):
+            def forward(self, ids):
+                model.seen.append((ids, step_pipeline.host_ids(ids, lookup=True)))
+                return ids.unsqueeze(-1).float()
+
+        self.embed_tokens = Embed()
+        self.rotary_emb = lambda hidden, pos: (None, None)
+        self.norm = torch.nn.Identity()
+
+
+@pytest.mark.parametrize("n", [37, 48])
+@pytest.mark.parametrize("tail_id", [None, 5])
+def test_host_ids_reach_the_embedding_with_the_tail(n, tail_id, monkeypatch):
+    """The host plan's packed ids and, with the alignment tail, the tail-extended ids carry their CPU
+    copy to the embedding (SOUP_SOLUTION_HOST_IDS); the same values as the GPU ids; off: none."""
+    monkeypatch.setitem(unpad._STATE, "tail_id", tail_id)
+    monkeypatch.setitem(unpad._STATE, "pad", 16)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    for on in (True, False):
+        monkeypatch.setitem(step_pipeline._STATE, "host_ids", on)
+        cpu = torch.randint(0, 1000, (1, n), dtype=torch.int64)
+        ids = cpu.to(device)
+        if on:
+            step_pipeline.remember(ids, cpu)
+        model = _IdsModel()
+        out = unpad.varlen_model_forward(model, ids, torch.arange(n, device=device).unsqueeze(0),
+                                         [(0, n)])
+        assert out.shape == (1, n, 1)
+        (seen, host), = model.seen
+        assert seen.shape == (1, n + (-n) % 16)
+        if not on:
+            assert host is None
+            continue
+        assert host is not None and host.device.type == "cpu" and torch.equal(host, seen.cpu())
+        assert (seen is ids) == (n % 16 == 0)
+    assert step_pipeline.host_ids(torch.zeros(3)) is None
+
+
 # ---- a tiny SFT run, every switch off against every switch on ------------------------------
 
 

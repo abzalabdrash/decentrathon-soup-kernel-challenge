@@ -130,10 +130,18 @@ def varlen_model_forward(model, input_ids, position_ids, spans):
     n = input_ids.shape[1]
     pad = _pad_count(n)
     if pad:
-        fill = input_ids[:, -1:]
-        if _STATE["tail_id"] is not None:
-            fill = torch.full_like(fill, _STATE["tail_id"])
-        input_ids = torch.cat([input_ids, fill.expand(1, pad)], dim=1)
+        from .step_pipeline import host_ids, remember
+
+        host = host_ids(input_ids)  # the packed ids' CPU copy (host plan), for the embedding lookup
+        ids_with_tail = []
+        for ids in (input_ids, host) if host is not None else (input_ids,):
+            fill = ids[:, -1:]
+            if _STATE["tail_id"] is not None:
+                fill = torch.full_like(fill, _STATE["tail_id"])
+            ids_with_tail.append(torch.cat([ids, fill.expand(1, pad)], dim=1))
+        input_ids = ids_with_tail[0]
+        if host is not None:
+            remember(input_ids, ids_with_tail[1])
         tail = torch.arange(pad, dtype=position_ids.dtype, device=position_ids.device)
         position_ids = torch.cat([position_ids, tail.unsqueeze(0)], dim=1)
     hidden = model.embed_tokens(input_ids)

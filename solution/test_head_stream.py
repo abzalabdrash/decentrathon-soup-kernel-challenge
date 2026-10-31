@@ -196,6 +196,34 @@ def test_embedding_lookup_is_exact(streamed):
         assert torch.equal(out, F.embedding(ids, weight).float())
 
 
+def test_embedding_lookup_with_host_ids(streamed, monkeypatch):
+    """With the ids' CPU copy recorded (the host plan, SOUP_SOLUTION_HOST_IDS) the lookup gathers
+    from it and never reads the GPU ids back; the same rows. A copy of another shape is ignored."""
+    from solution import step_pipeline
+
+    weight, param, streamer = streamed
+    monkeypatch.setitem(step_pipeline._STATE, "host_ids", True)
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    ids = torch.randint(0, V, (1, 333), device="cuda", generator=gen)
+    want = F.embedding(ids, weight.float())
+    step_pipeline.remember(ids, ids.cpu())
+    reads = []
+    to = torch.Tensor.to
+
+    def counting_to(self, *args, **kwargs):
+        if self.is_cuda and args and args[0] == "cpu":
+            reads.append(self.shape)
+        return to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", counting_to)
+    before = step_pipeline._STATS["host_ids"]
+    assert torch.equal(streamer.lookup(ids), want)
+    assert reads == [] and step_pipeline._STATS["host_ids"] == before + 1
+    step_pipeline.remember(ids, ids.cpu().view(-1))  # another shape: read back as before
+    assert torch.equal(streamer.lookup(ids), want)
+    assert len(reads) == 1 and step_pipeline._STATS["host_ids"] == before + 1
+
+
 def test_placeholder_and_deepcopy(streamed):
     weight, param, streamer = streamed
     assert param.is_cuda and param.dtype == torch.float32 and param.shape == (V, D)

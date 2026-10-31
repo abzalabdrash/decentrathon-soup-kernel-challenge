@@ -563,10 +563,15 @@ class HeadStreamer:
         return self._staging[:n]
 
     def lookup(self, ids):
-        """F.embedding(ids, weight) in the virtual dtype, from the host copy."""
+        """F.embedding(ids, weight) in the virtual dtype, from the host copy (the ids' CPU copy when
+        the host plan recorded one for this tensor, step_pipeline.host_ids; else read back)."""
+        from .step_pipeline import host_ids
+
         flat = ids.reshape(-1)
         staging = self._staging_rows(flat.numel())
-        torch.index_select(self.host, 0, flat.to("cpu"), out=staging)
+        host = host_ids(ids, lookup=True) if ids.is_cuda else None
+        torch.index_select(self.host, 0, host.reshape(-1) if host is not None else flat.to("cpu"),
+                           out=staging)
         device = ids.device if ids.is_cuda else self.device
         rows = torch.empty(staging.shape, dtype=self.dtype, device=device)
         rows.copy_(staging, non_blocking=True)

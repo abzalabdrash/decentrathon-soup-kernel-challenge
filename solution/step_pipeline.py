@@ -34,6 +34,10 @@ off), for the real CUDA trainer only (anything else runs the original):
   (the same integer operations as unpad.pack_batch on the GPU), and copied to the GPU in one
   non-blocking copy next to the batch. The forward (fused_ce.py) and the head take them by the
   identity of the batch's GPU tensors; any other tensor takes the GPU path.
+- SOUP_SOLUTION_HOST_IDS=1 (task C1, with the host plan): the packed ids' CPU copy is recorded for
+  their GPU view (`remember`), unpad.varlen_model_forward records the CPU copy of the ids with the
+  alignment tail for its GPU tensor, and the embedding lookup (head_stream.py) gathers its rows
+  with those CPU ids instead of reading the GPU ids back (the forward's last host wait).
 - SOUP_SOLUTION_BWD_SINGLE_THREAD=1: the trainer's `accelerator.backward(loss)` runs under
   `torch.autograd.set_multithreading_enabled(False)`: the autograd engine then evaluates every node
   on the calling thread instead of handing the CUDA nodes to its device thread (the same nodes, the
@@ -70,11 +74,13 @@ _STATE = {
     "nan_gpu": _env("SOUP_SOLUTION_NAN_FILTER", "gpu") == "gpu",
     "prefetch": _flag("SOUP_SOLUTION_PREFETCH_BATCH", "1"),
     "plan": _flag("SOUP_SOLUTION_HOST_PLAN", "1"),
+    "host_ids": _flag("SOUP_SOLUTION_HOST_IDS", "1"),
     "timing": _flag("SOUP_SOLUTION_BOUNDARY_TIMING"),
     "bwd_single": _flag("SOUP_SOLUTION_BWD_SINGLE_THREAD", "1"),
     "patched": False,
 }
-_STATS = {"prefetched": 0, "planned": 0, "plans_used": 0, "known_used": 0, "fetch_s": 0.0, "plan_s": 0.0}
+_STATS = {"prefetched": 0, "planned": 0, "plans_used": 0, "known_used": 0, "host_ids": 0,
+          "fetch_s": 0.0, "plan_s": 0.0}
 _TIMES = {}  # label -> [seconds, calls] (SOUP_SOLUTION_BOUNDARY_TIMING)
 
 
@@ -190,6 +196,23 @@ def _attach(cpu, gpu_batch):
 
     plan._refs = (weakref.ref(ids), weakref.ref(mask, drop), weakref.ref(labels))
     _PLANS[key] = plan
+    if _STATE["host_ids"]:  # the packed ids on the host, for the embedding lookup
+        remember(plan.ids, cpu["host"][:n].unsqueeze(0))
+
+
+def host_ids(ids, lookup=False):
+    """The CPU copy recorded for this very GPU ids tensor (same shape and dtype), or None;
+    `lookup`: counted as an embedding lookup made with it."""
+    if not _STATE["host_ids"] or not torch.is_tensor(ids):
+        return None
+    entry = _KNOWN.get(id(ids))
+    if entry is None or entry[0]() is not ids:
+        return None
+    cpu = entry[1]
+    if not torch.is_tensor(cpu) or cpu.shape != ids.shape or cpu.dtype != ids.dtype:
+        return None
+    _STATS["host_ids"] += lookup
+    return cpu
 
 
 def plan_for(input_ids, attention_mask, labels):
@@ -462,7 +485,8 @@ def _report(trainer, flipped, iterator, single=False):
                      f"(fetch {_STATS['fetch_s'] * 1e3:.0f} ms in all)")
         if _STATE["plan"]:
             parts.append(f"{_STATS['planned']} host plans ({_STATS['plan_s'] * 1e3:.0f} ms), "
-                         f"{_STATS['plans_used']} used, {_STATS['known_used']} host counts read")
+                         f"{_STATS['plans_used']} used, {_STATS['known_used']} host counts read, "
+                         f"{_STATS['host_ids']} lookups with host ids")
     if parts:
         print("[solution] step pipeline: " + "; ".join(parts), flush=True)
     if _TIMES:

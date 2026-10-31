@@ -943,10 +943,15 @@ def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, token_ma
     return q4, k4, v4, keep
 
 
-def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False):
-    """_QKVRope's backward (also the last part of _AttnBlock's) from the tensors _qkv_forward saved:
-    the gradients of x, A_q, B_q, A_v, B_v. `token_major` (_AttnBlock): the gradients of q, k, v as
-    the attention backward gives them, (1, N, H, D), instead of (1, H, N, D) views of those."""
+def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False, box=None):
+    """_QKVRope's backward (also the last part of _AttnBlock's and _QKVAttn's) from the tensors
+    _qkv_forward saved: the gradients of x, A_q, B_q, A_v, B_v. `token_major` (_AttnBlock,
+    _QKVAttn): the gradients of q, k, v as the attention backward gives them, (1, N, H, D), instead
+    of (1, H, N, D) views of those. `box` (_QKVAttn): a list holding the only references to the
+    three gradients, taken from it here, so they die once they are in `g`."""
+    if box is not None:
+        grad_q, grad_k, grad_v = box
+        box.clear()
     h, a16, b16, cos, sin, *kept = saved
     plan = ctx.plan
     n, d, nq, nk, nv, r = ctx.dims
@@ -984,6 +989,7 @@ def _qkv_backward(ctx, saved, grad_q, grad_k, grad_v, token_major=False):
         rope._launch(_last_dim_contiguous(grad_q), _last_dim_contiguous(grad_k), gq4, gk4, cos,
                      sin, backward=True)
         _heads(g[:, nq + nk:], n, plan.kv_heads, plan.head_dim).copy_(grad_v)
+    del grad_q, grad_k, grad_v  # in g now (autograd still holds them in _QKVRope's backward)
     g_q, g_v = g[:, :nq], g[:, nq + nk:]
 
     need_x, need_a = ctx.needs_input_grad[0], ctx.needs_input_grad[1] or ctx.needs_input_grad[3]
@@ -1133,6 +1139,66 @@ class _AttnBlock(torch.autograd.Function):
         # _QKVRope.backward (it took the transposes of these: the gradients of its q4, k4, v4)
         grads = _qkv_backward(ctx, saved[:ctx.qkv_count], grad_q, grad_k, grad_v, token_major=True)
         return (*grads, None, None, None, None, None, None)
+
+
+# SOUP_SOLUTION_ATTN_TWO_NODES=1 (task C1): a recomputing layer's _QKVRope and variable-length
+# attention as one autograd node (_QKVAttn), the o_proj its own node (_Linear4bitHalf) as before. The
+# o_proj backward still consumes the output's gradient before the attention backward runs; the node
+# holds its incoming gradient (the attention output's, N x D half) through the q/k/v backward in place
+# of the q/k/v gradients (N x (nq + nk + nv) half) that _QKVRope's node held there. One autograd node
+# and the reshape's view node less per layer and direction. SOUP_SOLUTION_ATTN_ONE_FUNCTION=1 wins
+_ATTN["two_nodes"] = os.environ.get("SOUP_SOLUTION_ATTN_TWO_NODES", "1").strip().lower() \
+    not in ("0", "false", "no", "")
+
+
+class _QKVAttn(torch.autograd.Function):
+    """x (1, N, D) -> attention(q, k, v) as (N, Hq * Dh) of a layer whose attention block is
+    recomputed in its backward: _QKVRope and unpad's _VarlenAttention as one node (the reshape to the
+    o_proj's input is a view of its output), the same operations on the same operands in the same
+    order each way (the q, k, v and their gradients in the kernel's layout, as _AttnBlock has them)."""
+
+    @staticmethod
+    def forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, scale):
+        q, k, v, keep = _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute,
+                                     token_major=True)
+        # unpad.attention and _VarlenAttention.forward (q, k, v as unpad.kernel_operands makes them)
+        bounds = plan.bounds
+        max_len = max(end - start for start, end in zip(bounds[:-1], bounds[1:]))
+        cu = _cu_seqlens(bounds, q.device)
+        groups = q.shape[2] // k.shape[2]
+        out, lse, seed, offset = varlen_forward(q, k, v, cu, max_len, scale)
+        recompute.attention_taken(cu, max_len, scale, q, k, v, out, lse)
+        del q, k, v, lse
+        ctx.attn_args = (max_len, scale, groups)
+        ctx.qkv_count = len(keep)
+        ctx.save_for_backward(*keep, cu)
+        return out.view(plan.n_tokens, plan.heads * plan.head_dim)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad):
+        saved = ctx.saved_tensors
+        plan = ctx.plan
+        # _VarlenAttention.backward (the reshape's backward before it is this reshape)
+        max_len, scale, groups = ctx.attn_args
+        cu = saved[-1]
+        q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
+        grad_out = grad.reshape(1, plan.n_tokens, plan.heads, plan.head_dim)
+        grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+        grad_q, grad_k, grad_v, _ = _efficient_backward(
+            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
+            seed, offset, scale)
+        del grad_out, q, out, lse
+        if groups > 1:
+            grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
+            grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
+        del k, v
+        # _QKVRope.backward on the gradients of its q4, k4, v4 (whose transposes it took)
+        box = [grad_q, grad_k, grad_v]
+        del grad_q, grad_k, grad_v
+        grads = _qkv_backward(ctx, saved[:ctx.qkv_count], None, None, None, token_major=True,
+                              box=box)
+        return (*grads, None, None, None, None, None)
 
 
 def _recompute_mode():
@@ -1344,9 +1410,15 @@ def _fused_attention(attn, x, position_embeddings, plan):
     dropout = 0.0 if not attn.training else attn.attention_dropout
     n = plan.n_tokens
     bias = _cached_bias(plan.o_base, (plan.o_base,), plan.half)
-    if recompute is not None and _ATTN["one_function"] and _one_function_ok(plan, dropout):
+    merged = recompute is not None and (_ATTN["one_function"] or _ATTN["two_nodes"]) \
+        and _one_function_ok(plan, dropout)
+    if merged and _ATTN["one_function"]:
         out = _AttnBlock.apply(x, a_q.weight, b_q.weight, a_v.weight, b_v.weight, cos, sin, plan,
                                recompute, attn.scaling, bias)
+    elif merged:
+        out = _QKVAttn.apply(x, a_q.weight, b_q.weight, a_v.weight, b_v.weight, cos, sin, plan,
+                             recompute, attn.scaling)  # (N, Hq * Dh)
+        out = _Linear4bitHalf.apply(out, plan.o_base, bias, plan)
     else:
         query, key, value = _QKVRope.apply(x, a_q.weight, b_q.weight, a_v.weight, b_v.weight, cos,
                                            sin, plan, recompute)

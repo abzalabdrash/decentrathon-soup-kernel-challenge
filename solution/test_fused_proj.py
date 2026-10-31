@@ -971,6 +971,7 @@ def test_attention_one_function_is_bitwise(layer_1p5b, monkeypatch, dropout):
     for proj in (attn.q_proj, attn.v_proj):
         proj.lora_dropout["default"] = torch.nn.Dropout(dropout).train() if dropout else \
             torch.nn.Identity()
+    monkeypatch.setitem(fused_proj._ATTN, "two_nodes", False)
     x, pe, grad = _attention_inputs(rotary, seed=44)
     _fused(True)
     nodes = []
@@ -992,6 +993,88 @@ def test_attention_one_function_is_bitwise(layer_1p5b, monkeypatch, dropout):
     finally:
         for proj in (attn.q_proj, attn.v_proj):
             proj.lora_dropout["default"] = torch.nn.Identity()
+
+
+def _attention_mode(monkeypatch, mode):
+    from solution import fused_proj
+
+    monkeypatch.setitem(fused_proj._ATTN, "one_function", mode == "one")
+    monkeypatch.setitem(fused_proj._ATTN, "two_nodes", mode == "two")
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.05])
+def test_attention_two_nodes_is_bitwise(layer_1p5b, monkeypatch, dropout):
+    """A recomputing layer's q/k/v and attention as one autograd node with the o_proj its own
+    (SOUP_SOLUTION_ATTN_TWO_NODES) against the three nodes and the one node: output, input gradient
+    and LoRA gradients bit for bit (one key split in the attention backward)."""
+    from solution import fused_proj, unpad
+
+    _, attn, _, rotary = layer_1p5b
+    monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", "all")
+    monkeypatch.setitem(unpad._STATE, "splits_key", 1)
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(dropout).train() if dropout else \
+            torch.nn.Identity()
+    x, pe, grad = _attention_inputs(rotary, seed=46)
+    _fused(True)
+    nodes = []
+    try:
+        results = []
+        for mode in ("three", "two", "one"):
+            _attention_mode(monkeypatch, mode)
+            torch.cuda.manual_seed(7)
+            with torch.autocast("cuda", dtype=torch.float16), unpad.varlen(_spans(LENGTHS)):
+                probe, _ = attn(x.detach().requires_grad_(True), pe, None)
+            below = probe.grad_fn.next_functions[0][0]  # below the view
+            nodes.append((type(below).__name__, type(below.next_functions[0][0]).__name__))
+            del probe, below
+            torch.cuda.manual_seed(7)
+            results.append(_attention_step(attn, x, pe, grad))
+        (out0, dx0, g0), *others = results
+        for out1, dx1, g1 in others:
+            assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
+            assert all(torch.equal(a, b) for a, b in zip(g1, g0))
+        assert nodes[0] == ("_Linear4bitHalfBackward", "ViewBackward0"), nodes
+        assert nodes[1] == ("_Linear4bitHalfBackward", "_QKVAttnBackward"), nodes
+        assert nodes[2][0] == "_AttnBlockBackward", nodes
+    finally:
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
+
+
+def test_attention_two_nodes_backward_peak(layer_1p5b, monkeypatch):
+    """The backward's allocated peak of one recomputing layer whose output gradient autograd makes
+    (and frees once its consumer returns): two nodes no higher than three; one node keeps the o_proj
+    output's gradient alive on top (the T4's +4.2 MiB; here +N x 2048 bytes)."""
+    from solution import fused_proj, unpad
+
+    _, attn, _, rotary = layer_1p5b
+    monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", "all")
+    monkeypatch.setitem(unpad._STATE, "splits_key", 1)
+    x, pe, grad = _attention_inputs(rotary, seed=47)
+    scale = torch.ones((), device="cuda", dtype=torch.float16, requires_grad=True)
+    _fused(True)
+    peaks = {}
+    for mode in ("warm", "three", "two", "one", "two", "three"):
+        _attention_mode(monkeypatch, mode)
+        xr = x.detach().requires_grad_(True)
+        for p in attn.parameters():
+            p.grad = None
+        with torch.autocast("cuda", dtype=torch.float16), unpad.varlen(_spans(LENGTHS)):
+            out, _ = attn(xr, pe, None)
+        loss = (out * scale * grad).float().sum()  # the output's gradient is made in the backward
+        del out
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        loss.backward()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        assert peaks.setdefault(mode, peak) == peak or mode == "warm", (mode, peaks, peak)
+        del loss, xr
+    n = sum(LENGTHS)
+    assert peaks["two"] <= peaks["three"], peaks
+    assert peaks["one"] >= peaks["three"] + n * 1024, peaks
 
 
 @pytest.mark.parametrize("mlp_recompute", [False, True])
@@ -1026,6 +1109,7 @@ def test_attention_fewer_views_is_bitwise(layer_1p5b, monkeypatch, mode):
     _, attn, _, rotary = layer_1p5b
     monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", mode)
     monkeypatch.setitem(fused_proj._ATTN, "one_function", False)
+    monkeypatch.setitem(fused_proj._ATTN, "two_nodes", False)
     monkeypatch.setitem(unpad._STATE, "splits_key", 1)
     for proj in (attn.q_proj, attn.v_proj):
         proj.lora_dropout["default"] = torch.nn.Dropout(0.05).train()
