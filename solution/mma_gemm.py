@@ -256,7 +256,7 @@ def tc_int8_swiglu_bwd_kernel(w_ptr, g_ptr, w_scale_ptr, g_scale_ptr, gate_up_pt
 
 
 # (BLOCK_I, BLOCK_T, BLOCK_K, num_warps, GROUP_I) of tc_int8_swiglu_bwd_kernel
-SWIGLU_BWD_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_BWD_CFG", "128x128x64x8x8")))
+SWIGLU_BWD_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_BWD_CFG", "64x128x64x4x8")))
 
 
 def int8_swiglu_bwd(w_down_t, g_q, w_scale, g_scale, gate_up, cfg=SWIGLU_BWD_CFG):
@@ -276,6 +276,104 @@ def int8_swiglu_bwd(w_down_t, g_q, w_scale, g_scale, gate_up, cfg=SWIGLU_BWD_CFG
 
 def int8_swiglu_bwd_usable(inter, d, cfg=SWIGLU_BWD_CFG):
     return inter % cfg[0] == 0 and d % cfg[2] == 0
+
+
+@triton.jit
+def _silu_mul_tc(g, u):
+    # silu(gate) * up in fp32 written as int8_fwd._silu_mul (and swiglu.py's forward) writes it
+    return g * tl.sigmoid(g) * u
+
+
+@triton.jit
+def tc_int8_gate_up_kernel(w_ptr, x_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, hidden_ptr,
+                           xk_ptr, wk_ptr, inter, tokens, chunk, D,
+                           BLOCK_F: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_K: tl.constexpr,
+                           GROUP_F: tl.constexpr, K: tl.constexpr):
+    """int8_fwd.py's gate|up products and int8_gate_up_kernel (MODE "gu") in one kernel: for BLOCK_F
+    features and BLOCK_T tokens, the int32 products of the gate rows and of the up rows of the int8
+    weight w (2I, D), rows interleaved by chunk as int8_fwd._decode_gate_up writes them (gate rows of
+    chunk c, then its up rows), with x_q (tokens, D) on the tensor cores, kept in registers; then the
+    epilogue of int8_gate_up_kernel on the tile: the same fp32 operations in the same order (scales,
+    the top-k channels' fp32 share wk @ xk^T when K > 0), (gate|up) (2I, tokens) and silu(gate) * up
+    (I, tokens) in half. The int32 products are exact, so the outputs are bit-for-bit those of the
+    chunked _int_mm path, without its int32 buffer. BLOCK_F divides chunk."""
+    pid = tl.program_id(0)
+    num_f = inter // BLOCK_F
+    num_t = tl.cdiv(tokens, BLOCK_T)
+    group = GROUP_F * num_t
+    first_f = (pid // group) * GROUP_F
+    size_f = min(num_f - first_f, GROUP_F)
+    pid_f = first_f + (pid % group) % size_f
+    pid_t = (pid % group) // size_f
+    feat = pid_f * BLOCK_F + tl.arange(0, BLOCK_F)
+    # rows of w (and of w_scale, wk) of these features: gate, then up, within their chunk
+    row_g = (feat // chunk) * (2 * chunk) + feat % chunk
+    row_u = row_g + chunk
+    rt = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    rk = tl.arange(0, BLOCK_K)
+    g_ptrs = w_ptr + row_g[:, None].to(tl.int64) * D + rk[None, :]
+    u_ptrs = w_ptr + row_u[:, None].to(tl.int64) * D + rk[None, :]
+    x_ptrs = x_ptr + (rt % tokens)[None, :].to(tl.int64) * D + rk[:, None]
+    acc_g = tl.zeros((BLOCK_F, BLOCK_T), dtype=tl.int32)
+    acc_u = tl.zeros((BLOCK_F, BLOCK_T), dtype=tl.int32)
+    for _ in range(0, D // BLOCK_K):
+        xt = tl.load(x_ptrs)
+        acc_g = tl.dot(tl.load(g_ptrs), xt, acc_g, out_dtype=tl.int32)
+        acc_u = tl.dot(tl.load(u_ptrs), xt, acc_u, out_dtype=tl.int32)
+        g_ptrs += BLOCK_K
+        u_ptrs += BLOCK_K
+        x_ptrs += BLOCK_K
+    live = rt < tokens
+    s_tok = tl.load(x_scale_ptr + rt, mask=live, other=0.0)
+    g = acc_g.to(tl.float32)
+    u = acc_u.to(tl.float32)
+    g = g * tl.load(w_scale_ptr + row_g)[:, None] * s_tok[None, :]
+    u = u * tl.load(w_scale_ptr + row_u)[:, None] * s_tok[None, :]
+    if K:
+        kk = tl.arange(0, K)
+        xkt = tl.trans(tl.load(xk_ptr + rt[:, None].to(tl.int64) * K + kk[None, :],
+                               mask=live[:, None], other=0.0))
+        wg = tl.load(wk_ptr + row_g[:, None].to(tl.int64) * K + kk[None, :])
+        wu = tl.load(wk_ptr + row_u[:, None].to(tl.int64) * K + kk[None, :])
+        g = g + tl.dot(wg, xkt, input_precision="ieee")
+        u = u + tl.dot(wu, xkt, input_precision="ieee")
+    g = g.to(gate_up_ptr.dtype.element_ty)
+    u = u.to(gate_up_ptr.dtype.element_ty)
+    dest = feat[:, None].to(tl.int64) * tokens + rt[None, :]
+    tl.store(gate_up_ptr + dest, g, mask=live[None, :])
+    tl.store(gate_up_ptr + inter.to(tl.int64) * tokens + dest, u, mask=live[None, :])
+    h = _silu_mul_tc(g.to(tl.float32), u.to(tl.float32))
+    tl.store(hidden_ptr + dest, h.to(gate_up_ptr.dtype.element_ty), mask=live[None, :])
+
+
+# (BLOCK_F, BLOCK_T, BLOCK_K, num_warps, GROUP_F) of tc_int8_gate_up_kernel
+GATE_UP_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_GU_CFG", "64x128x64x4x8")))
+
+
+def int8_gate_up(w, s_w, x_q, s_x, inter, chunk, half, w_k=None, x_k=None, gate_up=None,
+                 hidden=None, cfg=GATE_UP_CFG):
+    """int8_fwd.gate_up_forward's products and epilogue (MODE "gu") in one launch: w (2I, D) int8
+    interleaved by chunk, s_w (2I,), x_q (tokens, D) int8, s_x (tokens,), optional top-k w_k (2I, K)
+    and x_k (tokens, K) fp32. Returns ((gate|up) (2I, tokens), silu(gate) * up (I, tokens)) in half."""
+    install()
+    bf, bt, bk, warps, group = cfg
+    tokens, d = x_q.shape
+    device = x_q.device
+    if gate_up is None:
+        gate_up = torch.empty((2 * inter, tokens), dtype=half, device=device)
+    if hidden is None:
+        hidden = torch.empty((inter, tokens), dtype=half, device=device)
+    k = 0 if w_k is None else w_k.shape[1]
+    dummy = s_x[:1]
+    tc_int8_gate_up_kernel[(inter // bf * triton.cdiv(tokens, bt),)](
+        w, x_q, s_w, s_x, gate_up, hidden, x_k if k else dummy, w_k if k else dummy, inter, tokens,
+        chunk, d, BLOCK_F=bf, BLOCK_T=bt, BLOCK_K=bk, GROUP_F=group, K=k, num_warps=warps,
+        num_stages=1)
+    return gate_up, hidden
+
+
+def int8_gate_up_usable(inter, d, chunk, cfg=GATE_UP_CFG):
+    return chunk % cfg[0] == 0 and inter % chunk == 0 and d % cfg[2] == 0
 
 
 def _grid(M, N, bm, bn):
