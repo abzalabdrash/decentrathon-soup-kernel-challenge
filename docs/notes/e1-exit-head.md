@@ -37,7 +37,26 @@ save and Soup's summary. EXIT_NOGC disables the collector at the same point (Py_
 collection is then skipped; the module teardown runs as always). `solution/__init__.py`: one `if`
 wiring the switch (orchestrator: please note).
 
-Results: TODO (soup-e1-exit2: sol / rel / relgc).
+Results (T4, soup-e1-exit2, commit 10e9308, ABBA 2 runs each + a warm run; seconds):
+
+| stage | defaults | EXIT_RELEASE=1 | + EXIT_NOGC=1 |
+|---|---:|---:|---:|
+| Trainer.train end -> main() end | 0.48 | 0.47 | 0.46 |
+| atexit callbacks | 0.09 | 0.07 | 0.07 |
+| Python finalization (of it gc) | 0.13 (0.044) | 0.12 (0.044) | 0.10 (0) |
+| C-level exit | 0.26 | 0.25 | 0.26 |
+| kernel teardown | 0.88 | 0.36 | 0.34 |
+| **train end -> process end** | **1.84** | **1.27 (-0.57)** | **1.22 (-0.61)** |
+
+The release thread takes 0.50-0.53 s (2,560 MiB of slabs freed, 1,090 MiB unregistered) and is done
+before main() returns (the interpreter's join of it waits 0.0 ms); the main thread's own tail is not
+slower (0.48 -> 0.46 s). Our kernel teardown is now at the base's (0.32 s in soup-e1-exit1). Wall in
+that session: 47.7 / 48.6 / 48.5 s, i.e. inside the session's loop noise (loop 28.5-30.5 s); the
+exit stages are what this switch changes and they are measured directly. What is left above the base:
+~30 ms in torch.library's own finalizers (the base has the same 234-246 `_del_library` callbacks, 12 ms
+there; left alone), and the post-train work (+0.1 s: the harness reads back ~41k CUDA event pairs of
+our kernels' launches). `SOUP_SOLUTION_EXIT_RELEASE=all` also returns the caching allocator's free
+GPU blocks on the thread (148 MiB locally, aimed at the 0.25 s C-level exit); not measured on the T4.
 
 ## Part B: the head's bytes (SOUP_SOLUTION_HEAD_PACK=1, off by default)
 
