@@ -139,3 +139,13 @@ session as the save tail (`soup-e1-tail1`, account 3, commit e4b9f3c, variant `h
 `docs/notes/save-tail.md` for how to fetch it). Merge rule: >= 0.1 s in that session, peak unchanged
 (371 MiB), bitwise (tested locally). To turn it on: `os.environ.setdefault("SOUP_SOLUTION_NORM_HALF", "1")`
 in `apply()`; its two consumer lines in fused_proj.py may conflict with C1's edits (only those lines).
+
+NORM_HALF in soup-e1-tail1 (variant `half`, positions 3 and 4 of the ABBA): steps 3+ 25.83 / 26.28 s
+against base 23.44 / 26.87 and once (no step change at all) 24.63 / 27.18: the session's drift
+(+3.4 s from the first to the last base run, concave) is 10-30x the expected effect, so the wall says
+nothing; peak 371 MiB, reserved 250, allocated 225.5 as base; rms_norm_rows_fwd_half launched in both
+half runs (check 3). Per-norm cost on the T4 instead: `solution.bench_norm_half` (account 3,
+soup-e1-nhb1, d79ad23, in flight; fetch with `bash tools/kaggle_win.sh 3 --attach --slug soup-e1-nhb1
+--mode bench`): norm + cast against the half-writing norm at 400-2,048 tokens, bitwise checked, and
+the step total for 1 plain + 55 fused-add norms. Laptop: 1.1 / 1.2 / 2.6 / 2.4 / 3.0 / 4.0 ms per step
+at 400 / 600 / 830 / 1,100 / 1,440 / 2,048 tokens (~0.15 s per run of GPU time).

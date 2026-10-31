@@ -40,15 +40,30 @@ equal), so the replayed files are what the original would write.
 
 ## T4
 
-In flight (31 Oct ~12:45 Astana): Kaggle account 3 (slerfas), kernel `soup-e1-tail1`, commit e4b9f3c
-(= main d2ab23e+ merged), `--mode variants` ABBA 2 rounds + warm run: `base:` / `once:SOUP_SOLUTION_SAVE_ONCE=1`
-/ `half:SOUP_SOLUTION_NORM_HALF=1`. Fetch without a slot:
-`bash tools/kaggle_win.sh 3 --attach --slug soup-e1-tail1 --mode variants`. What to read: per run
-`phase train end` minus (`phase first step begin` + metrics.json `train_loop_s`) = the save tail (last
-step end -> SFTTrainerWrapper.train return, which holds all three tokenizer saves); `phase exit` minus
-`phase train end`; the wall; and the exit line `[solution] save tail: tokenizer written 1x ..., replayed
-2x ...; adapter saved 2x in N ms` (the adapter saves are only timed, never replayed). Reference
-(soup-c1-abba4, main path): save tail 0.50-0.56 s, train end -> exit 0.12-0.19 s.
+**soup-e1-tail1** (account 3 slerfas, e4b9f3c, variants ABBA 2 rounds + warm; order warm, base, once,
+half, half, once, base). Save tail = last step end -> `phase train end` (SFTTrainerWrapper.train's
+return: checkpoint save, Soup's save_model and tokenizer save):
+
+| run | wall s | steps 3+ s | save tail s | train end -> exit s | exit line |
+|---|---:|---:|---:|---:|---|
+| base_1 | 41.53 | 23.44 | 0.99 | 0.17 | |
+| once_1 | 42.54 | 24.63 | 0.92 | 0.17 | tokenizer written 1x in 166 ms, replayed 2x in 101 ms; adapter saved 2x in 122 ms |
+| half_1 | 44.50 | 25.83 | 0.99 | 0.17 | |
+| half_2 | 44.86 | 26.28 | 0.97 | 0.17 | |
+| once_2 | 45.00 | 27.18 | 0.94 | 0.17 | tokenizer written 1x in 170 ms, replayed 2x in 118 ms; adapter saved 2x in 123 ms |
+| base_2 | 45.04 | 26.87 | 1.02 | 0.18 | |
+
+All 371 MiB nvidia-smi, reserved 250 / allocated 225.5 MiB in every run, checks 3, 4, 9 pass.
+SAVE_ONCE (first version): save tail -0.075 s (0.99/1.02 -> 0.92/0.94). The wall cannot show it: this
+T4 drifted +3.4 s in steps 3+ over the session (base_1 23.44 -> base_2 26.87), far above the effect.
+The replay itself cost 50-59 ms per call (11.4 MB written on Kaggle's disk), so the second version
+leaves the third save's files in place when they are exactly the bytes the second wrote (same inode,
+mtime, size): expected about -0.13 s. A hard-link variant (-0.05 s more) was tried and dropped: an
+in-place writer of either file would change both (a test showed it).
+
+**soup-e1-save2** (account 3, d79ad23, base vs once, ABBA 2 rounds + warm): in flight; fetch with
+`bash tools/kaggle_win.sh 3 --attach --slug soup-e1-save2 --mode variants` and read the save tail as
+above (`tail_stats`: train end - (first step begin + metrics.json train_loop_s)).
 
 ## State and what is left
 
