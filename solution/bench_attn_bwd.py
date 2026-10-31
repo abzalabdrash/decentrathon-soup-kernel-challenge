@@ -114,9 +114,10 @@ def main():
     attn_bwd._STATE.update(mode="math", min_tokens=0, max_len=4096, scratch="own", scratch_mb=16)
     print(torch.cuda.get_device_name(0), torch.__version__, flush=True)
     shapes = []
-    for big in (208, 256, 320, 384, 512):
+    for big in (208, 256, 320, 384, 448, 512):
         shapes.append((f"L={big} even", [big, big - 4, big - 12, big - 20]))
-        shapes.append((f"L={big} skew", [big, int(big * 0.7), int(big * 0.5), int(big * 0.35)]))
+        # the longest row and three of the task data's median length (140 tokens)
+        shapes.append((f"L={big} +3x140", [big, 140, 140, 140]))
     # batches like the task's (row lengths: median 140, max 512)
     for lengths in ([380, 140, 120, 100], [300, 200, 150, 90], [250, 230, 180, 120], [512, 160, 120, 60],
                     [450, 300, 140, 80]):
@@ -144,6 +145,7 @@ def main():
                 em, hm, mm, bins = err, host_ms(run_m, 10), peak_mib(run_m), plan.bins
         ho, mo = host_ms(run_o, 10), peak_mib(run_o)
         print(f"{name:24s} {bounds[-1]:5d} {to:7.3f} " + " ".join(f"{t:7.3f}" for t in times)
+              + f" r2={attn_bwd.work_ratio(list(lengths), 2):4.2f}"
               + f" {ho:5.2f}/{hm:5.2f} {mo:5.1f}/{mm:5.1f}  "
               f"{eo[0]:.1e} {eo[1]:.1e} {eo[2]:.1e} | {em[0]:.1e} {em[1]:.1e} {em[2]:.1e}  {bins}"
               f"{'' if tail_zero else '  TAIL NOT ZERO'}", flush=True)
