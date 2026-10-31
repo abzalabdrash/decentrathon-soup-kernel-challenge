@@ -69,11 +69,14 @@ from .fused_ce import IGNORE_INDEX
 from .head_stream import BLOCK_D, head_finish_kernel
 
 START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "4"))
-BUILD_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_AT", "setup").strip().lower()
+# where the build thread starts: "head" (the first head; soup-h1-abba2: setup end -> train begin +0.07 s against
+# +0.35 s for "setup", the end of Soup's setup, where the thread fought the trainer build for the GIL)
+BUILD_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_AT", "head").strip().lower()
 # int8_transpose_kernel's square tile and warps: T4, one head's 38 transposes, 2.47 ms against 2.77 for 64 x 64
 # with 4 warps (soup-h1-kern1)
 T_TILE, T_WARPS = 128, 8
-QUANT_ROWS = 1024  # vocabulary rows per quantization step of the build (transient GPU memory ~10 MiB)
+QUANT_ROWS = 1024  # vocabulary rows per quantization step of the build (4.5 MiB of GPU buffers)
+QUANT_WARPS = 4
 ACC_BLOCK = 512
 # warps of the chunk kernel: T4, one head at 830 tokens, 16 warps 5.8-6.0 ms against 8.5-9.8 for 8 and 8.0-9.5
 # for 4 (soup-h1-kern1; head_stream's fp16 kernel is fastest with 8); 2-8 rows per program were slower
@@ -208,21 +211,40 @@ def head_i8_acc_kernel(acc_ptr, stride_acc, g_ptr, stride_g, alpha_ptr, sp_ptr, 
     tl.store(at, g, mask=md)
 
 
+@triton.jit
+def int8_rows_kernel(x_ptr, stride_x, col_ptr, q_ptr, stride_q, s_ptr, n_cols, BLOCK: tl.constexpr):
+    # q[row] = round(x[row] * col * 127 / absmax(x[row] * col)) in int8, s[row] = absmax / 127 (the
+    # hidden rows of a head, and the weight's rows at the build). A row with a nan gets a nan scale and
+    # one with an inf an inf scale, so its products are not finite either
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    m = offs < n_cols
+    x = tl.load(x_ptr + row.to(tl.int64) * stride_x + offs, mask=m, other=0.0).to(tl.float32)
+    x = x * tl.load(col_ptr + offs, mask=m, other=0.0)
+    amax = tl.max(tl.abs(x), axis=0)
+    nan = tl.sum((x != x).to(tl.int32), axis=0) > 0
+    inv = tl.where(amax > 0.0, 127.0 / amax, 0.0)
+    q = tl.minimum(tl.maximum(tl.floor(x * inv + 0.5), -127.0), 127.0)
+    tl.store(q_ptr + row.to(tl.int64) * stride_q + offs, q.to(tl.int8), mask=m)
+    tl.store(s_ptr + row, tl.where(nan, float("nan"), amax / 127.0))
+
+
 def _pad_rows(n):
     """Rows of an `_int_mm` operand: more than 16 and a multiple of 8."""
     return max(-(-n // 8) * 8, 24)
 
 
-def quant_rows(x, out, col=None):
-    """Per-row absmax int8 of x (n, D), times `col` (D,) per column when given, into out[:n] (rows
-    past n are left as they are): returns the fp32 scales absmax / 127. A zero row gets scale 0; a
-    non-finite row a non-finite scale."""
-    xf = x.float() if col is None else x.float() * col
-    amax = xf.abs().amax(dim=1)
-    inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
-    q = torch.floor(xf.mul_(inv[:, None]).add_(0.5)).clamp_(-127, 127)
-    out[:x.shape[0]].copy_(q)
-    return amax / 127.0
+def quant_rows(x, out, col, scales=None):
+    """Per-row absmax int8 of x (n, D) times `col` (D,) per column into out[:n] (rows past n are left
+    as they are), with int8_rows_kernel: returns the fp32 scales absmax / 127 (into `scales` when
+    given). A zero row gets scale 0; a non-finite row a non-finite scale."""
+    n, d = x.shape
+    if scales is None:
+        scales = torch.empty(n, dtype=torch.float32, device=x.device)
+    if n:
+        int8_rows_kernel[(n,)](x, x.stride(0), col, out, out.stride(0), scales, d,
+                               BLOCK=triton.next_power_of_2(d), num_warps=QUANT_WARPS)
+    return scales
 
 
 class HeadSkipInt8(Exception):
@@ -258,12 +280,11 @@ class HeadInt8:
         self.host = self._unpin = None
         self._deferred = False
         self.total_bytes = self.vocab * (self.hidden + 4)
-        self.col = self.inv_col = None
-        if smooth is not None:
-            c = smooth.detach().float().to(self.device).reshape(-1)
-            if c.numel() != self.hidden or not bool(torch.isfinite(c).all()) or not bool((c > 0).all()):
-                raise HeadSkipInt8("the smoothing vector is not a positive (D,) vector")
-            self.col, self.inv_col = c, 1.0 / c
+        self.smoothed = smooth is not None
+        c = torch.ones(self.hidden) if smooth is None else smooth.detach().float().reshape(-1)
+        if c.numel() != self.hidden or not bool(torch.isfinite(c).all()) or not bool((c > 0).all()):
+            raise HeadSkipInt8("the smoothing vector is not a positive (D,) vector")
+        self.col, self.inv_col = c.to(self.device), (1.0 / c).to(self.device)
 
     def chunk(self, c):
         """(first row, rows, first byte, bytes) of chunk c."""
@@ -306,10 +327,10 @@ class HeadInt8:
     def _build_safely(self):
         started = time.perf_counter()
         try:
-            self.build()
             began = time.perf_counter()
             warm_kernels(self)
             self.times["compile"] = time.perf_counter() - began
+            self.build()
             self.ready = True
         except Exception as exc:  # noqa: BLE001 - an optimisation must not break the run
             self.error = f"{type(exc).__name__}: {exc}"
@@ -318,14 +339,17 @@ class HeadInt8:
             t = self.times
             self.log(f"[solution] head int8: {self.vocab} x {self.hidden} in {self.n_chunks} chunks of "
                      f"{self.rows} rows ({self.total_bytes / 2**20:.0f} MiB pinned, per-row scales, smoothing "
-                     f"{'on' if self.col is not None else 'off'}) in {self.seconds:.2f} s (pinning "
-                     f"{t.get('pin', 0):.2f}, quantization {t.get('quant', 0):.2f}, compilation "
-                     f"{t.get('compile', 0):.2f}), ready after {self.calls} heads; heads from number "
+                     f"{'on' if self.smoothed else 'off'}) in {self.seconds:.2f} s (compilation "
+                     f"{t.get('compile', 0):.2f}, pinning {t.get('pin', 0):.2f}, quantization "
+                     f"{t.get('quant', 0):.2f}), ready after {self.calls} heads; heads from number "
                      f"{START_HEADS + 1} on")
         elif not self._stop.is_set():
             self.log(f"[solution] head int8 off: {self.error}")
 
     def build(self):
+        """The int8 copy, QUANT_ROWS vocabulary rows at a time: the fp16 rows to the GPU, int8_rows_kernel,
+        the int8 rows and their scales back into the pinned buffer, all queued on a stream of its own (the
+        training's queue is not waited for, nor the GIL held while the GPU works) and waited for once."""
         from .weight_stream import pinned_host_buffer
 
         torch.cuda.set_device(self.device)
@@ -333,27 +357,36 @@ class HeadInt8:
         host, unpin = pinned_host_buffer(self.total_bytes, self)
         self.times["pin"] = time.perf_counter() - began
         began = time.perf_counter()
-        dev = self.device
-        # the default stream: the blocks allocated here go back to the pool training allocates from
-        stream = torch.cuda.default_stream(dev)
+        dev, d, r = self.device, self.hidden, QUANT_ROWS
+        # allocated on the training's stream (its pool takes them back) and freed only after the build
+        # stream is synchronized, so no record_stream is needed
+        w = torch.empty(r, d, dtype=self._source.dtype, device=dev)
+        q = torch.empty(r, d, dtype=torch.int8, device=dev)
+        sc = torch.empty(r, dtype=torch.float32, device=dev)
+        stream = torch.cuda.Stream(device=dev)
+        stream.wait_stream(torch.cuda.current_stream(dev))
         with torch.cuda.stream(stream), torch.no_grad():
             for c in range(self.n_chunks):
                 if self._stop.is_set():
-                    unpin()
-                    raise HeadSkipInt8("stopped")
-                c0, vc, b0, nb = self.chunk(c)
-                out = torch.empty(nb, dtype=torch.uint8, device=dev)
-                q = out[:vc * self.hidden].view(torch.int8).view(vc, self.hidden)
-                scales = out[vc * self.hidden:].view(torch.float32)
-                for r0 in range(0, vc, QUANT_ROWS):
-                    r1 = min(r0 + QUANT_ROWS, vc)
-                    w = self._source[c0 + r0:c0 + r1].to(dev, non_blocking=True)
-                    scales[r0:r1] = quant_rows(w, q[r0:r1], self.col)
-                if not bool(torch.isfinite(scales).all()):
-                    unpin()
-                    raise HeadSkipInt8(f"chunk {c}: a non-finite weight row")
-                host[b0:b0 + nb].copy_(out)  # synchronous: the pinned bytes are final after it
+                    break
+                c0, vc, b0, _ = self.chunk(c)
+                q_host = host[b0:b0 + vc * d].view(torch.int8).view(vc, d)
+                s_host = host[b0 + vc * d:b0 + vc * (d + 4)].view(torch.float32)
+                for r0 in range(0, vc, r):
+                    n = min(r, vc - r0)
+                    w[:n].copy_(self._source[c0 + r0:c0 + r0 + n], non_blocking=True)
+                    quant_rows(w[:n], q, self.col, sc[:n])
+                    q_host[r0:r0 + n].copy_(q[:n], non_blocking=True)
+                    s_host[r0:r0 + n].copy_(sc[:n], non_blocking=True)
             stream.synchronize()
+        if self._stop.is_set():
+            unpin()
+            raise HeadSkipInt8("stopped")
+        scales = [host[b0 + vc * d:b0 + vc * (d + 4)].view(torch.float32)
+                  for _, vc, b0, _ in (self.chunk(c) for c in range(self.n_chunks))]
+        if not all(bool(torch.isfinite(x).all()) for x in scales):
+            unpin()
+            raise HeadSkipInt8("a non-finite weight row")
         self.times["quant"] = time.perf_counter() - began
         self.host, self._unpin = host, unpin
 
@@ -449,7 +482,7 @@ class HeadInt8:
         )
         if n_lab == 0:
             acc.zero_()
-        elif self.inv_col is not None:
+        elif self.smoothed:
             acc[:n_lab].mul_(self.inv_col)  # dL/dh = sum_v g_v (W_v * c) / c
 
     def _finish(self, st, compute):
@@ -473,7 +506,7 @@ def _join_at_exit(ref):
 
 
 def warm_kernels(obj=None):
-    """Compiles the three kernels for the classes the head launches (in the build thread)."""
+    """Compiles the four kernels for the classes the head launches (in the build thread)."""
     from .warmup import HIDDEN, compile_kernel, training_half_dtype
 
     half, f32, i8, i32, i64 = training_half_dtype(), torch.float32, torch.int8, torch.int32, torch.int64
@@ -488,3 +521,6 @@ def warm_kernels(obj=None):
     compile_kernel(head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK,
                    num_warps=4)
     compile_kernel(int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)
+    # the hidden rows (stride 1536) and, at the build, the weight's rows (fp16 on the T4, as the hidden rows)
+    compile_kernel(int8_rows_kernel, half, hidden, f32, i8, hidden, f32, hidden,
+                   BLOCK=triton.next_power_of_2(hidden), num_warps=QUANT_WARPS)

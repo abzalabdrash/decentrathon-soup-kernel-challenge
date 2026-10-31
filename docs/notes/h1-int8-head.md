@@ -62,6 +62,33 @@ transpose, so the transpose stays. Chunk kernel sweep (soup-h1-kern1): 16 warps 
 8.5-12.6 for 8; R rows per program (2-8) and the reduction-free P scale (PBOUND) not better; transpose
 128 x 128 with 8 warps 2.47 vs 2.77 ms.
 
+After the kernel changes (2e5e2ac: 16-warp chunk kernel, 128 x 128 transpose; hidden rows shaped like the
+final norm's output, gamma * randn, so the smoothing sees what it sees in training), soup-h1-bench3, ring of 2:
+
+| N / labelled | fp16 | int8 | delta | head memory fp16 -> int8 | int8 vs fp16: loss / entropy |
+|---|---:|---:|---:|---|---|
+| 512 / 158 | 41.3 | 20.3 | -21.0 | 29.8 -> 23.8 MiB | +0.036 % / -0.050 % |
+| 512 / 308 | 41.3 | 20.3 | -21.0 | 30.7 -> 27.6 | +0.031 % / -0.050 % |
+| 830 / 250 | 41.7 | 23.7 | -17.9 | 32.7 -> 26.7 | -0.007 % / -0.035 % |
+| 830 / 504 | 41.9 | 30.4 | -11.6 | 35.4 -> 31.9 | +0.007 % / -0.035 % |
+| 1440 / 434 | 50.8 | 43.1 | -7.7 | 39.5 -> 34.4 | -0.014 % / +0.008 % |
+| 1440 / 861 | 62.3 | 52.1 | -10.2 | 43.6 -> 39.5 | -0.001 % / +0.008 % |
+| 2048 / 600 | 67.0 | 55.7 | -11.3 | 45.3 -> 42.6 | -0.010 % / +0.009 % |
+| 2048 / 1238 | 83.9 | 65.2 | -18.8 | 51.7 -> 46.3 | -0.007 % / +0.009 % |
+
+Compute alone (every chunk resident) the int8 head is +1..+2.8 ms slower up to 830 tokens and 0..-5.8 ms faster
+above: the gain is the halved PCIe (and the copies' smaller drag on the GEMMs), not the IMMA GEMMs, whose saving the
+chunk kernel (int32 logits and the scales: 1.5x the fp16 kernel), the transpose (2.5 ms) and the accumulation
+(0.4-2.5 ms) take back. Build in the thread: pinning 0.09 s, quantization 0.21 s, compilation of the three kernels
+1.22 s (bench process; 5.6 s inside a training run with five kernels in soup-h1-abba1, hence three kernels and the
+switch at head 5).
+
+The side-stream transpose (removed): no faster, and it raced at a head's start (its first transpose waited only for
+the copy, not for the compute work still using the reused buffer: a wrong loss at 2048 tokens in soup-h1-bench2).
+
 ## In training
 
-(pending: soup-h1-abba1, soup-h1-bench2)
+soup-h1-abba1 (e50b06b: 8-warp chunk kernel, 64 x 64 transpose, five kernels compiled in the thread at setup end,
+switch at head 3; peagverr, ABBA 2 rounds + warm): fp16 47.10 s / steps 3+ 26.32 / step 0 0.503; int8 47.97 /
+26.52 / 0.632; peak 395 MiB both; own kernels 17.1 -> 20.2 %. The thread took 5.58 s in training and finished at
+step 2 (head 3 waited for it); setup end -> train begin 3.89 -> 4.23 s. No gain with those kernels.

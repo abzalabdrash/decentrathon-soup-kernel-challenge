@@ -58,13 +58,13 @@ def _run(streamer, int8, h16, t, n_lab, grad_scale):
 
 
 def _reference(h16, t, n_lab, grad_scale, q, sv, col=None):
-    """The int8 head's math in fp64: per-token int8 hidden (of h / col), int32-exact products, fp64
-    softmax; dL/dh divided by col."""
-    x = h16.float() if col is None else h16.float() / col
-    amax = x.abs().amax(1)
-    inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
-    hq = torch.floor(x * inv[:, None] + 0.5).clamp(-127, 127)
-    sh = (amax / 127.0).double()
+    """The int8 head's math in fp64 from the head's own per-token quantization of h / col (quant_rows,
+    checked on its own below): int32-exact products, fp64 softmax; dL/dh divided by col."""
+    from solution.head_int8 import quant_rows
+
+    inv = torch.ones(D, device="cuda") if col is None else 1.0 / col
+    hq = torch.empty(h16.shape, dtype=torch.int8, device="cuda")
+    sh = quant_rows(h16, hq, inv).double()
     logits = (hq.double() @ q.double().t()) * sh[:, None] * sv.double()[None, :]
     lse = torch.logsumexp(logits, 1)
     p = torch.softmax(logits, 1)
@@ -80,6 +80,24 @@ def _reference(h16, t, n_lab, grad_scale, q, sv, col=None):
     if col is not None:
         dh = dh / col.double()
     return loss, entropy, correct, dh, logits
+
+
+def test_quant_rows_against_torch():
+    from solution.head_int8 import quant_rows
+
+    torch.manual_seed(1)
+    x = (torch.randn(300, D, device="cuda") * torch.rand(300, 1, device="cuda") * 5).half()
+    x[7] = 0
+    col = torch.rand(D, device="cuda") + 0.5
+    q = torch.empty(300, D, dtype=torch.int8, device="cuda")
+    s = quant_rows(x, q, col)
+    xf = x.float() * col
+    amax = xf.abs().amax(1)
+    assert torch.allclose(s, amax / 127, rtol=1e-6, atol=0)
+    expect = torch.floor(xf * torch.where(amax > 0, 127 / amax, 0)[:, None] + 0.5).clamp(-127, 127)
+    assert (q.float() - expect).abs().max().item() <= 1  # the kernel's division may round a half the other way
+    assert (q.float() == expect).float().mean().item() > 0.999
+    assert s[7] == 0 and not q[7].any()
 
 
 def test_int8_copy_matches_the_weight(streamed):
