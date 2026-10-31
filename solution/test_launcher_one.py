@@ -143,3 +143,18 @@ def test_switch_off_by_default(monkeypatch):
     assert not launcher_one.enabled()
     monkeypatch.setenv("SOUP_SOLUTION_LAUNCHERS_ONE", "1")
     assert launcher_one.enabled()
+
+
+def test_probe_takes_the_kernel_modules_warmups_only():
+    import functools
+
+    from solution import fused_proj, head_stream, warmup as warmup_module
+
+    assert launcher_one.probe_safe(warmup_module.warm_rmsnorm_fwd)
+    assert launcher_one.probe_safe(fused_proj._warm_masked_pair_sum)
+    assert launcher_one.probe_safe(functools.partial(head_stream._warm_kernels, 4096))
+
+    def elsewhere():
+        pass
+
+    assert not launcher_one.probe_safe(elsewhere)  # this module: not one of the kernel modules

@@ -72,16 +72,20 @@ def _key(text):
 
 # ---------------------------------------------------------------- the probe
 
+# the modules whose warm-up registrations only compile (compile_kernel with dtypes and sizes: nothing
+# allocated, launched or drawn), so running one once more in the probe changes nothing
+COMPILE_ONLY_MODULES = frozenset(f"solution.{name}" for name in (
+    "warmup", "rmsnorm", "nf4", "rope", "swiglu", "fused_ce", "fused_proj", "head_stream", "head_pack", "int8_bwd"))
+
+
 def probe_safe(fn):
-    """Whether the probe may run the registration `fn` once more: the warm-ups of the solution's own
-    kernel modules only compile (compile_kernel); a registration from anywhere else may do more."""
+    """Whether the probe may run the registration `fn` once more: a warm-up defined in one of
+    COMPILE_ONLY_MODULES (cublas and step_ops, which launch, are left out by warmup.py)."""
     import functools
 
     while isinstance(fn, functools.partial):
         fn = fn.func
-    module = getattr(fn, "__module__", "") or ""
-    leaf = module.rsplit(".", 1)[-1]
-    return module.startswith("solution.") and not leaf.startswith(("test_", "bench_"))
+    return (getattr(fn, "__module__", "") or "") in COMPILE_ONLY_MODULES
 
 
 def probe_sources(registrations):
