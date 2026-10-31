@@ -199,8 +199,8 @@ def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
     state[0] = 2.0
     state[1] = 1.0
     idx = torch.zeros(n, dtype=torch.int32, device=dev)
-    idx2 = torch.zeros(n, dtype=torch.int32, device=dev)
-    best2 = torch.zeros(n, device=dev)
+    cidx = torch.zeros(n_lab, 64, dtype=torch.int32, device=dev)
+    cmax = torch.zeros(n_lab, 64, device=dev)
     pq = torch.empty(n_lab, rows, dtype=torch.int8, device=dev)
     asp = torch.empty(2, n_lab, device=dev)
     q = torch.randint(-127, 127, (rows, d), dtype=torch.int8, device=dev, generator=gen)
@@ -221,8 +221,10 @@ def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
     def one(w):
         for _ in range(chunks):
             head_i8_chunk_kernel[(n,)](l32, rows, 0, pq, rows, sh, sv, targets, m, s_, e, best, xt, idx,
-                                       best2, idx2, asp[0], asp[1], q, d, wt, d, 0, 0, rows, n_lab, d,
-                                       IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, num_warps=w)
+                                       cmax, cidx, 64, 1, asp[0], idx[:n_lab], asp[0], asp[1], q, d, wt, d, 0, 0,
+                                       rows, n_lab, d,
+                                       IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, RUNNER_UP=True,
+                                       num_warps=w)
 
     for w in (8, 16):
         res[f"fp16 kernel w{w}"] = _timed(lambda: fp16(w), reps)

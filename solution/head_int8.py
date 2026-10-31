@@ -130,7 +130,7 @@ def enabled():
     return _STATE["on"]
 
 
-@triton.jit(do_not_specialize=["row0", "first", "c0", "vc", "n_lab"])
+@triton.jit(do_not_specialize=["row0", "chunk", "first", "c0", "vc", "n_lab"])
 def head_i8_chunk_kernel(
     l32_ptr, stride_l, row0,  # int32 (block rows, vc): this chunk's logits for rows row0 + i
     pq_ptr, stride_pq,  # int8 (n_lab, vc): P quantized, labelled rows
@@ -138,13 +138,14 @@ def head_i8_chunk_kernel(
     targets_ptr,  # int64 (rows,): target token id or IGNORE
     m_ptr, s_ptr, e_ptr, best_ptr, xt_ptr,  # fp32 (rows,): running max, sum, entropy sum, best, x_t
     idx_ptr,  # int32 (rows,): running argmax
-    best2_ptr, idx2_ptr,  # fp32, int32 (n_lab,): the running runner-up (head_i8_rescore_kernel)
+    cmax_ptr, cidx_ptr, stride_c, chunk,  # fp32, int32 (n_lab, chunks): each chunk's max (the rescoring)
+    sec_ptr, sec_idx_ptr,  # fp32, int32 (n_lab,): the runner-up inside the chunk that holds the running top
     alpha_ptr, sp_ptr,  # fp32 (n_lab,): exp(m_old - m_new) and P's scale for this chunk
     q_ptr, stride_q,  # int8 (vc, D): the chunk of Q on the GPU
     wt_ptr, stride_wt,  # half (n_lab, D): W_q[target], written by the chunk that holds the target
     first, c0, vc, n_lab, D,  # first: 1 for the vocabulary's first chunk (a runtime flag: one compile)
     IGNORE: tl.constexpr, BLOCK: tl.constexpr, BLOCK_D: tl.constexpr,
-    RUNNER_UP: tl.constexpr,  # keep the runner-up (only for head_i8_rescore_kernel)
+    RUNNER_UP: tl.constexpr,  # keep the chunk's max for head_i8_rescore_kernel's runner-up
 ):
     row = row0 + tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -175,7 +176,7 @@ def head_i8_chunk_kernel(
         best = tl.load(best_ptr + row)
         best_idx = tl.load(idx_ptr + row)
         x_t = tl.load(xt_ptr + row)
-    best_old, idx_old = best, best_idx
+    best_old = best
     m_new = tl.maximum(m_old, c_max)
     alpha = tl.exp(m_old - m_new)
     p = tl.exp(x - m_new)
@@ -198,23 +199,18 @@ def head_i8_chunk_kernel(
         tl.store(pq_ptr + row.to(tl.int64) * stride_pq + offs, pq, mask=mask)
         tl.store(sp_ptr + row, u_max / 127.0)
         tl.store(alpha_ptr + row, alpha)
-        # the runner-up: the chunk's second largest, merged with the running two (earlier ids win ties)
+        # the runner-up of head_i8_rescore_kernel: each chunk's max (the best of the other chunks), and the
+        # second of the chunk that takes over the running top (the one that holds the top at the end), a
+        # second reduction only there, a few chunks of the 38 (in every chunk it cost 1.3-2.5 ms per head
+        # on the T4; without it a runner-up in the top's own chunk was missed: accuracy gap 0.24 % vs 0.04)
         if RUNNER_UP:
-            x2 = tl.where(offs == c_idx, -float("inf"), x)
-            c_max2, c_idx2 = tl.max(x2, axis=0, return_indices=True, return_indices_tie_break_left=True)
-            b2 = -float("inf")
-            i2 = 0
-            if first == 0:
-                b2 = tl.load(best2_ptr + row)
-                i2 = tl.load(idx2_ptr + row)
-            up = c_max > best_old
-            keep_v = tl.where(up, best_old, b2)
-            keep_i = tl.where(up, idx_old, i2)
-            new_v = tl.where(up, c_max2, c_max)
-            new_i = tl.where(up, c0 + c_idx2, c0 + c_idx)
-            take = new_v > keep_v
-            tl.store(best2_ptr + row, tl.where(take, new_v, keep_v))
-            tl.store(idx2_ptr + row, tl.where(take, new_i, keep_i))
+            tl.store(cmax_ptr + row.to(tl.int64) * stride_c + chunk, c_max)
+            tl.store(cidx_ptr + row.to(tl.int64) * stride_c + chunk, c0 + c_idx)
+            if c_max > best_old:
+                x2 = tl.where(offs == c_idx, -float("inf"), x)
+                c_max2, c_idx2 = tl.max(x2, axis=0, return_indices=True, return_indices_tie_break_left=True)
+                tl.store(sec_ptr + row, c_max2)
+                tl.store(sec_idx_ptr + row, c0 + c_idx2)
         if hit:
             q_row = q_ptr + t_local * stride_q
             wt_row = wt_ptr + row.to(tl.int64) * stride_wt
@@ -229,14 +225,17 @@ def head_i8_chunk_kernel(
 def head_i8_rescore_kernel(
     h_ptr, stride_h,  # half (n, D): the hidden rows (labelled first)
     w_ptr, stride_w,  # half (V, D): the exact weight in pinned host memory, read over PCIe (mapped)
-    targets_ptr, idx_ptr, idx2_ptr, best_ptr, best2_ptr, xt_ptr,  # the int8 pass's top two and target
+    targets_ptr, idx_ptr, best_ptr, xt_ptr,  # the int8 pass's top and the target's logit
+    cmax_ptr, cidx_ptr, stride_c, n_chunks,  # fp32, int32 (n_lab, chunks): each chunk's max
+    sec_ptr, sec_idx_ptr,  # fp32, int32 (n_lab,): the runner-up inside the top's own chunk
     m_ptr, s_ptr,  # fp32 (n,): the int8 pass's max and sum (its lse)
     correct_ptr, loss_ptr,  # int32 (n,): rewritten for the rows rescored; fp32 (n,): corrected (FIX_LOSS)
     delta, n_lab, D,
-    BLOCK_D: tl.constexpr, FIX_LOSS: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_C: tl.constexpr, FIX_LOSS: tl.constexpr,
 ):
     # TRL's accuracy is argmax(logits) == label; int8 logits flip near-ties (1-2 % of the labelled rows
-    # on real hidden states). A labelled row whose int8 top two, or its top and its target, are less
+    # on real hidden states). The runner-up is the best of the other chunks' maxima. A labelled row
+    # whose int8 top two, or its top and its target, are less
     # than delta apart takes the exact logits of these (at most three) tokens: fp16 weight rows from the
     # host copy, the fp16 hidden row, an fp32 dot rounded to fp16 as the base's fp16 GEMM output, the
     # first id among equal values as torch.argmax. FIX_LOSS (every labelled row): the loss to first
@@ -245,9 +244,19 @@ def head_i8_rescore_kernel(
     row = tl.program_id(0)
     t = tl.load(targets_ptr + row).to(tl.int32)
     a1 = tl.load(idx_ptr + row)
-    a2 = tl.load(idx2_ptr + row)
     b1 = tl.load(best_ptr + row)
-    b2 = tl.load(best2_ptr + row)
+    oc = tl.arange(0, BLOCK_C)
+    mc = oc < n_chunks
+    cm = tl.load(cmax_ptr + row.to(tl.int64) * stride_c + oc, mask=mc, other=-float("inf"))
+    ci = tl.load(cidx_ptr + row.to(tl.int64) * stride_c + oc, mask=mc, other=0)
+    cm = tl.where(ci == a1, -float("inf"), cm)  # the top token's own chunk
+    b2, j = tl.max(cm, axis=0, return_indices=True, return_indices_tie_break_left=True)
+    a2 = tl.sum(tl.where(oc == j, ci, 0), axis=0)
+    s2 = tl.load(sec_ptr + row)
+    i2 = tl.load(sec_idx_ptr + row)
+    take2 = (s2 > b2) | ((s2 == b2) & (i2 < a2))
+    b2 = tl.where(take2, s2, b2)
+    a2 = tl.where(take2, i2, a2)
     x_t = tl.load(xt_ptr + row)
     near = (b1 - b2 < delta) | ((a1 != t) & (b1 - x_t < delta))
     if near | FIX_LOSS:
@@ -526,10 +535,14 @@ class HeadInt8:
         h_q = torch.empty(n_pad, d, dtype=torch.int8, device=dev)
         s_h = quant_rows(hidden16, h_q, self.inv_col)
         stride = -(-n // 4) * 4  # 16-byte aligned rows of the state, whatever n
-        state = torch.empty(6, stride, dtype=torch.float32, device=dev)
-        m, s, e, best, x_t, best2 = state
-        indices = torch.empty(2, stride, dtype=torch.int32, device=dev)
-        idx, idx2 = indices[0, :n], indices[1]
+        state = torch.empty(5, stride, dtype=torch.float32, device=dev)
+        m, s, e, best, x_t = state
+        idx = torch.empty(n, dtype=torch.int32, device=dev)
+        stride_c = triton.next_power_of_2(self.n_chunks)  # each labelled row's chunk maxima (the rescoring)
+        cmax = torch.empty(max(n_lab, 1), stride_c, dtype=torch.float32, device=dev)
+        cidx = torch.empty(max(n_lab, 1), stride_c, dtype=torch.int32, device=dev)
+        second = torch.empty(2, -(-max(n_lab, 1) // 4) * 4, dtype=torch.float32, device=dev)
+        sec_v, sec_i = second[0], second[1].view(torch.int32)
         lab = max(n_lab, 1)
         wt = torch.empty(lab, d, dtype=hidden16.dtype, device=dev)
         alpha_sp = torch.empty(2, -(-lab // 4) * 4, dtype=torch.float32, device=dev)
@@ -557,7 +570,8 @@ class HeadInt8:
             for (b0, nb), (h_b, logits) in zip(blocks, gemms):
                 torch._int_mm(h_b, q.t(), out=logits)
                 head_i8_chunk_kernel[(nb,)](
-                    logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, best2, idx2, alpha, sp,
+                    logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, cmax, cidx, stride_c, c,
+                    sec_v, sec_i, alpha, sp,
                     q, d, wt, wt.stride(0), int(c == 0), c0, vc, n_lab, d,
                     IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
                     num_warps=self.num_warps,
@@ -580,9 +594,9 @@ class HeadInt8:
         )
         if n_lab and _rescoring() and st.host.is_pinned():
             head_i8_rescore_kernel[(n_lab,)](
-                hidden16, hidden16.stride(0), st.host, st.host.stride(0), targets, idx, idx2, best, best2, x_t,
-                m, s, correct, loss, DELTA, n_lab, d, BLOCK_D=triton.next_power_of_2(d), FIX_LOSS=LOSS_FIX,
-                num_warps=4)
+                hidden16, hidden16.stride(0), st.host, st.host.stride(0), targets, idx, best, x_t,
+                cmax, cidx, stride_c, self.n_chunks, sec_v, sec_i, m, s, correct, loss, DELTA, n_lab, d,
+                BLOCK_D=triton.next_power_of_2(d), BLOCK_C=stride_c, FIX_LOSS=LOSS_FIX, num_warps=4)
         if n_lab == 0:
             acc.zero_()
         elif self.smoothed:
@@ -626,15 +640,17 @@ def warm_kernels(obj=None):
 
     # stride_l = rows of the chunk (4096 and the last 384: divisible by 16), the hidden size 1536;
     # row0, first, c0, vc, n_lab not specialized
+    stride_c = triton.next_power_of_2(obj.n_chunks if obj is not None else 38)
     timed("chunk", head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
-          f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
+          f32, i32, stride_c, 3, f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
           IGNORE=IGNORE_INDEX, BLOCK=triton.next_power_of_2(rows), BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
           num_warps=warps)
     timed("acc", head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK, num_warps=4)
     timed("transpose", int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)
     if _rescoring():
-        timed("rescore", head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, i32, f32, f32, f32,
-              f32, f32, i32, f32, 1.0, 387, hidden, BLOCK_D=triton.next_power_of_2(hidden), FIX_LOSS=LOSS_FIX,
-              num_warps=4)
+        timed("rescore", head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, f32, f32,
+              f32, i32, stride_c, 38, f32, i32, f32, f32, i32, f32, 1.0, 387, hidden,
+              BLOCK_D=triton.next_power_of_2(hidden),
+              BLOCK_C=stride_c, FIX_LOSS=LOSS_FIX, num_warps=4)
     if obj is not None:
         obj.times["kernels"] = spent
