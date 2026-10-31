@@ -62,6 +62,11 @@ other fp32 tensor is ever touched; each layer then saves two tensors (its input,
 both windows grow by one, and the input stays on the GPU after its first unpack until its last user
 (the post-attention norm, the x16 rebuild and the input norm read it in the same layer's backward).
 
+int8 (SOUP_SOLUTION_OFFLOAD_INT8, offload_int8.py, task P1): a (gate|up) whose copy offload_early
+starts is first quantized on the compute stream into one uint8 buffer (int8 values and per token and
+feature group scales, ~52 % of its bytes), and that buffer is what is copied, held while its copy runs,
+prefetched and fetched; the unpack rebuilds the half tensor from it. A handle's `codec` says so.
+
 Knobs for experiments (environment): SOUP_SOLUTION_OFFLOAD_MIN_NUMEL, SOUP_SOLUTION_OFFLOAD_INFLIGHT,
 SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). bench_offload.py
 measures time and peak of the three modes and the pinning speed of the machine.
@@ -153,6 +158,19 @@ def _is_weight(tensor):
     """A parameter, a trainable leaf or a view of one: saved by reference, offloading frees nothing."""
     base = tensor if tensor._base is None else tensor._base
     return isinstance(base, torch.nn.Parameter) or (base.requires_grad and base.grad_fn is None)
+
+
+def _made_from(saved, tensor):
+    """Whether `saved` (a handle offload_early made) is that of `tensor`'s storage: its GPU tensor
+    while the copy runs (half), or its source, alive and not written since (int8)."""
+    if saved.codec is None:
+        source = saved.gpu
+    else:
+        source = saved.source()
+        if source is None or tensor._version != saved.version:
+            return False
+    return (source is not None and source.data_ptr() == tensor.data_ptr()
+            and saved.shape == tensor.shape and saved.dtype == tensor.dtype)
 
 
 def prepin(megabytes):
@@ -277,10 +295,12 @@ class _HostStack:
 
 class _Saved:
     """What the pack hook returns for an offloaded tensor. `gpu` holds a GPU copy while the D2H is
-    in flight (the original) or after a prefetch (with `ready`, the H2D's event)."""
+    in flight (the original) or after a prefetch (with `ready`, the H2D's event). With a `codec`
+    (offload_int8.Codec) the copies hold its int8 buffer instead, `source` is a weak reference to the
+    tensor it was made from (at `version`), and the unpack decodes the buffer."""
 
     __slots__ = ("shape", "dtype", "device", "index", "slot", "host", "copied", "gpu", "ready",
-                 "home", "keep", "unpacked", "__weakref__")
+                 "home", "keep", "unpacked", "codec", "source", "version", "__weakref__")
 
     def __del__(self):
         slot = getattr(self, "slot", None)
@@ -330,23 +350,26 @@ class Offloader:
     def pack(self, tensor):
         if self.early:
             saved = self.early.pop(tensor.data_ptr(), None)
-            if (saved is not None and saved.gpu is not None
-                    and saved.gpu.data_ptr() == tensor.data_ptr()
-                    and saved.shape == tensor.shape and saved.dtype == tensor.dtype):
+            if saved is not None and _made_from(saved, tensor):
                 return saved  # the copy offload_early started for this very storage
         if _RESIDUAL["marked"]:
             saved = self._pack_marked(tensor)
             if saved is not None:
                 return saved
-        if (tensor.dtype not in HALF_DTYPES or not self.min_numel <= tensor.numel() <= MAX_NUMEL
-                or not tensor.is_cuda or not tensor.is_contiguous()):
-            return tensor
-        storage = tensor.untyped_storage()
-        if (storage.nbytes() != tensor.numel() * tensor.element_size()
-                or storage.data_ptr() in self.weight_storages or _is_weight(tensor)):
+        if not self.eligible(tensor):
             return tensor
         with self.lock:
             return self._offload(tensor)
+
+    def eligible(self, tensor):
+        """The size rule: a half CUDA tensor of min_numel to MAX_NUMEL elements owning its storage that
+        is not a weight."""
+        if (tensor.dtype not in HALF_DTYPES or not self.min_numel <= tensor.numel() <= MAX_NUMEL
+                or not tensor.is_cuda or not tensor.is_contiguous()):
+            return False
+        storage = tensor.untyped_storage()
+        return not (storage.nbytes() != tensor.numel() * tensor.element_size()
+                    or storage.data_ptr() in self.weight_storages or _is_weight(tensor))
 
     def _pack_marked(self, tensor):
         """The handle of a marked tensor (mark_offload), the tensor itself when it cannot go, or
@@ -369,32 +392,42 @@ class Offloader:
                 self.stats["residuals" if keep else "marked"] += 1
             return saved
 
-    def _offload(self, tensor):
+    def _offload(self, tensor, int8=False):
+        """`int8`: the tensor (2-D, offload_int8.applies) goes as offload_int8's buffer."""
         if tensor.device != self.device:
             return tensor
         inflight = self.inflight
         while inflight and inflight[0].copied.query():
             inflight.popleft().gpu = None
-        nbytes = tensor.numel() * tensor.element_size()
+        if int8:
+            from . import offload_int8
+
+            nbytes = offload_int8.wire_bytes(*tensor.shape)
+        else:
+            nbytes = tensor.numel() * tensor.element_size()
         slot, host = self.host.push(nbytes)
         if slot is None:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
         home = self._current()
+        # the quantization runs on home before the copy's order event: the copy reads its output
+        wire, codec = offload_int8.encode(tensor) if int8 else (tensor, None)
         self._order.record(home)
         side.wait_event(self._order)
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
-        host = host.view(tensor.dtype).view(tensor.shape)
+        host = host.view(wire.dtype).view(wire.shape)
         with self._side():
-            host.copy_(tensor, non_blocking=True)
+            host.copy_(wire, non_blocking=True)
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
         saved.slot, saved.host, saved.copied = slot, host, side.record_event()
-        saved.gpu, saved.ready, saved.home = tensor, None, home
+        saved.gpu, saved.ready, saved.home = wire, None, home
         saved.keep, saved.unpacked = False, False
+        saved.codec, saved.version = codec, tensor._version
+        saved.source = weakref.ref(tensor) if codec is not None else None
         saved.index = self.count
         self.count += 1
         self.by_index[saved.index] = saved
@@ -405,6 +438,7 @@ class Offloader:
             oldest.gpu = None
             self.stats["waited"] += 1
         self.stats["offloaded"] += 1
+        self.stats["int8"] += int8
         self.stats["bytes"] += nbytes
         return saved
 
@@ -418,7 +452,7 @@ class Offloader:
                 return tensor
             if tensor is None:
                 current.wait_event(saved.copied)
-                tensor = torch.empty(saved.shape, dtype=saved.dtype, device=saved.device)
+                tensor = torch.empty(saved.host.shape, dtype=saved.host.dtype, device=saved.device)
                 tensor.copy_(saved.host, non_blocking=True)
                 self.reads.append(current.record_event())
                 self.stats["fetched"] += 1
@@ -438,6 +472,8 @@ class Offloader:
                 except ValueError:
                     pass
                 self.stats["still_on_gpu"] += 1
+            if saved.codec is not None:  # the half tensor from the int8 buffer, on current
+                tensor = saved.codec.decode(tensor)
             if saved.keep:  # its other readers in this layer's backward get the same tensor
                 saved.gpu, saved.unpacked = tensor, True
             else:  # read: out of the prefetch window (a node unpacking several handles in
@@ -453,7 +489,7 @@ class Offloader:
             saved = self.by_index.get(j)
             if saved is None or saved.gpu is not None:
                 continue
-            tensor = torch.empty(saved.shape, dtype=saved.dtype, device=saved.device)
+            tensor = torch.empty(saved.host.shape, dtype=saved.host.dtype, device=saved.device)
             if not waited:
                 self._order.record(current)
                 side.wait_event(self._order)
@@ -482,7 +518,7 @@ class Offloader:
                 f"{(self.host.released or (0, len(self.host.slabs)))[1]} slabs ({self.host.prepinned} prepinned"
                 f"{'; released after the last step' if self.host.released else ''}); kept on GPU over the cap {s['kept']}; "
                 f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
-                f"started early {s['early']}")
+                f"started early {s['early']}, of them int8 {s['int8']}")
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
@@ -517,12 +553,18 @@ EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "1").strip().lower() not i
 
 def offload_early(tensor):
     """Starts the D2H copy of `tensor` now when the active Offloader would offload it on its pack
-    (the MLP's (gate|up), still in the custom Function's forward); the pack of the same tensor right
-    after the forward returns this handle."""
+    (the MLP's (gate|up), still in the custom Function's forward), as int8 when offload_int8 applies;
+    the pack of the same tensor right after the forward returns this handle."""
     offloader = _ACTIVE["offloader"]
     if offloader is None:
         return
-    saved = offloader.pack(tensor)
+    from . import offload_int8
+
+    if offloader.eligible(tensor) and offload_int8.applies(tensor):
+        with offloader.lock:
+            saved = offloader._offload(tensor, int8=True)
+    else:
+        saved = offloader.pack(tensor)
     if saved is not tensor:
         with offloader.lock:
             if len(offloader.early) > 8:  # never packed (no graph after all): forget them
