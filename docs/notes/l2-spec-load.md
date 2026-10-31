@@ -69,3 +69,25 @@ soup-l2-v2 (f91a66d; first step / setup end / warm-up length / waited / wall):
 - ew1 11.91 / 6.76 / 7.95 / 0.32 / 47.17
 - esw1 11.52 / 6.26 / 7.57 / 0.81 / 46.39
 - esomw1 11.65 / 6.25 / 7.68 / 0.86 / 46.54
+
+soup-l2-v3 (93574b3, a slow session; first step / setup end / tensor loop / wall):
+- base 12.01 / 7.45 / 1.97 / 46.17
+- eomt (LOAD_EARLY + LOAD_ONE_SYNC + META_INIT + TRACKER_THREAD) 12.02 / 7.22 / 1.29 / 46.13
+- seomt (+ LOAD_SPEC: 196 of 196 handed over, the loop waited 0.00 s) 11.71 / 7.01 / 1.15 / 45.89
+- pseomt (+ LOAD_PREPIN) 11.40 / 6.68 / 0.95 / 45.53: first step -0.61 s, wall -0.64 s
+- wpseomt (+ one warm-up worker) 11.65 / 6.23 / 0.77 / 45.64 (train waits 0.9 s for the warm-up)
+Peak 395 MiB, per-run checks 3, 4, 9 pass.
+
+## The warm-up's variants (do_not_specialize)
+
+The WARMUP_AUDIT (L1, soup-l1-p0) lists 16 compiled variants of 12 kernels, each launched in training.
+The four kernels with two variants differ only in constexpr flags or pointer dtypes (rms_norm_rows_fwd
+ADD and an fp32/fp16 add input, rope_qk_kernel BACKWARD, rms_norm_rows_bwd ADD_GRAD/SECOND and dtype,
+head_chunk_kernel FIRST); every int argument is in one divisible-by-16 class. No variant comes from
+specialization on token counts or strides, so `do_not_specialize` would merge nothing; merging the
+constexpr variants would mean rewriting those kernels. Costliest compiles under contention:
+rms_norm_rows_rebuild 1.50 s, nf4_dequant4 1.18, head_finish 1.02, masked_pair_sum 0.57.
+
+`SOUP_SOLUTION_WARMUP_NICE=<n>` (warmup.py `lower_thread_priority`; allowed by the organizers): the warm-up's
+worker threads and the one-build thread raise their own Linux nice value (`os.setpriority` on the thread
+id; the C compiler and ptxas they start inherit it); the main thread and the process keep theirs.
