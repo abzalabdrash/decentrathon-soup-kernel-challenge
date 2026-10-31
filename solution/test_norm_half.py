@@ -35,6 +35,8 @@ def test_half_output_is_the_cast(half_on, rows):
         assert y16.dtype == torch.float16 and version == out._version
         assert torch.equal(y16.view(torch.int16), out.to(torch.float16).view(torch.int16))
         assert rmsnorm.half_of(out, torch.float16) is y16
+        assert not hasattr(out, "_soup_half")  # handed over once
+        assert torch.equal(rmsnorm.half_of(out, torch.float16), y16)  # then the cast, same bits
     rmsnorm._HALF["on"] = False
     with torch.autocast("cuda", dtype=torch.float16):
         y_off = rmsnorm.rmsnorm(x, w, 1e-6, half=True)
@@ -48,8 +50,10 @@ def test_half_of_falls_back(half_on):
     w = torch.ones(1536, device="cuda")
     with torch.autocast("cuda", dtype=torch.float16):
         y = rmsnorm.rmsnorm(x, w, 1e-6, half=True)
-    y16 = y._soup_half[0]
     assert rmsnorm.half_of(y, torch.bfloat16).dtype == torch.bfloat16  # another dtype: the cast
+    with torch.autocast("cuda", dtype=torch.float16):
+        y = rmsnorm.rmsnorm(x, w, 1e-6, half=True)
+    y16 = y._soup_half[0]
     y.mul_(2)  # changed after the norm: its half copy is stale
     got = rmsnorm.half_of(y, torch.float16)
     assert got is not y16 and torch.equal(got, y.half())
@@ -75,8 +79,9 @@ def test_tiny_peft_model_same_bits(half_on):
         original = rmsnorm.half_of
 
         def spy(x, half, cast=True):
+            copy = getattr(x, "_soup_half", (None,))[0]
             out = original(x, half, cast)
-            taken.append(out is getattr(x, "_soup_half", (None,))[0])
+            taken.append(copy is not None and out is copy)
             return out
 
         fused_proj.half_of = spy

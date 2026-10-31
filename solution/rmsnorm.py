@@ -333,9 +333,12 @@ def _attach(y):
 
 def half_of(x, half, cast=True):
     """x in `half`: the norm's own half copy of it when it wrote one and x is unchanged since, else
-    x.to(half) (x itself when it is in `half` already, or with cast=False: the caller casts)."""
+    x.to(half) (x itself when it is in `half` already, or with cast=False: the caller casts). The
+    copy is handed over once: x lets go of it, so it lives only as long as the consumer keeps it
+    (as the cast did), not as long as x."""
     found = getattr(x, "_soup_half", None)
     if found is not None:
+        del x._soup_half
         y16, version = found
         if (y16.dtype == half and y16.shape == x.shape and version == x._version
                 and y16.device == x.device):
