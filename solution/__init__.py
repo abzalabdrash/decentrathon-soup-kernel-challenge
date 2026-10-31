@@ -44,7 +44,7 @@ SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARL
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
-SOUP_SOLUTION_EXIT_RELEASE=1 and SOUP_SOLUTION_EXIT_NOGC=1 (off by default, exit_release.py);
+SOUP_SOLUTION_EXIT_RELEASE=1 and SOUP_SOLUTION_EXIT_NOGC=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache);
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
@@ -114,6 +114,10 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
+    # E1 (docs/notes/e1-exit-head.md): pinned host memory handed back on a thread at the last step and the
+    # collector off there: train end -> process end 1.84 -> 1.08 s on the T4; SOUP_SOLUTION_EXIT_RELEASE=0 turns it off
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # not "all": no empty_cache right after the last step (check 9)
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_NOGC", "1")
     if os.environ.get("SOUP_SOLUTION_EXIT_RELEASE", "0") not in ("0", "false", "no", ""):
         from .exit_release import patch_soup_exit_release
 
