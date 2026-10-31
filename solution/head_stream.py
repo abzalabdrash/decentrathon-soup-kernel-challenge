@@ -630,12 +630,12 @@ class HeadStreamer:
 
     def start_int8(self, log=print):
         """Builds the int8 copy of the weight in a thread (head_int8.py); heads take it from START_HEADS on."""
-        from .head_int8 import HeadInt8, HeadSkipInt8
+        from .head_int8 import HeadInt8, HeadSkipInt8, smoothing
 
         if self._int8 is not None:
             return self._int8
         try:
-            self._int8 = HeadInt8(self, log=log).start()
+            self._int8 = HeadInt8(self, log=log, smooth=smoothing(self)).start()
         except HeadSkipInt8 as exc:
             log(f"[solution] head int8 off: {exc}")
         return self._int8

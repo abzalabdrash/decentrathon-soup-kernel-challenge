@@ -57,9 +57,10 @@ def _run(streamer, int8, h16, t, n_lab, grad_scale):
     return out
 
 
-def _reference(h16, t, n_lab, grad_scale, q, sv):
-    """The int8 head's math in fp64: per-token int8 hidden, int32-exact products, fp64 softmax."""
-    x = h16.float()
+def _reference(h16, t, n_lab, grad_scale, q, sv, col=None):
+    """The int8 head's math in fp64: per-token int8 hidden (of h / col), int32-exact products, fp64
+    softmax; dL/dh divided by col."""
+    x = h16.float() if col is None else h16.float() / col
     amax = x.abs().amax(1)
     inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
     hq = torch.floor(x * inv[:, None] + 0.5).clamp(-127, 127)
@@ -76,6 +77,8 @@ def _reference(h16, t, n_lab, grad_scale, q, sv):
     g = p[:n_lab].clone()
     g[torch.arange(n_lab), tt[:n_lab]] -= 1
     dh = (g @ w_q) * grad_scale
+    if col is not None:
+        dh = dh / col.double()
     return loss, entropy, correct, dh, logits
 
 
@@ -108,6 +111,43 @@ def test_int8_head_matches_int8_math(streamed, n, frac, scale):
     # dL/dh: P quantized per row and chunk (and W_q[target] rounded to fp16)
     err = (dh[:n_lab].double() - ref_dh).norm() / ref_dh.norm()
     assert err.item() < 1e-2, err.item()
+
+
+def test_smoothing_moves_the_outlier_channel(streamed):
+    """h / c and W * c: the same products, and with c large on the outlier channel the int8 loss
+    lands closer to the fp16 head's."""
+    from solution.head_int8 import HeadInt8
+
+    weight, streamer, plain = streamed
+    c = torch.ones(D, device="cuda")
+    c[7] = 4.0  # _sorted_inputs scales channel 7 by 12
+    c[100:110] = 0.5
+    smooth = HeadInt8(streamer, smooth=c).start()
+    smooth.join()
+    assert smooth.ready, smooth.error
+    h16, t, n_lab = _sorted_inputs(826, 0.6, 1.0, seed=41)
+    grad_scale = 1.0 / n_lab
+    try:
+        streamer._int8 = smooth
+        out = _run(streamer, smooth, h16, t, n_lab, grad_scale)
+    finally:
+        streamer._int8 = plain
+    q, sv = _int8_weight(smooth)
+    ref_loss, ref_entropy, _, ref_dh, _ = _reference(h16, t, n_lab, grad_scale, q, sv, col=c)
+    assert torch.allclose(out[0].double(), ref_loss, rtol=1e-4, atol=1e-4)
+    assert torch.allclose(out[1].double(), ref_entropy, rtol=1e-4, atol=1e-4)
+    assert ((out[3][:n_lab].double() - ref_dh).norm() / ref_dh.norm()).item() < 1e-2
+    plain_out = _run(streamer, plain, h16, t, n_lab, grad_scale)
+    int8_off = plain.calls
+    plain.calls = -1000
+    streamer.prefetch(826)
+    fp16 = streamer.head(h16, t, n_lab, grad_scale)
+    plain.calls = int8_off
+    lab = t != -100
+    err_plain = (plain_out[0][lab] - fp16[0][lab]).abs().mean()
+    err_smooth = (out[0][lab] - fp16[0][lab]).abs().mean()
+    assert err_smooth < err_plain
+    smooth.stop()
 
 
 def test_int8_head_close_to_the_fp16_head(streamed):

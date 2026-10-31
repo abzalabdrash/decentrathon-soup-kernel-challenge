@@ -68,6 +68,23 @@ ACC_BLOCK = 512
 FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "1024")) // 8 * 8, 24)
 
 
+def smoothing(streamer):
+    """The smoothing vector for this streamer's copy (SOUP_SOLUTION_HEAD_INT8_SMOOTH): "gamma" (default)
+    takes |gamma|^alpha of the decoder's final RMSNorm weight (frozen in this task; any positive vector
+    keeps the products exact, so a later change of it would only change the rounding), alpha from
+    SOUP_SOLUTION_HEAD_INT8_ALPHA (0.5); "none": no smoothing."""
+    mode = os.environ.get("SOUP_SOLUTION_HEAD_INT8_SMOOTH", "gamma").strip().lower()
+    weight = getattr(getattr(streamer, "norm", None), "weight", None)
+    if mode != "gamma" or not isinstance(weight, torch.Tensor) or weight.numel() != streamer.hidden:
+        return None
+    try:
+        alpha = float(os.environ.get("SOUP_SOLUTION_HEAD_INT8_ALPHA", "0.5"))
+    except ValueError:
+        alpha = 0.5
+    c = weight.detach().float().abs().clamp_min(1e-3) ** alpha
+    return c / c.mean()
+
+
 def enabled():
     from .int8_bwd import _soup_train_process
 
@@ -181,12 +198,14 @@ def _pad_rows(n):
     return max(-(-n // 8) * 8, 24)
 
 
-def quant_rows(x, out):
-    """Per-row absmax int8 of x (n, D) into out[:n] (rows past n are left as they are): returns the
-    fp32 scales absmax / 127. A zero row gets scale 0; a non-finite row a non-finite scale."""
-    amax = x.abs().amax(dim=1).float()
+def quant_rows(x, out, col=None):
+    """Per-row absmax int8 of x (n, D), times `col` (D,) per column when given, into out[:n] (rows
+    past n are left as they are): returns the fp32 scales absmax / 127. A zero row gets scale 0; a
+    non-finite row a non-finite scale."""
+    xf = x.float() if col is None else x.float() * col
+    amax = xf.abs().amax(dim=1)
     inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
-    q = torch.floor(x.float().mul_(inv[:, None]).add_(0.5)).clamp_(-127, 127)
+    q = torch.floor(xf.mul_(inv[:, None]).add_(0.5)).clamp_(-127, 127)
     out[:x.shape[0]].copy_(q)
     return amax / 127.0
 
@@ -200,7 +219,10 @@ class HeadInt8:
     thread) and the head that streams it. Chunk c of the host buffer (and of a ring slot): its
     vc x D int8 rows, then its vc fp32 scales."""
 
-    def __init__(self, streamer, log=print):
+    def __init__(self, streamer, log=print, smooth=None):
+        """`smooth`: a positive (D,) vector c: the copy holds W * c (per hidden channel) and the head
+        quantizes h / c, which moves the hidden states' outlier channels into the weight (the
+        products are the same; only the rounding changes). None: c = 1."""
         if streamer.hidden % 64 or streamer.rows % 64 or streamer.vocab % 8:
             raise HeadSkipInt8(f"shape {streamer.vocab} x {streamer.hidden}, {streamer.rows} rows per chunk")
         self.rows, self.hidden, self.vocab = streamer.rows, streamer.hidden, streamer.vocab
@@ -220,6 +242,12 @@ class HeadInt8:
         self._thread = None
         self.host = self._unpin = None
         self.total_bytes = self.vocab * (self.hidden + 4)
+        self.col = self.inv_col = None
+        if smooth is not None:
+            c = smooth.detach().float().to(self.device).reshape(-1)
+            if c.numel() != self.hidden or not bool(torch.isfinite(c).all()) or not bool((c > 0).all()):
+                raise HeadSkipInt8("the smoothing vector is not a positive (D,) vector")
+            self.col, self.inv_col = c, 1.0 / c
 
     def chunk(self, c):
         """(first row, rows, first byte, bytes) of chunk c."""
@@ -288,7 +316,7 @@ class HeadInt8:
                 for r0 in range(0, vc, QUANT_ROWS):
                     r1 = min(r0 + QUANT_ROWS, vc)
                     w = self._source[c0 + r0:c0 + r1].to(dev, non_blocking=True)
-                    scales[r0:r1] = quant_rows(w, q[r0:r1])
+                    scales[r0:r1] = quant_rows(w, q[r0:r1], self.col)
                 if not bool(torch.isfinite(scales).all()):
                     unpin()
                     raise HeadSkipInt8(f"chunk {c}: a non-finite weight row")
@@ -332,7 +360,7 @@ class HeadInt8:
         blocks = [(b0, min(FWD_ROWS, n - b0)) for b0 in range(0, n, FWD_ROWS)]
         n_pad = max(b0 + _pad_rows(nb) for b0, nb in blocks)  # every block's GEMM rows: > 16, multiple of 8
         h_q = torch.empty(n_pad, d, dtype=torch.int8, device=dev)
-        s_h = quant_rows(hidden16, h_q)
+        s_h = quant_rows(hidden16, h_q, self.inv_col)
         stride = -(-n // 4) * 4  # 16-byte aligned rows of the state, whatever n
         state = torch.empty(5, stride, dtype=torch.float32, device=dev)
         m, s, e, best, x_t = state
@@ -391,6 +419,8 @@ class HeadInt8:
         )
         if n_lab == 0:
             acc.zero_()
+        elif self.inv_col is not None:
+            acc[:n_lab].mul_(self.inv_col)  # dL/dh = sum_v g_v (W_v * c) / c
 
     def _finish(self, st, compute):
         # every copy into the ring has been waited for by the compute stream (st._acquire): freeing
