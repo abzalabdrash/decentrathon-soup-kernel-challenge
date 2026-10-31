@@ -41,7 +41,7 @@ import torch
 import triton
 import triton.language as tl
 
-from . import nf4
+from . import int8_glue, nf4
 
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_INT8_BWD", "1").strip().lower()
@@ -281,13 +281,15 @@ def usable(plan, tokens):
     return _READY.is_set()
 
 
-def mlp_backward(plan, gate_up, grad16, buffer, done=None):
+def mlp_backward(plan, gate_up, grad16, buffer, done=None, padded=None):
     """The fused MLP's backward from dL/dout (tokens, D) half and the saved (gate|up) (2I, tokens):
     returns dL/dx (tokens, D) fp32; (gate|up) is overwritten with its gradient. `buffer` is
     fused_proj's flat half buffer for one (I, D) weight (taken as int8 bytes). A uint8 `gate_up` is
     offload_int8.py's int8 form of it (offload_int8.raw): the SwiGLU backward reads that and writes
     the gradient over the int32 product of step 3 (interleaved per element: no new buffer)."""
     tokens, d = grad16.shape
+    if padded is not None:  # grad16: the unpadded gradient in its own dtype (int8_glue pads and rounds)
+        tokens = padded
     inter = plan.gate.out_features
     device = grad16.device
     i8 = buffer.view(torch.int8)
@@ -305,8 +307,11 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
             int8_in = False
         else:
             q, qs = offload_int8.views(gate_up, 2 * inter, tokens)
-    # 1. the incoming gradient per token (torch ops: a small pass, no kernel to compile)
-    g_q, s_g = _quant_rows(grad16)
+    # 1. the incoming gradient per token (int8_glue's kernel, or the torch ops)
+    if padded is not None:
+        g_q, s_g = int8_glue.quant_rows(grad16, rows=padded, half=plan.half)
+    else:
+        g_q, s_g = int8_glue.quant_rows(grad16) if int8_glue.usable(grad16) else _quant_rows(grad16)
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
@@ -336,8 +341,11 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
     inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
     inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
-    scale_gu = torch.maximum(scale_g, scale_u)
-    inv_gu = _inverse(scale_gu * 127.0)
+    if int8_glue.ON:  # kept on the layer: frozen weights
+        scale_gu, inv_gu = int8_glue.gate_up_scales(plan.gate, scale_g, scale_u, _inverse)
+    else:
+        scale_gu = torch.maximum(scale_g, scale_u)
+        inv_gu = _inverse(scale_gu * 127.0)
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
@@ -346,6 +354,8 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
         done(plan.up)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
+    if int8_glue.ON:
+        return int8_glue.dequant_rows_cols(acc_x, amax, scale_gu)
     grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])
     return grad_x
 
@@ -368,6 +378,7 @@ def _warm():
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=1, INT8_IN=False)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
+    int8_glue.warm(half, HIDDEN)
     return None
 
 

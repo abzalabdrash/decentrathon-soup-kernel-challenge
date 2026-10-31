@@ -83,7 +83,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import int8_bwd, int8_fwd, nf4, rope, weight_stream
+from . import int8_bwd, int8_fwd, int8_glue, nf4, rope, weight_stream
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -1666,7 +1666,11 @@ class _MLP(torch.autograd.Function):
             saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
         half = plan.half
         inter = plan.gate.out_features
-        grad16 = _padded_half(grad.reshape(n, grad.shape[-1]), n, padded, half)
+        flat = grad.reshape(n, grad.shape[-1])
+        # int8_glue (SOUP_SOLUTION_GLUE): the int8 backward quantizes the gradient as it comes, rounded
+        # to half and padded in its kernel: no cast and no padded copy here
+        glue = int8 and int8_glue.usable(flat, half)
+        grad16 = None if glue else _padded_half(flat, n, padded, half)
         if int8:
             # SOUP_SOLUTION_INT8_BWD=1: both input-gradient GEMMs on int8 tensor cores, the int8
             # weights in the shared buffer, (gate|up) overwritten with its gradient
@@ -1679,7 +1683,10 @@ class _MLP(torch.autograd.Function):
             # is then a no-op)
             done = ((lambda base: plan.ring.release(base, -1))
                     if plan.ring is not None and weight_stream.EARLY_RELEASE else None)
-            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer, done)[:n]
+            if glue:
+                grad_x = int8_bwd.mlp_backward(plan, saved, flat, buffer, done, padded=padded)[:n]
+            else:
+                grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer, done)[:n]
             for base in matrices:
                 plan.ring.release(base, -1)
             if ctx.x_dtype != torch.float32:

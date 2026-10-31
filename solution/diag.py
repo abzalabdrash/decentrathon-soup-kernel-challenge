@@ -36,6 +36,14 @@ TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STE
 # runtime calls with their correlation ids); with the CPU activity the traced steps run CPU-bound under
 # the profiler and the GPU's waits for copies hide behind it
 TRACE_CPU = os.environ.get("SOUP_SOLUTION_DIAG_TRACE_CPU", "1") not in ("0", "false", "no", "")
+# SOUP_SOLUTION_DIAG_STACK=1: the trace with Python stacks, and diag_stacks.log: the call stacks of the
+# torch ops behind the small elementwise launches (copies, casts, binary ops), counted (task H2)
+STACK = os.environ.get("SOUP_SOLUTION_DIAG_STACK", "0") not in ("0", "false", "no", "")
+STACK_OPS = ("aten::copy_", "aten::_to_copy", "aten::contiguous", "aten::clone", "aten::add", "aten::add_",
+             "aten::mul", "aten::mul_", "aten::div", "aten::div_", "aten::sub", "aten::where", "aten::fill_",
+             "aten::zero_", "aten::cat", "aten::index_copy_", "aten::index_select", "aten::abs", "aten::amax",
+             "aten::clamp", "aten::clamp_", "aten::floor", "aten::maximum", "aten::reciprocal", "aten::neg",
+             "aten::sum", "aten::masked_fill_", "aten::addcmul_", "aten::lerp_", "aten::sqrt")
 MAX_ENTRIES = 1_000_000
 MIB = 2 ** 20
 
@@ -114,7 +122,7 @@ class _Trace:
         from torch.profiler import ProfilerActivity, profile
 
         activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA] if TRACE_CPU else [ProfilerActivity.CUDA]
-        self.prof = profile(activities=activities, record_shapes=False, with_stack=False,
+        self.prof = profile(activities=activities, record_shapes=STACK, with_stack=STACK and TRACE_CPU,
                             profile_memory=False)
         self.prof.start()
         log(f"trace started at step {TRACE_STEPS[0]}")
@@ -123,6 +131,11 @@ class _Trace:
         if self.prof is None:
             return
         self.prof.stop()
+        if STACK:
+            try:
+                self._stacks()
+            except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the run
+                log(f"stack table failed: {exc!r}")
         name = f"diag_trace_steps{TRACE_STEPS[0]}-{TRACE_STEPS[-1]}.json"
         raw = self.directory / name
         self.prof.export_chrome_trace(str(raw))
@@ -131,6 +144,27 @@ class _Trace:
         raw.unlink()
         self.prof = None
         log(f"trace written: {raw}.gz")
+
+
+    def _stacks(self):
+        steps = max(len(TRACE_STEPS), 1)
+        rows = []
+        for evt in self.prof.key_averages(group_by_stack_n=12, group_by_input_shape=True):
+            if evt.key not in STACK_OPS:
+                continue
+            stack = [f for f in (evt.stack or []) if "solution/" in f or "transformers/" in f or "peft/" in f
+                     or "torch/nn/" in f or "torch/autograd/" in f][:8]
+            gpu_us = getattr(evt, "device_time_total", 0) or getattr(evt, "cuda_time_total", 0)
+            rows.append((evt.count / steps, gpu_us / steps, evt.key, str(evt.input_shapes)[:160], stack))
+        rows.sort(key=lambda r: -r[0])
+        path = self.directory / "diag_stacks.log"
+        with open(path, "w") as out:
+            out.write(f"torch ops per step (steps {TRACE_STEPS}), by call stack and input shapes\n")
+            for count, gpu, key, shapes, stack in rows[:150]:
+                out.write(f"\n{count:7.1f} per step, GPU {gpu / 1000:7.3f} ms  {key}  {shapes}\n")
+                for frame in stack:
+                    out.write(f"      {frame}\n")
+        log(f"stack table written: {path}")
 
 
 def make_callback():
