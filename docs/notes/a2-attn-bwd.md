@@ -36,7 +36,8 @@ attn_bwd_scatter_kernel (check_rules likeness to the example 0.31 / 0.31 / 0.69 
 ## Numerics
 
 Not bitwise (the brief allows it). Against an fp32 autograd reference (max |err| / max |ref|), random
-fp16 q/k/v/dO, 4 rows: the original path 3.4e-4 .. 9.6e-4, the math path 2.8e-4 .. 6.3e-4 (same order,
+fp16 q/k/v/dO, 4 rows (T4, below): the original path 2.9e-4 .. 7.9e-4, the math path (NB = 2) 2.5e-4 ..
+6.2e-4 (same order,
 slightly better: delta from P and dP in fp32 instead of dO . O with O rounded). Tail rows exactly zero.
 
 ## Tests (`solution/test_attn_bwd.py`, laptop)
@@ -48,6 +49,55 @@ bits as allocated scratch, chunks of 3/3/2 within 1e-3), the allocation cap, the
 original backward, dk/dv bitwise), no math call outside `varlen` or with the switch off, guards,
 warm-up compile. `test_unpad.py` 30/30 with the hook in place.
 
-## T4
+## T4: no-go
 
-(filled below)
+`solution/bench_attn_bwd.py`, T4 (peagverr, soup-e1-a2b4, f944614, 30 timed calls per entry, medians
+of CUDA-event times; one layer's backward alone: q, k, v, grad_out and the forward's out/lse given,
+so the attention recompute, which both paths run the same way, is not in the numbers). orig: unpad's
+path (k/v expansion, fmha backward, group sums); nb = 1/2/4: the math path with that many query-row
+blocks; r2: work_ratio at NB = 2; host: ms of CPU to queue one call (GPU idle); MiB: peak allocated
+above the inputs (math: scratch allocated, at most 16 MiB; in training it sits in the shared buffer).
+
+| batch (row lengths) | N | orig ms | nb=1 | nb=2 | nb=4 | r2 | host o / m2 | MiB o / m2 |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| 208, 204, 196, 188 | 800 | 0.835 | **0.779** | 0.902 | 1.143 | 1.90 | 0.18 / 0.67 | 19.3 / 18.6 |
+| 208, 3 x 140 | 640 | **0.733** | 0.757 | 0.873 | 1.076 | 2.95 | 0.17 / 0.68 | 18.7 / 17.6 |
+| 256, 252, 244, 236 | 992 | 0.912 | 1.236 | **0.687** | 1.100 | 1.61 | 0.17 / 0.63 | 22.9 / 21.9 |
+| 256, 3 x 140 | 688 | **0.501** | 0.821 | 0.668 | 1.088 | 3.16 | 0.18 / 0.63 | 19.2 / 22.7 |
+| 320, 316, 308, 300 | 1248 | **0.853** | 1.046 | 0.874 | 1.118 | 1.59 | 0.18 / 0.69 | 30.5 / 30.4 |
+| 320, 3 x 140 | 752 | **0.522** | 0.857 | 0.690 | 1.101 | 2.86 | 0.17 / 0.64 | 22.9 / 22.9 |
+| 384, 380, 372, 364 | 1504 | **0.862** | 1.542 | 1.218 | 1.111 | 1.57 | 0.19 / 1.06 | 33.4 / 30.3 |
+| 384, 3 x 140 | 816 | **0.556** | 1.096 | 0.860 | 1.176 | 3.22 | 0.18 / 0.68 | 23.4 / 29.0 |
+| 448, 444, 436, 428 | 1760 | **1.124** | 2.123 | 1.543 | 1.328 | 1.56 | 0.17 / 1.07 | 40.9 / 36.6 |
+| 448, 3 x 140 | 880 | **0.666** | 1.120 | 0.854 | 1.163 | 2.32 | 0.18 / 0.69 | 27.9 / 25.4 |
+| 512, 508, 500, 492 | 2016 | **1.309** | 2.315 | 1.994 | 2.087 | 1.55 | 0.18 / 1.57 | 44.8 / 39.9 |
+| 512, 3 x 140 | 944 | **0.682** | 1.222 | 1.153 | 1.127 | 2.45 | 0.17 / 1.08 | 29.3 / 21.9 |
+| 380, 140, 120, 100 | 752 | **0.476** | 0.884 | 0.713 | 1.123 | 2.35 | 0.17 / 0.75 | 23.9 / 20.5 |
+| 300, 200, 150, 90 | 752 | **0.494** | 0.825 | 0.732 | 1.130 | 2.87 | 0.17 / 0.77 | 23.1 / 22.8 |
+| 250, 230, 180, 120 | 784 | **0.453** | 0.751 | 0.700 | 1.098 | 2.42 | 0.17 / 0.63 | 19.5 / 22.1 |
+| 512, 160, 120, 60 | 864 | **0.583** | 1.206 | 1.162 | 1.184 | 2.57 | 0.19 / 1.13 | 27.7 / 21.6 |
+| 450, 300, 140, 80 | 976 | **0.668** | 1.630 | 1.305 | 1.170 | 3.26 | 0.17 / 1.13 | 30.3 / 28.3 |
+
+Also measured: the scores GEMM at L = 208 (8 batches of 1248 x 208 x 128) takes 0.082 ms with
+`bmm(out_dtype=float32)`, 0.126 ms as a half bmm plus a cast, 0.064 ms as a half bmm alone (so
+out_dtype works on sm_75 and is the cheaper way to fp32 scores); the row kernels' warps (1/2/4/8) move
+the whole call by under 10 % (2 kept).
+
+Verdict (the brief's rule: stop unless < 0.5 ms per layer at L ~ 208): **no-go, A2 closed.** The best
+math variant at 4 x ~200 tokens is 0.78 ms against 0.84; the original is faster on every batch shaped
+like the task's data (one long row and shorter ones: 0.45-0.68 ms against 0.70-1.30) and on every even
+batch from L = 320 up. The only wins are near-even batches of 4 x 200-256 tokens (-0.06 and -0.22 ms
+per layer), which random batches of this data almost never form (2-4 of 64 steps have even a
+longest row <= 256 at >= 600 tokens). Why: on the power-limited T4 these strided-batched GEMMs run at
+5-7 TFLOPS and cost 0.06-0.08 ms each however small, so five GEMMs per row block plus the four own
+launches put a floor of ~0.7 ms under the math path, while the fmha kernel skips the causal half and
+all padding (its time follows the sum of L^2 / 2: 0.45 ms at the data's typical batch). Queueing costs
+0.6-1.6 ms of CPU per layer against 0.18 (16-44 launches), which would also eat the GPU lag of the
+long steps. Nothing here makes the 0.5 ms target reachable without an own tensor-core kernel (review
+2, section 2.5: not the plan for today).
+
+The code stays in the branch, off by default (`SOUP_SOLUTION_ATTN_BWD=sdpa`): with the default, the
+forward's `taken` and the backward's hook return on their first comparison. Recommendation: do not
+merge the `unpad.py` hook and `attn_bwd.py` into main (no gain, more for the jury to read); this note
+and the bench numbers are the result. No full run with ATTN_BWD=math was made (the brief asked for it
+only after a passing microbench).
