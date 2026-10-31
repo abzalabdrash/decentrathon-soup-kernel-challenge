@@ -158,7 +158,7 @@ class FusedLMHeadLoss(torch.autograd.Function):
         n, d = hidden2d.shape
         labelled = targets != IGNORE_INDEX
         order = torch.argsort(labelled.to(torch.int8), descending=True, stable=True)
-        n_labelled = int(labelled.sum().item())
+        n_labelled = labelled_count(targets, labelled)
         if num_items is None:
             grad_scale = 1.0 / max(n_labelled, 1)
         else:
@@ -189,6 +189,16 @@ class FusedLMHeadLoss(torch.autograd.Function):
         if grad_loss is not None:
             grad = grad * grad_loss.to(torch.float32)
         return grad.to(ctx.in_dtype), None, None, None, None
+
+
+def labelled_count(targets, labelled):
+    """The number of rows of `targets` with a label: the host's count when the step's packed
+    targets were planned on the host (step_pipeline.py, SOUP_SOLUTION_HOST_PLAN=1), else read from
+    the GPU (a wait for everything queued before it)."""
+    from .step_pipeline import known
+
+    value = known(targets)
+    return value if value is not None else int(labelled.sum().item())
 
 
 def fused_lm_head_loss(hidden2d, weight, targets, num_items=None, chunk=DEFAULT_CHUNK):
@@ -234,7 +244,7 @@ def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK, unpad_enabled=True):
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2
 
-    from . import unpad
+    from . import step_pipeline, unpad
 
     UNPAD["enabled"] = unpad_enabled
     cls = modeling_qwen2.Qwen2ForCausalLM
@@ -254,6 +264,9 @@ def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK, unpad_enabled=True):
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
         num_items = kwargs.pop("num_items_in_batch", None)
+        known_items = step_pipeline.known(num_items)  # the host's count of the same labels
+        if known_items is not None:
+            num_items = known_items
         kwargs.pop("return_dict", None)
         b, t = labels.shape
         targets_full = shift_labels(labels.to(weight.device))
@@ -263,9 +276,24 @@ def patch_qwen2_causal_lm(chunk=DEFAULT_CHUNK, unpad_enabled=True):
                   and inputs_embeds is None and position_ids is None and past_key_values is None
                   and not use_cache and tuple(input_ids.shape) == (b, t))
         if packed:
-            ids, pos, idx, spans = unpad.pack_batch(input_ids, mask2d)
-            hidden = unpad.varlen_model_forward(self.model, ids, pos, spans)  # (1, N, D)
+            plan = step_pipeline.plan_for(input_ids, mask2d, labels)
+            if plan is None:
+                ids, pos, idx, spans = unpad.pack_batch(input_ids, mask2d)
+                hidden = unpad.varlen_model_forward(self.model, ids, pos, spans)  # (1, N, D)
+            else:
+                # the same outputs as pack_batch, made on the host; its cu_seqlens seed unpad's
+                # per-step cache, which varlen_model_forward reads for these bounds and device
+                ids, pos, idx, spans = plan.ids, plan.pos, plan.idx, plan.spans
+                saved_cu = unpad._CTX["cu"]
+                if plan.cu is not None:
+                    unpad._CTX["cu"] = (plan.bounds, plan.cu.device, plan.cu)
+                try:
+                    hidden = unpad.varlen_model_forward(self.model, ids, pos, spans)
+                finally:
+                    unpad._CTX["cu"] = saved_cu
             targets = targets_full.flatten()[idx]
+            if plan is not None:
+                step_pipeline.remember(targets, plan.n_labelled)
             past = None
         else:
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
