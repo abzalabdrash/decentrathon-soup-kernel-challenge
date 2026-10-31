@@ -124,6 +124,10 @@ def apply():
         from .diag import patch_soup_diag
 
         patch_soup_diag()  # off by default: memory marks, PCIe probe, one step's allocation history, a trace
+    if os.environ.get("SOUP_SOLUTION_CPU_PROFILE", "0") not in ("0", "false", "no", ""):
+        from .cpu_profile import patch_soup_cpu_profile
+
+        patch_soup_cpu_profile()  # off by default: the CPU side of training steps 5-12, see cpu_profile.py
     if _on("SOUP_SOLUTION_WARMUP"):
         from .warmup import patch_soup_warmup, start_background_warmup, watch_compiles
 
