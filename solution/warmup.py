@@ -114,7 +114,7 @@ import threading
 import time
 
 SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
-EXIT_TIMEOUT = 60.0  # seconds the interpreter's exit waits for the warm-up thread (see _shutdown)
+EXIT_TIMEOUT = 60.0  # join interval at exit; never finalize under a live compiler (see _shutdown)
 # threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
 # 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
@@ -147,7 +147,7 @@ _LOCK = threading.Lock()
 
 
 def _new_state():
-    return {"thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
+    return {"thread": None, "key_thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
             "errors": {}, "queue": queue.Queue(), "queued": set(), "closed": False}
 
 
@@ -229,7 +229,9 @@ def warm_cublas():
     import torch.nn.functional as F
 
     half = training_half_dtype()
-    x = torch.randn(64, 64, device="cuda", dtype=half)
+    # This runs beside Soup's seeding/model setup. A global-RNG draw here would race with its
+    # CUDA seed and change the first dropout mask depending on thread scheduling.
+    x = torch.ones(64, 64, device="cuda", dtype=half)
     F.linear(x, x, x[0]).sum().item()  # addmm with a bias: the cuBLASLt path
     (x @ x).sum().item()
 
@@ -443,7 +445,7 @@ def _setting(name, default, kind):
 
 def _shutdown():
     """At the interpreter's exit: the warm-up takes no new registration, and the exit waits for the
-    thread to finish the registration it is in (at most EXIT_TIMEOUT s). Without it, a process that
+    thread to finish the registration it is in. Without it, a process that
     ends soon after apply() (Soup's tests end 0.6 s after it) could finalize while the thread
     compiles, and the compiler's C++ thread pool, destroyed under it, aborts the process
     ("terminate called without an active exception", exit code 134; T13 saw it in 3 of 6 runs of
@@ -451,9 +453,14 @@ def _shutdown():
     waiting for the whole warm-up would add its seconds. In a training run the warm-up is long
     done at exit: nothing to wait for."""
     _STOP.set()
-    thread = _STATE["thread"]
-    if thread is not None and thread is not threading.current_thread():
-        thread.join(EXIT_TIMEOUT)
+    # A timed join can expire on a slow machine while native compiler work is still running.
+    # Returning then recreates the abort this hook prevents. The early hashing/import thread
+    # also belongs to us, including when apply() fails before starting the compile thread.
+    current = threading.current_thread()
+    for thread in (_STATE["thread"], _STATE["key_thread"]):
+        if thread is not None and thread is not current:
+            while thread.is_alive():
+                thread.join(EXIT_TIMEOUT)
 
 
 def _register_shutdown():
@@ -492,6 +499,7 @@ def _worker(device, stream, log):
 def _run(device, log, workers, switch):
     begin = time.perf_counter()
     previous = ours = None
+    helpers, stream = [], None
     try:
         import torch
 
@@ -511,20 +519,27 @@ def _run(device, log, workers, switch):
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any
         # Executor, triton/runtime/_async_compile.py)
-        helpers = [threading.Thread(target=_worker, args=(device, stream, log),
-                                    name=f"solution-warmup-{i}", daemon=True)
-                   for i in range(1, workers)]
-        for helper in helpers:
+        for i in range(1, workers):
+            helper = threading.Thread(target=_worker, args=(device, stream, log),
+                                      name=f"solution-warmup-{i}", daemon=True)
             helper.start()
+            helpers.append(helper)  # only threads whose start succeeded are joinable
         _worker(device, stream, log)
-        for helper in helpers:
-            helper.join()
-        stream.synchronize()
     except Exception as exc:  # noqa: BLE001
+        _STOP.set()  # active helpers finish their current registration, taking no new jobs
         _STATE["errors"]["(thread)"] = repr(exc)
         if log:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
+        # _worker's device/stream setup, or a later helper.start(), can raise while an earlier
+        # helper is inside native compiler code. DONE must mean all those workers are gone.
+        for helper in helpers:
+            helper.join()
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception as exc:  # noqa: BLE001 - compilation is optional
+                _STATE["errors"]["(stream)"] = repr(exc)
         if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
             sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
@@ -614,7 +629,12 @@ def start_early(log=True):
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
-    threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
+    with _LOCK:
+        if _STATE["key_thread"] is None:
+            thread = threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True)
+            _STATE["key_thread"] = thread
+            _register_shutdown()
+            thread.start()
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)
     return None

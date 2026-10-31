@@ -266,13 +266,14 @@ def test_exit_while_compiling_is_clean(tmp_path, mode):
         assert "done_at_exit=False" in out.stdout  # it did exit in the middle of the warm-up
 
 
-def test_step_ops_draw_no_random_numbers():
+@pytest.mark.parametrize("name", ["warm_step_ops", "warm_cublas"])
+def test_step_ops_draw_no_random_numbers(name):
     """The optimizer / clipping / scaler warm-up runs on its own tensors: the CPU and CUDA random
     states are the same after it."""
     from solution import warmup
 
     cpu, cuda = torch.get_rng_state(), torch.cuda.get_rng_state()
-    warmup.warm_step_ops()
+    getattr(warmup, name)()
     torch.cuda.synchronize()
     assert torch.equal(torch.get_rng_state(), cpu)
     assert torch.equal(torch.cuda.get_rng_state(), cuda)
