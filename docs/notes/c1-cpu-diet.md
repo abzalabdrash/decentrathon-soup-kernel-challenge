@@ -43,13 +43,15 @@ there: the forward runs ahead of the GPU), 25 ms `_QKVRope.forward`, 22 ms `nf4.
   state's tensors): no Params4bit attribute reads and no views per launch. Guards: imports cached,
   Params4bit getters read with the function override off, bitsandbytes' small-M verdict memoized.
   Dropout RNG state through the generator itself.
-- `SOUP_SOLUTION_ATTN_ONE_FUNCTION=1` (fused_proj.py): a recomputing layer's `_QKVRope`, varlen
-  attention and o_proj as one autograd node (`_AttnBlock`), the same ops in the same order; two
-  Python round trips into autograd and five view nodes less per layer and direction. In that path
-  and in the recompute, q, k, v are built in the kernel's token-major layout directly and rope is
-  launched from strides (`rope._launch_strided`: the same kernel arguments), ~30 view ops less per
-  layer and step; the transposes of the shared buffer's weight views and the adapter halves' views
-  are made once (kept with the buffers); the q/k/v/o operands of a layer are checked once per plan.
+- `SOUP_SOLUTION_FEWER_VIEWS=1` (fused_proj.py, rope.py): rope launched from strides
+  (`rope._launch_strided`: the same kernel arguments as on the head-major views) and the recompute's
+  q, k, v built in the attention kernel's token-major layout directly (same pointers, sizes and
+  strides as `kernel_operands`); ~20 view ops less per layer and step. The transposes of the shared
+  buffer's weight views and the adapter halves' views are made once (kept with the buffers); a
+  layer's q/k/v/o operands are checked once per plan (8.2 -> 1.9 us per call on the laptop).
+- `SOUP_SOLUTION_ATTN_ONE_FUNCTION` (fused_proj.py, **off by default**): a recomputing layer's
+  `_QKVRope`, varlen attention and o_proj as one autograd node (`_AttnBlock`), the same ops in the
+  same order; tested bitwise, faster on short steps, but +4.2 MiB allocated peak (see ABBA 2).
 - `SOUP_SOLUTION_MLP_ADDMM_INPLACE=1` (fused_proj.py): the MLP input gradient's second GEMM adds into
   the first's fp32 result in place (torch's out-of-place addmm copied it first): 28 D2D copies and
   one N x 1536 fp32 buffer per layer less.
@@ -93,4 +95,20 @@ dequantization buffer now first grows to the q|k|v|o size), so nvidia-smi 401 ->
 both sessions (prof2 too). Checks 3, 4, 9 pass in every run (own kernels 12.9 %). T4 pytest of
 9e72037: 342 passed, 1 failed (the new reuse test assumed an empty buffer; fixed in b951367).
 
-**ABBA 2** (b951367 = + one-node attention, in-place accumulate, hook marker): (pending)
+**ABBA 2** (peagverr, soup-c1-abba2, b951367 = + one-node attention, in-place accumulate, hook marker;
+a hot session, main's second run 1.6 s slower than its first):
+
+| variant | wall s | steps 3+ s | median | <600 tok ms | 600-900 ms | >=900 ms | nvidia-smi | reserved | alloc peak |
+|---|---|---|---|---|---|---|---|---|---|
+| main path | 44.32 / 45.88 | 25.46 / 27.30 | 0.410 | 345.9 | 379.1 | 550.5 | 401 | 272 | 234.6 |
+| C1 (b951367) | 43.20 / 44.83 | 24.68 / 26.12 | 0.410 | 296.8 | 368.1 | 545.2 | 401 | 272 | **238.8** |
+
+Per step C1 - main: -15.7 ms mean (faster in 58 of 62): -47 ms under 600 tokens, -11 ms at
+600-900, -5 ms above. Wall -1.08 s, steps 3+ -0.98 s. But the allocated peak rose by 4.2 MiB and the
+20 MiB segment of ABBA 1 came back: autograd keeps a node's incoming gradient until the node returns,
+so in the one-node attention the o_proj output's gradient (N x 1536 halves: 4.2 MiB at the
+1,440-token step) lives through the attention and q/k/v backward. So `SOUP_SOLUTION_ATTN_ONE_FUNCTION`
+is off by default from bc35c89 (memory first), and its view savings moved to the three nodes
+(`SOUP_SOLUTION_FEWER_VIEWS=1`). Checks 3, 4, 9 pass in all five runs.
+
+**ABBA 3** (bc35c89, the final defaults): (pending)
