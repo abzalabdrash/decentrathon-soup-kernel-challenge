@@ -183,6 +183,30 @@ def prepin(megabytes):
     return thread
 
 
+def release_host_memory():
+    """Training is over (exit_release.py): the pinned slabs, spare and used, go back to the driver
+    (cudaFreeHost through torch's host allocator, whose cache holds them once unreferenced). An
+    offload that runs again pins new slabs on demand. Slabs still holding a live slot stay. Call it
+    with the device synchronized. Returns the bytes released."""
+    with _SPARE_LOCK:
+        if _PREPINNING[0]:
+            return 0  # a prepin thread is still pinning: leave everything as it is
+        spares = list(_SPARE)
+        _SPARE.clear()
+    released = sum(slab.numel() for slab in spares)
+    del spares
+    offloader = _ACTIVE["offloader"]
+    if offloader is not None:
+        with offloader.lock:
+            host = offloader.host
+            if host.live() == 0:
+                released += host.nbytes
+                host.slabs, host.slots, host.nbytes = [], [], 0
+    if released:
+        torch._C._host_emptyCache()
+    return released
+
+
 # ----------------------------------------------------------------------------------------------
 # offload
 

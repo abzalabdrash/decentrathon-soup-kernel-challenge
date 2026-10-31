@@ -55,7 +55,9 @@ pair without bias, an fp16 or bf16 weight, and peft about to cast it (not GPTQ a
 Soup's setup. Eval and generation (the original forward) run through the lm_head override: logits in
 full, chunk by chunk, with the base's dtypes. Switches (environment): SOUP_SOLUTION_HEAD_STREAM=0,
 SOUP_SOLUTION_HEAD_ROWS (vocabulary rows per chunk), SOUP_SOLUTION_HEAD_SLOTS (ring slots, >= 2),
-SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head (where the first chunks start).
+SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head (where the first chunks start),
+SOUP_SOLUTION_HEAD_PACK=1 (the chunks cross PCIe in a lossless 12-bit form and are decoded on the GPU
+by our kernel, head_pack.py; off by default).
 """
 
 import atexit
@@ -274,7 +276,9 @@ class HeadStreamer:
         self._staging, self._staging_done = None, None
         self._spans = collections.deque()
         self._spare_events = []
-        self.loads = self.late_loads = self.heads = self.copies_timed = 0
+        self.loads = self.late_loads = self.heads = self.copies_timed = self.packed_heads = 0
+        # head_pack.HeadPack (SOUP_SOLUTION_HEAD_PACK=1), and the one the current ring holds chunks of
+        self._pack = self._ring_pack = None
         self.copy_ms = self.wait_ms = 0.0
         self.copy_bytes = 0
         self.param_ref = weakref.ref(param)
@@ -367,24 +371,39 @@ class HeadStreamer:
         far (which includes every use of the slot's previous chunk, and the ring's allocation)."""
         s = c % self.slots
         c0, vc = self._chunk(c)
+        pack = self._ring_pack
         compute = torch.cuda.current_stream(self.device)
         self._free[s].record(compute)
         begin, end = self._event(), self._event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
             begin.record(self._copy_stream)
-            self._ring[s, :vc].copy_(self.host[c0:c0 + vc], non_blocking=True)
+            if pack is None:
+                self._ring[s, :vc].copy_(self.host[c0:c0 + vc], non_blocking=True)
+                nbytes = vc * self.hidden * self.host.element_size()
+            else:
+                source = pack.host_chunk(c)
+                nbytes = source.numel()
+                self._ring[s, :nbytes].copy_(source, non_blocking=True)
             end.record(self._copy_stream)
             self._ready[s].record(self._copy_stream)
-        self._spans.append(("copy", begin, end, vc * self.hidden * self.host.element_size()))
+        self._spans.append(("copy", begin, end, nbytes))
         self._owner[s] = c
         self.loads += 1
 
     def prefetch(self):
-        """Allocates the ring (on the compute stream) and starts the copies of the first chunks."""
+        """Allocates the ring (on the compute stream) and starts the copies of the first chunks. The
+        ring holds packed chunks when the pack is ready (decided here, once per head), else fp16."""
         if self._ring is None:
-            self._ring = torch.empty(self.slots, self.rows, self.hidden, dtype=self.dtype,
-                                     device=self.device)
+            pack = self._pack
+            if pack is not None and not (pack.ready and pack.rows == self.rows and pack.n_chunks == self.n_chunks):
+                pack = None
+            self._ring_pack = pack
+            if pack is None:
+                self._ring = torch.empty(self.slots, self.rows, self.hidden, dtype=self.dtype,
+                                         device=self.device)
+            else:
+                self._ring = torch.empty(self.slots, pack.slot_bytes, dtype=torch.uint8, device=self.device)
             self._owner = [-1] * self.slots
         for c in range(min(self.slots, self.n_chunks)):
             if self._owner[c % self.slots] != c:
@@ -402,7 +421,7 @@ class HeadStreamer:
         compute.wait_event(self._ready[s])
         end.record(compute)
         self._spans.append(("wait", begin, end, 0))
-        return self._ring[s, :self._chunk(c)[1]]
+        return self._ring[s] if self._ring_pack is not None else self._ring[s, :self._chunk(c)[1]]
 
     def _release(self, c):
         """Chunk c's GEMMs are queued: its slot takes chunk c + K."""
@@ -434,10 +453,17 @@ class HeadStreamer:
         if self.fp32_out is None:
             self.fp32_out = _fp32_out_gemm_works(self.device)
         self.prefetch()  # a no-op for the chunks prefetched at the final norm (or the embedding)
+        pack = self._ring_pack
+        # packed ring: each chunk is decoded into one fp16 buffer right before its GEMMs (same stream)
+        decoded = None if pack is None else torch.empty(self.rows, self.hidden, dtype=self.dtype, device=dev)
         with torch.autocast("cuda", enabled=False):
             for c in range(self.n_chunks):
                 c0, vc = self._chunk(c)
                 w = self._acquire(c)
+                if pack is not None:
+                    pack.decode(c, w, decoded[:vc])
+                    self._release(c)  # the packed slot is free once its decode is queued
+                    w = decoded[:vc]
                 if w.dtype != dtype:
                     w = w.to(dtype)
                 logits = buffer[:n * vc].view(n, vc)
@@ -456,7 +482,8 @@ class HeadStreamer:
                         out.copy_(torch.mm(p, w))
                     else:
                         out.add_(torch.mm(p, w))
-                self._release(c)
+                if pack is None:
+                    self._release(c)
         head_finish_kernel[(n,)](
             targets, m, s, e, x_t, idx, loss, entropy, correct,
             acc, acc.stride(0), wt, wt.stride(0), grad_scale, n_lab, d,
@@ -466,8 +493,9 @@ class HeadStreamer:
             acc.zero_()
         # every copy into the ring has been waited for by the compute stream: freeing it on the
         # compute stream needs no record_stream
-        self._ring, self._owner = None, [-1] * self.slots
+        self._ring, self._owner, self._ring_pack = None, [-1] * self.slots, None
         self.heads += 1
+        self.packed_heads += pack is not None
         self._harvest()
         return loss, entropy, correct, acc
 
@@ -512,8 +540,23 @@ class HeadStreamer:
 
     # ---- end of life -----------------------------------------------------------------------
 
+    def start_pack(self, log=print):
+        """Builds the packed form of the weight in a thread (head_pack.py); the head uses it once ready."""
+        from .head_pack import HeadPack, PackSkip
+
+        if self._pack is not None:
+            return self._pack
+        try:
+            self._pack = HeadPack(self, log=log).start()
+        except PackSkip as exc:
+            log(f"[solution] head pack off: {exc}")
+        return self._pack
+
     def restore(self):
         """The real weight back on the GPU in the virtual dtype, the overrides removed."""
+        if self._pack is not None:
+            self._pack.stop()
+            self._pack = None
         param = self.param_ref()
         if param is not None and _registered(param) is self:
             if param.data_ptr() == self._placeholder.data_ptr():
@@ -537,7 +580,8 @@ class HeadStreamer:
         if self._spans:
             torch.cuda.synchronize(self.device)
             self._harvest(block=True)
-        return {"heads": self.heads, "loads": self.loads, "late_loads": self.late_loads,
+        return {"heads": self.heads, "packed_heads": self.packed_heads, "loads": self.loads,
+                "late_loads": self.late_loads,
                 "copies_timed": self.copies_timed, "copy_ms": self.copy_ms,
                 "copy_gbps": self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None,
                 "wait_ms": self.wait_ms}
@@ -760,6 +804,7 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
                 f"in pinned host memory since the load: {loaded.host_bytes / 2**20:.0f} MiB; head in chunks "
                 f"of {loaded.rows} rows through {loaded.slots} GPU slots, first chunks copied from the "
                 f"{loaded.prefetch_at}")
+            _maybe_pack(loaded, log)
             return loaded
         before = torch.cuda.memory_allocated()
         streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, prefetch_at=prefetch_at,
@@ -775,7 +820,19 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
         f"{streamer.slots} GPU slots ({streamer.slots * streamer.rows * streamer.hidden * 2 / 2**20:.0f} "
         f"MiB), first chunks copied from the {streamer.prefetch_at}")
     atexit.register(_report, weakref.ref(streamer), log)
+    _maybe_pack(streamer, log)
     return streamer
+
+
+def _pack_on():
+    return os.environ.get("SOUP_SOLUTION_HEAD_PACK", "0").strip().lower() not in ("0", "false", "no", "")
+
+
+def _maybe_pack(streamer, log):
+    """SOUP_SOLUTION_HEAD_PACK=1: the 12-bit packed form for the PCIe transfer, built in a thread
+    while Soup builds the trainer (head_pack.py)."""
+    if _pack_on():
+        streamer.start_pack(log)
 
 
 def finish_setup(model, log=print):
@@ -824,7 +881,8 @@ def _report(ref, log):
         return
     copy = (f"{st['copy_ms'] / st['copies_timed']:.2f} ms per chunk at {st['copy_gbps']:.1f} GB/s"
             if st["copies_timed"] and st["copy_gbps"] else "no timed copies")
-    log(f"[solution] head stream: {st['heads']} heads, {st['loads']} chunk copies ({st['late_loads']} "
+    packed = f" ({st['packed_heads']} from the 12-bit pack)" if streamer._pack is not None else ""
+    log(f"[solution] head stream: {st['heads']} heads{packed}, {st['loads']} chunk copies ({st['late_loads']} "
         f"not prefetched), {copy}; the head waited for copies {st['wait_ms'] / st['heads']:.1f} ms per step")
 
 
@@ -913,3 +971,7 @@ def patch_head_stream(rows=None, slots=None, load=None):
     from .warmup import register
 
     register(functools.partial(_warm_kernels, rows), name="head_stream_kernels")
+    if _pack_on():
+        from .head_pack import warm_kernels
+
+        register(warm_kernels, name="head_pack_kernels")

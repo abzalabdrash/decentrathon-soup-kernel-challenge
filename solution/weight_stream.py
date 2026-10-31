@@ -105,6 +105,23 @@ def _unregister(buffer):
         pass
 
 
+_PINNED = []  # the finalizers of the buffers pinned_host_buffer registered (dead ones are skipped)
+
+
+def unpin_all():
+    """Every buffer pinned_host_buffer registered goes back to pageable memory now (exit_release.py,
+    once training is over): its values stay, a copy from it stays correct, only slower; its finalizer
+    is spent, so nothing unregisters it again at exit. Returns the bytes unregistered."""
+    total = 0
+    while _PINNED:
+        finalizer = _PINNED.pop()
+        info = finalizer.peek()
+        if info is not None:
+            total += info[2][0].numel()
+            finalizer()
+    return total
+
+
 def pinned_host_buffer(nbytes, owner):
     """`nbytes` of page-locked host memory as a uint8 tensor, unpinned when `owner` is collected (or
     at exit). A plain CPU tensor registered with the driver: torch's pinned allocator rounds the size
@@ -122,7 +139,9 @@ def pinned_host_buffer(nbytes, owner):
         if ok:
             _unregister(buffer)
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
-    return buffer, weakref.finalize(owner, _unregister, buffer)
+    finalizer = weakref.finalize(owner, _unregister, buffer)
+    _PINNED.append(finalizer)
+    return buffer, finalizer
 
 
 class PinnedBuffer:
