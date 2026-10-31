@@ -253,6 +253,11 @@ time gained, a 20 MiB page lost: **stays off**.
 
 ### 7. Why s is lower in the jury order (analysis of downloaded logs, no new T4 runs)
 
+**First line: the growth sits in the training loop, in the GPU-bound steps of 600+ tokens** (the jury
+rows have more of them: 30 and 43 steps of >= 900 tokens against 20, and at equal token count our step
+loses 6-12 % against the base's); not in the start-up, the host, PCIe or the short CPU-bound steps
+(7 and 3 of them in the jury rows).
+
 Runs (main checkout `runs_kaggle/`): cold full soup-m2-full (ce27a54), m3 (8d2d0bd), m4 (0f9bc57), m6
 (ca6db38), all on the public rows; jury soup-m2-jury (ce27a54, rows 15000:15256, order base / sol /
 sol / base) and soup-m5-jury (6050a09, rows 18000:18256). Tokens per step from TRL's `num_tokens`
