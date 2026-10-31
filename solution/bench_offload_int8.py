@@ -14,7 +14,9 @@ import statistics
 import torch
 
 
-def _time(fn, iters=30):
+def _time(fn, iters=30, inner=1):
+    """Median GPU ms of fn; `inner` calls between the events (a short kernel's launch from Python
+    would otherwise be timed too: in training the CPU runs ahead of the GPU)."""
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -22,11 +24,30 @@ def _time(fn, iters=30):
     for _ in range(iters):
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        fn()
+        for _ in range(inner):
+            fn()
         end.record()
         end.synchronize()
-        times.append(start.elapsed_time(end))
+        times.append(start.elapsed_time(end) / inner)
     return statistics.median(times)
+
+
+def tiles(ms, configs):
+    """quant and rebuild per layer for (tokens per program) x (warps) configurations."""
+    from solution import offload_int8
+
+    rows = 2 * 8960
+    for config in configs:
+        offload_int8.TILE_M, offload_int8.WARPS = (int(v) for v in config.split("x"))
+        line = []
+        for m in ms:
+            x = (torch.randn(rows, m, device="cuda") * 2).half()
+            spare = torch.empty((rows // 2, m), dtype=x.dtype, device="cuda")
+            wire, codec = offload_int8.encode(x, spare)
+            quant = _time(lambda: offload_int8.encode(x, spare), inner=10)
+            rebuild = _time(lambda: codec.decode(wire), inner=10)
+            line.append(f"M={m}: quant {quant:.3f} rebuild {rebuild:.3f}")
+        print(f"tile {config:8s} " + "  ".join(line), flush=True)
 
 
 def kernels_and_copies(ms, layers=28):
@@ -42,8 +63,8 @@ def kernels_and_copies(ms, layers=28):
         wire, codec = offload_int8.encode(x)
         host16 = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
         host8 = torch.empty(wire.shape, dtype=wire.dtype, pin_memory=True)
-        quant = _time(lambda: offload_int8.encode(x))
-        rebuild = _time(lambda: codec.decode(wire))
+        quant = _time(lambda: offload_int8.encode(x), inner=10)
+        rebuild = _time(lambda: codec.decode(wire), inner=10)
         d2h16 = _time(lambda: host16.copy_(x, non_blocking=True))
         d2h8 = _time(lambda: host8.copy_(wire, non_blocking=True))
         h2d16 = _time(lambda: x.copy_(host16, non_blocking=True))
@@ -135,7 +156,10 @@ def main():
     parser.add_argument("--m", type=int, nargs="+", default=[416, 832, 1440, 2048])
     parser.add_argument("--groups", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--skip-error", action="store_true")
+    parser.add_argument("--tiles", nargs="*", default=[], metavar="TMxWARPS")
     args = parser.parse_args()
+    if args.tiles:
+        tiles(args.m, args.tiles)
     kernels_and_copies(args.m)
     if not args.skip_error:
         gradient_error([[212, 187, 310, 117], [512, 512, 512, 512]], args.groups)

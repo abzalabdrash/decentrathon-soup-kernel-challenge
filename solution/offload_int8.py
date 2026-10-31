@@ -39,7 +39,8 @@ _STATE = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8", "1" if _soup_train_
 START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "112"))
 # features per scale (64, 128 or 256 divide Qwen2.5-1.5B's 8960); tokens per program
 GROUP = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_GROUP", "128"))
-TILE_M = 64 if GROUP <= 128 else 32
+TILE_M = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_TILE_M", "64" if GROUP <= 128 else "32"))
+WARPS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_WARPS", "4"))
 # SOUP_SOLUTION_OFFLOAD_INT8_FUSED=1: the int8 MLP backward (int8_bwd.py) reads the int8 form itself
 # inside its SwiGLU backward (raw), no rebuild pass; "now" while fused_proj's backward unpacks for it
 RAW = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_FUSED", "1").strip().lower()
@@ -125,7 +126,8 @@ class Codec:
         rows, tokens = self.shape
         q, s = views(wire, rows, tokens)
         out = torch.empty(self.shape, dtype=self.dtype, device=q.device)
-        gu_dequant_kernel[_grid(rows, tokens)](q, s, out, tokens, GROUP=GROUP, TM=TILE_M, num_warps=4)
+        gu_dequant_kernel[_grid(rows, tokens)](q, s, out, tokens, GROUP=GROUP, TM=TILE_M,
+                                               num_warps=WARPS)
         return out
 
 
@@ -167,7 +169,7 @@ def encode(tensor, spare=None):
     else:
         wire = torch.empty(wire_bytes(rows, tokens), dtype=torch.uint8, device=tensor.device)
         q, s = views(wire, rows, tokens)
-    gu_quant_kernel[_grid(rows, tokens)](tensor, q, s, tokens, GROUP=GROUP, TM=TILE_M, num_warps=4)
+    gu_quant_kernel[_grid(rows, tokens)](tensor, q, s, tokens, GROUP=GROUP, TM=TILE_M, num_warps=WARPS)
     return wire, Codec(tensor.shape, tensor.dtype)
 
 
@@ -223,7 +225,7 @@ def _warm():
     tokens = -(-TOKENS // 16) * 16
     half = training_half_dtype()
     compile_kernel(gu_quant_kernel, half, torch.int8, torch.float32, tokens, GROUP=GROUP, TM=TILE_M,
-                   num_warps=4)
+                   num_warps=WARPS)
     compile_kernel(gu_dequant_kernel, torch.int8, torch.float32, half, tokens, GROUP=GROUP, TM=TILE_M,
-                   num_warps=4)
+                   num_warps=WARPS)
     return None
