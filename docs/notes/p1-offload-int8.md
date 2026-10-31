@@ -134,6 +134,17 @@ compile threads (mine and int8_bwd's, which compiled the INT8_IN variants too), 
 variants in offload_int8's own thread (int8_bwd's thread compiles exactly main's kernels): without the
 stall the loop gain is ~-1.3 s on these rows.
 
+**1e0eac4 on public rows (soup-p1-abba-pub5):**
+
+| variant | wall s | steps 3+ s | median step | step 0 | nvidia-smi | alloc | own |
+|---|---|---|---|---|---|---|---|
+| off | 46.34 / 46.64 | 25.44 | 0.400 | 0.504 | 395 | 229.3 | 17.5 % |
+| i8 | 46.14 / 45.69 | 24.76 | 0.377 | 0.507 | 395 | 230.1 | 20.8 % |
+
+Wall -0.58 s, steps 3+ -0.68 s, median step -5.8 %, the same peak. On the public rows the ceiling showed
+no PCIe bound, so this gain is mostly the backward's SwiGLU and quantization kernels reading half the
+bytes (int8 form) and the shorter D2H/H2D contention with the weight stream.
+
 ## 6. Full + jury
 
 TODO

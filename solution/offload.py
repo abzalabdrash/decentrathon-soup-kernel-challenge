@@ -62,10 +62,12 @@ other fp32 tensor is ever touched; each layer then saves two tensors (its input,
 both windows grow by one, and the input stays on the GPU after its first unpack until its last user
 (the post-attention norm, the x16 rebuild and the input norm read it in the same layer's backward).
 
-int8 (SOUP_SOLUTION_OFFLOAD_INT8, offload_int8.py, task P1): a (gate|up) whose copy offload_early
-starts is first quantized on the compute stream into one uint8 buffer (int8 values and per token and
-feature group scales, ~52 % of its bytes), and that buffer is what is copied, held while its copy runs,
-prefetched and fetched; the unpack rebuilds the half tensor from it. A handle's `codec` says so.
+int8 (SOUP_SOLUTION_OFFLOAD_INT8, offload_int8.py, task P1): for a (gate|up) that goes int8,
+offload_early only reserves the host slot; the fused MLP's SwiGLU forward then writes the int8 form over
+the tensor's gate half (int8 values and per token and feature group scales, ~52 % of its bytes), and
+the second offload_early call copies that form, holds it while the copy runs (the tensor's storage), and
+the prefetch and the fetch bring back one buffer of it; the unpack rebuilds the half tensor, or hands
+the buffer to the int8 MLP backward (offload_int8.raw). A handle's `codec` says so.
 
 Knobs for experiments (environment): SOUP_SOLUTION_OFFLOAD_MIN_NUMEL, SOUP_SOLUTION_OFFLOAD_INFLIGHT,
 SOUP_SOLUTION_OFFLOAD_PREFETCH, SOUP_SOLUTION_OFFLOAD_PREPIN_MB (see prepin). bench_offload.py
