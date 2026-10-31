@@ -87,7 +87,7 @@ from . import int8_bwd, nf4, rope, weight_stream
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
-from .rmsnorm import norm_source, rebuild
+from .rmsnorm import half_of, norm_source, rebuild
 from .unpad import (_CTX, _compact, _cu_seqlens, _efficient_backward, _expand_heads, kernel_operands,
                     sequences, varlen_forward)
 from .unpad import attention as packed_attention
@@ -881,8 +881,7 @@ def _qkv_forward(ctx, x, a_q, b_q, a_v, b_v, cos, sin, plan, recompute, token_ma
     q_base, k_base, v_base = plan.bases
     nq, nk, nv = q_base.out_features, k_base.out_features, v_base.out_features
     r = a_q.shape[0]
-    x16 = x.reshape(n, d)
-    x16 = x16 if x16.dtype == half else x16.to(half)
+    x16 = half_of(x, half).reshape(n, d)  # the input norm's half copy (SOUP_SOLUTION_NORM_HALF)
 
     pair = _attn_weights(plan, x.device)  # q|k|v and o in one launch (o_proj reads it later)
     w = pair[0] if pair is not None else _weights(plan.bases, half, x.device)
@@ -1531,7 +1530,7 @@ class _MLP(torch.autograd.Function):
         n = x.numel() // d
         padded = -(-n // 8) * 8
         # zero padding rows: their gate|up, SwiGLU and output rows are zeros, cut off below
-        x16 = _padded_half(x.reshape(n, d), n, padded, half)
+        x16 = _padded_half(half_of(x, half, cast=False).reshape(n, d), n, padded, half)
         gate_up = torch.empty((2 * inter, padded), dtype=half, device=x.device)
         _gate_up_matmul(plan, None, x16.t(), gate_up)
         if plan.early:

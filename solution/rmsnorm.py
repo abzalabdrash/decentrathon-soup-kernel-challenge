@@ -99,6 +99,49 @@ def rms_norm_rows_fwd(
     tl.store(y_ptr + rows64 * stride_y + cols[None, :], out.to(y_ptr.dtype.element_ty), mask=tile_ok)
 
 
+@triton.jit(do_not_specialize=["n_rows", "stride_y16"])
+def rms_norm_rows_fwd_half(
+    x_ptr, stride_x, add_ptr, stride_add, sum_ptr, stride_sum, w_ptr, y_ptr, stride_y,
+    y16_ptr, stride_y16,  # the output rows rounded to half as well (SOUP_SOLUTION_NORM_HALF)
+    rstd_ptr, n_rows, n_cols, eps,
+    ADD: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """rms_norm_rows_fwd plus a second store of the output in half: the value its consumer's
+    `y.to(half)` would give (one rounding to nearest even of the same fp32 product). The half rows
+    are stored 4 elements per vector, as the fp32 ones: stride_y16 is not specialized and only
+    declared a multiple of 4, else Triton picks 8-wide vectors for them, which changes the tile's
+    layout and with it the order of the sum of squares (rstd and y would differ from
+    rms_norm_rows_fwd's in the last bit)."""
+    stride_y16 = tl.multiple_of(stride_y16, 4)
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK)
+    row_ok = rows < n_rows
+    col_ok = cols < n_cols
+    tile_ok = row_ok[:, None] & col_ok[None, :]
+    rows64 = rows.to(tl.int64)[:, None]
+    v = tl.load(x_ptr + rows64 * stride_x + cols[None, :], mask=tile_ok, other=0.0).to(tl.float32)
+    if ADD:
+        a = tl.load(add_ptr + rows64 * stride_add + cols[None, :], mask=tile_ok, other=0.0)
+        s = (v + a.to(tl.float32)).to(sum_ptr.dtype.element_ty)
+        tl.store(sum_ptr + rows64 * stride_sum + cols[None, :], s, mask=tile_ok)
+        v = s.to(tl.float32)
+    mean_sq = tl.sum(v * v, axis=1) / n_cols
+    rstd = tl.rsqrt(mean_sq + eps)
+    tl.store(rstd_ptr + rows, rstd, mask=row_ok)
+    normed = v * rstd[:, None]
+    if ADD:
+        normed = normed.to(sum_ptr.dtype.element_ty).to(tl.float32)
+    else:
+        normed = normed.to(x_ptr.dtype.element_ty).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)
+    out = (normed * w[None, :]).to(y_ptr.dtype.element_ty)
+    tl.store(y_ptr + rows64 * stride_y + cols[None, :], out, mask=tile_ok)
+    tl.store(y16_ptr + rows64 * stride_y16 + cols[None, :], out.to(y16_ptr.dtype.element_ty),
+             mask=tile_ok)
+
+
 @triton.jit(do_not_specialize=["n_rows"])
 def rms_norm_rows_bwd(
     dy_ptr, stride_dy,  # gradient of the norm output
@@ -238,17 +281,66 @@ def _sm_count(device):
     return _SM_COUNT[index]
 
 
-def _forward(x2, add2, sum2, weight, y2, rstd, eps):
+def _forward(x2, add2, sum2, weight, y2, rstd, eps, y16=None):
     n_rows, n_cols = x2.shape
     block = triton.next_power_of_2(n_cols)
     has_add = add2 is not None
     add2 = add2 if has_add else x2
     sum2 = sum2 if has_add else x2
+    if y16 is not None:
+        rms_norm_rows_fwd_half[(triton.cdiv(n_rows, FWD_ROWS),)](
+            x2, x2.stride(0), add2, add2.stride(0), sum2, sum2.stride(0), weight,
+            y2, y2.stride(0), y16, y16.stride(0), rstd, n_rows, n_cols, eps,
+            ADD=has_add, ROWS=FWD_ROWS, BLOCK=block, num_warps=FWD_WARPS,
+        )
+        return
     rms_norm_rows_fwd[(triton.cdiv(n_rows, FWD_ROWS),)](
         x2, x2.stride(0), add2, add2.stride(0), sum2, sum2.stride(0), weight,
         y2, y2.stride(0), rstd, n_rows, n_cols, eps,
         ADD=has_add, ROWS=FWD_ROWS, BLOCK=block, num_warps=FWD_WARPS,
     )
+
+
+# SOUP_SOLUTION_NORM_HALF=1 (review 2, section 4.2): under CUDA autocast the input and post-attention
+# norms of a decoder layer also write their fp32 output in the autocast half dtype, in the same
+# kernel, attached to the output (`_soup_half`, with the output's version); fused_proj.py's q/k/v
+# projection and MLP take it (`half_of`) instead of their own `x.to(half)`: one launch less per
+# norm, the cast's fp32 read and half write against one half store more. Bit for bit the cast's
+# values. The final norm does not (the head gathers and casts its rows itself).
+_HALF = {"on": os.environ.get("SOUP_SOLUTION_NORM_HALF", "0").strip().lower()
+         not in ("0", "false", "no", ""), "out": None}
+
+
+def _half_out(y2, want):
+    """An empty half buffer for y2's rows when the norm writes its half copy too (asked for by the
+    decoder layer, the switch on, fp32 rows under CUDA autocast), else None."""
+    if (not want or not _HALF["on"] or y2.dtype != torch.float32 or not y2.is_cuda
+            or not torch.is_autocast_enabled("cuda")):
+        return None
+    half = torch.get_autocast_dtype("cuda")
+    if half not in (torch.float16, torch.bfloat16):
+        return None
+    return torch.empty(y2.shape, dtype=half, device=y2.device)
+
+
+def _attach(y):
+    """Hands the half copy the last forward wrote (if any) to its output `y`."""
+    y16, _HALF["out"] = _HALF["out"], None
+    if y16 is not None:
+        y._soup_half = (y16.view(y.shape), y._version)
+    return y
+
+
+def half_of(x, half, cast=True):
+    """x in `half`: the norm's own half copy of it when it wrote one and x is unchanged since, else
+    x.to(half) (x itself when it is in `half` already, or with cast=False: the caller casts)."""
+    found = getattr(x, "_soup_half", None)
+    if found is not None:
+        y16, version = found
+        if (y16.dtype == half and y16.shape == x.shape and version == x._version
+                and y16.device == x.device):
+            return y16
+    return x if x.dtype == half or not cast else x.to(half)
 
 
 def _backward(dy2, x2, weight, rstd, dsum2, dx_dtype, dx2_dtype, need_dw):
@@ -317,11 +409,13 @@ def warm_bwd_split():
 
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight, eps):
+    def forward(ctx, x, weight, eps, half=False):
         x2 = _rows(x)
         y = torch.empty(x2.shape, dtype=torch.promote_types(weight.dtype, x.dtype), device=x.device)
         rstd = torch.empty(x2.shape[0], dtype=torch.float32, device=x.device)
-        _forward(x2, None, None, weight, y, rstd, eps)
+        y16 = _half_out(y, half)
+        _forward(x2, None, None, weight, y, rstd, eps, y16)
+        _HALF["out"] = y16
         ctx.save_for_backward(x2, weight, rstd)
         ctx.shape = x.shape
         return y.view(x.shape)
@@ -332,7 +426,7 @@ class RMSNormFunction(torch.autograd.Function):
         x2, weight, rstd = ctx.saved_tensors
         dx, _, dw = _backward(_rows(dy), x2, weight, rstd, None, x2.dtype, None,
                               ctx.needs_input_grad[1])
-        return dx.view(ctx.shape), dw, None
+        return dx.view(ctx.shape), dw, None, None
 
 
 class AddRMSNormFunction(torch.autograd.Function):
@@ -345,14 +439,16 @@ class AddRMSNormFunction(torch.autograd.Function):
     gets the branch from that object in the backward."""
 
     @staticmethod
-    def forward(ctx, residual, branch, weight, eps, addends=None, offload=False):
+    def forward(ctx, residual, branch, weight, eps, addends=None, offload=False, half=False):
         r2, b2 = _rows(residual), _rows(branch)
         sum_dtype = torch.promote_types(residual.dtype, branch.dtype)
         s = torch.empty(r2.shape, dtype=sum_dtype, device=residual.device)
         y = torch.empty(r2.shape, dtype=torch.promote_types(weight.dtype, sum_dtype),
                         device=residual.device)
         rstd = torch.empty(r2.shape[0], dtype=torch.float32, device=residual.device)
-        _forward(r2, b2, s, weight, y, rstd, eps)
+        y16 = _half_out(y, half)
+        _forward(r2, b2, s, weight, y, rstd, eps, y16)
+        _HALF["out"] = y16
         if addends is not None and residual.dtype != sum_dtype:
             addends = None  # the split backward re-forms the sum in the residual's dtype
         ctx.addends = addends
@@ -410,7 +506,7 @@ class AddRMSNormFunction(torch.autograd.Function):
         d_res = d_res.view(ctx.shape)
         # as torch's add backward, both addends get the same tensor when their dtypes agree
         d_branch = d_res if d_branch is None else d_branch.view(ctx.shape)
-        return d_res, d_branch, dw, None, None, None
+        return d_res, d_branch, dw, None, None, None, None
 
 
 def _input_norm_node(residual):
@@ -423,9 +519,10 @@ def _input_norm_node(residual):
     return None
 
 
-def rmsnorm(x, weight, eps):
-    """Qwen2RMSNorm.forward(x) for a CUDA tensor x (…, C) and an fp32 weight (C,)."""
-    return RMSNormFunction.apply(x, weight, float(eps))
+def rmsnorm(x, weight, eps, half=False):
+    """Qwen2RMSNorm.forward(x) for a CUDA tensor x (…, C) and an fp32 weight (C,); `half`: with
+    SOUP_SOLUTION_NORM_HALF, also its half copy for the consumer (`half_of`)."""
+    return _attach(RMSNormFunction.apply(x, weight, float(eps), bool(half)))
 
 
 def norm_source(y):
@@ -474,11 +571,30 @@ def warm_rebuild():
     return None
 
 
-def add_rmsnorm(residual, branch, weight, eps, addends=None, offload=False):
+def warm_fwd_half():
+    """warmup.py registration of rms_norm_rows_fwd_half (SOUP_SOLUTION_NORM_HALF=1): the classes of
+    rms_norm_rows_fwd's warm-up with the half output added."""
+    from . import _on
+    from .warmup import HIDDEN, SKIPPED, TOKENS, compile_kernel, training_half_dtype
+
+    if not _on("SOUP_SOLUTION_RMSNORM"):
+        return SKIPPED
+    f32, half, block = torch.float32, training_half_dtype(), triton.next_power_of_2(HIDDEN)
+    for add, add_dtype in ((False, f32), (True, half)):
+        compile_kernel(rms_norm_rows_fwd_half, f32, HIDDEN, add_dtype, HIDDEN, f32, HIDDEN, f32,
+                       f32, HIDDEN, half, HIDDEN, f32, TOKENS, HIDDEN, 1e-6,
+                       ADD=add, ROWS=FWD_ROWS, BLOCK=block, num_warps=FWD_WARPS)
+    return None
+
+
+def add_rmsnorm(residual, branch, weight, eps, addends=None, offload=False, half=False):
     """(r, y) with r = residual + branch and y = Qwen2RMSNorm(r), same shapes; `addends`: what the
     backward keeps (AddRMSNormFunction); `offload`: the fp32 tensor it keeps is a layer input that
-    offload.py may move to host memory (SOUP_SOLUTION_OFFLOAD_RESIDUAL)."""
-    return AddRMSNormFunction.apply(residual, branch, weight, float(eps), addends, offload)
+    offload.py may move to host memory (SOUP_SOLUTION_OFFLOAD_RESIDUAL); `half`: with
+    SOUP_SOLUTION_NORM_HALF, y's half copy too (`half_of`)."""
+    total, y = AddRMSNormFunction.apply(residual, branch, weight, float(eps), addends, offload,
+                                        bool(half))
+    return total, _attach(y)
 
 
 def post_attention_addends(residual, branch):
@@ -527,6 +643,10 @@ def patch_qwen2_rmsnorm():
     cls = modeling_qwen2.Qwen2RMSNorm
     if getattr(cls, "_soup_rmsnorm", False):
         return
+    if _HALF["on"]:
+        from .warmup import register
+
+        register(warm_fwd_half, name="rms_norm_rows_fwd_half")
     original = getattr(cls, "_soup_original_forward", None) or cls.forward
 
     def forward(self, hidden_states):
@@ -552,12 +672,13 @@ def _addable(residual, branch):
             and branch.device == residual.device and branch.dtype in DTYPES)
 
 
-def add_norm(norm, residual, branch, norm_cls, offload=False):
+def add_norm(norm, residual, branch, norm_cls, offload=False, half=False):
     """(residual + branch, norm(residual + branch)) for a Qwen2RMSNorm `norm`: one kernel when the
     norm is a plain one the kernel fits, else the add and the norm's own forward. The sum is the
     base's `residual + branch` (fp32 residual, half branch: summed and kept in fp32)."""
     if (_plain_norm(norm, norm_cls) and fits(residual, norm.weight) and _addable(residual, branch)):
-        return add_rmsnorm(residual, branch, norm.weight, norm.variance_epsilon, offload=offload)
+        return add_rmsnorm(residual, branch, norm.weight, norm.variance_epsilon, offload=offload,
+                           half=half)
     total = residual + branch
     return total, norm(total)
 
@@ -607,10 +728,14 @@ def patch_qwen2_decoder_layer():
         offload = _offload_inputs()
         if _soup_branch is not None:
             residual, hidden_states = add_norm(self.input_layernorm, hidden_states, _soup_branch,
-                                               norm_cls, offload=offload)
+                                               norm_cls, offload=offload, half=True)
         else:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            first = self.input_layernorm
+            if _HALF["on"] and _plain_norm(first, norm_cls) and fits(hidden_states, first.weight):
+                hidden_states = rmsnorm(hidden_states, first.weight, first.variance_epsilon, half=True)
+            else:
+                hidden_states = first(hidden_states)
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -625,7 +750,7 @@ def patch_qwen2_decoder_layer():
             residual, hidden_states = add_rmsnorm(residual, hidden_states, norm.weight,
                                                   norm.variance_epsilon,
                                                   post_attention_addends(residual, hidden_states),
-                                                  offload=offload)
+                                                  offload=offload, half=True)
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
