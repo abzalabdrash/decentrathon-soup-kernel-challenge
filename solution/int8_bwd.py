@@ -281,12 +281,15 @@ def usable(plan, tokens):
     return _READY.is_set()
 
 
-def mlp_backward(plan, gate_up, grad16, buffer):
+def mlp_backward(plan, gate_up, grad16, buffer, release=None):
     """The fused MLP's backward from dL/dout (tokens, D) half and the saved (gate|up) (2I, tokens):
     returns dL/dx (tokens, D) fp32; (gate|up) is overwritten with its gradient. `buffer` is
     fused_proj's flat half buffer for one (I, D) weight (taken as int8 bytes). A uint8 `gate_up` is
     offload_int8.py's int8 form of it (offload_int8.raw): the SwiGLU backward reads that and writes
-    the gradient over the int32 product of step 3 (interleaved per element: no new buffer)."""
+    the gradient over the int32 product of step 3 (interleaved per element: no new buffer).
+    `release(base)`, when given, is called as soon as the last read of that 4-bit weight is queued
+    (its column scales and its int8 decode; the GEMMs read the decoded copy in `buffer`), so that
+    weight_stream.py's ring can start the copy of the next layer's matrix into its slot then."""
     tokens, d = grad16.shape
     inter = plan.gate.out_features
     device = grad16.device
@@ -311,6 +314,8 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
     _decode_t(plan.down, inv_d, w_down_t, d, 0)
+    if release is not None:
+        release(plan.down)
     acc_h = torch._int_mm(w_down_t, g_q.t())
     # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group (from the
     # int8 form: over the int32 product, interleaved, no new buffer)
@@ -338,7 +343,11 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     inv_gu = _inverse(scale_gu * 127.0)
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
+    if release is not None:
+        release(plan.gate)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
+    if release is not None:
+        release(plan.up)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
     grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])

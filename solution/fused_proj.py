@@ -1385,6 +1385,11 @@ def _accumulate(result, a, b):
     return torch.addmm(result, a, b, out_dtype=torch.float32)
 
 
+# SOUP_SOLUTION_EARLY_RELEASE (see _MLP.backward's int8 path): off by default until measured
+_EARLY_RELEASE = {"on": os.environ.get("SOUP_SOLUTION_EARLY_RELEASE", "0").strip().lower()
+                  not in ("0", "false", "no", "")}
+
+
 def set_mlp_recompute(on):
     """What the fused MLP keeps for its backward: (gate|up) itself (False, the default: offload.py's
     saved-tensor hooks move it to host memory, or it stays on the GPU), or its half input x16
@@ -1674,9 +1679,21 @@ class _MLP(torch.autograd.Function):
             matrices = (plan.down, plan.gate, plan.up) if plan.ring is not None else ()
             for base in matrices:  # it reads the three (scales, int8 decode) in one go
                 plan.ring.acquire(base, -1)
-            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer)[:n]
+            released = []
+            release = None
+            if matrices and _EARLY_RELEASE["on"]:
+                # SOUP_SOLUTION_EARLY_RELEASE=1: each matrix's slot is released right after its last
+                # read is queued (down before the first int8 GEMM, gate and up before the second),
+                # so the copy of the next layer's matrix runs under this layer's GEMMs; the same
+                # kernels in the same order on the compute stream, the same values
+                def release(base, ring=plan.ring, done=released):
+                    ring.release(base, -1)
+                    done.append(base)
+
+            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer, release=release)[:n]
             for base in matrices:
-                plan.ring.release(base, -1)
+                if not any(base is b for b in released):
+                    plan.ring.release(base, -1)
             if ctx.x_dtype != torch.float32:
                 grad_x = grad_x.to(ctx.x_dtype)
             return grad_x.view(ctx.x_shape), None
