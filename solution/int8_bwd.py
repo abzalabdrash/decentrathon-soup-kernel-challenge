@@ -190,6 +190,75 @@ def quant_t_int8_kernel(src_ptr, pmax_ptr, amax_ptr, q_ptr, n_rows, tokens,
 # ---------------------------------------------------------------------------------------------
 
 
+# SOUP_SOLUTION_INT8_FUSED_QUANT=1: step 1's per-token quantization and step 7's two scalings run as one
+# own kernel each (quant_rows_t_kernel, scale_rows_cols_kernel) instead of ~9 and 3 torch launches per
+# layer (soup-m10-prof: the clamp / floor / add / reduce / binary launches of the step); the same fp32
+# operations in the same order, compiled without FMA contraction, so the same int8 values and scales
+_FUSED_QUANT = {"on": os.environ.get("SOUP_SOLUTION_INT8_FUSED_QUANT", "1").strip().lower()
+                not in ("0", "false", "no", "")}
+QR_ROWS = 4  # token rows per program of quant_rows_t_kernel
+# torch's fp32 reciprocal of 127 (div_true_kernel_cuda divides by a scalar as a multiply by 1 / b in fp32)
+R127 = float(torch.tensor(1.0, dtype=torch.float32).div(torch.tensor(127.0, dtype=torch.float32)))
+SC_ROWS, SC_BLOCK = 8, 512  # (rows, columns) tile of scale_rows_cols_kernel
+
+
+@triton.jit
+def quant_rows_t_kernel(x_ptr, q_ptr, s_ptr, r127, n_rows, n_cols, ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    # _quant_rows in one pass with torch's own roundings: amax = max |x| per row (half, exact);
+    # `127.0 / t` is torch's t.reciprocal() * 127 (an IEEE reciprocal, then a multiply), `t / 127.0` is
+    # its multiply by the fp32 reciprocal r127 (div_true_kernel_cuda with a scalar divisor); q =
+    # clamp(floor(x * inv + 0.5), -127, 127) with the multiply and the add rounded separately (no FMA:
+    # enable_fp_fusion=False)
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.arange(0, BLOCK)
+    live = (rows < n_rows)[:, None] & (cols < n_cols)[None, :]
+    at = rows[:, None].to(tl.int64) * n_cols + cols[None, :]
+    x = tl.load(x_ptr + at, mask=live, other=0.0)
+    amax = tl.max(tl.abs(x), axis=1).to(tl.float32)
+    inv = tl.math.div_rn(tl.full([ROWS], 1.0, tl.float32), tl.maximum(amax, 1e-30)) * 127.0
+    inv = tl.where(amax > 0.0, inv, 0.0)
+    v = x.to(tl.float32) * inv[:, None]
+    v = v + 0.5
+    q8 = tl.minimum(tl.maximum(tl.floor(v), -127.0), 127.0).to(tl.int8)
+    tl.store(q_ptr + at, q8, mask=live)
+    tl.store(s_ptr + rows, amax * r127, mask=rows < n_rows)
+
+
+@triton.jit
+def scale_rows_cols_kernel(acc_ptr, a_ptr, b_ptr, out_ptr, r127, n_cols, ROWS: tl.constexpr,
+                           BLOCK: tl.constexpr):
+    # out = acc.float() * (a[row] / 127) * b[col], as acc.float().mul_((a / 127)[:, None]).mul_(b[None, :])
+    # with torch's a / 127 = a * r127 (see quant_rows_t_kernel)
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    at = rows[:, None].to(tl.int64) * n_cols + cols[None, :]
+    sa = tl.load(a_ptr + rows) * r127
+    v = tl.load(acc_ptr + at).to(tl.float32) * sa[:, None]
+    v = v * tl.load(b_ptr + cols)[None, :]
+    tl.store(out_ptr + at, v)
+
+
+def _fused_quant_ok(tokens, d):
+    return _FUSED_QUANT["on"] and tokens % SC_ROWS == 0 and d % SC_BLOCK == 0 and d <= 8192
+
+
+def _quant_rows_fused(x):
+    tokens, d = x.shape
+    q = torch.empty((tokens, d), dtype=torch.int8, device=x.device)
+    s = torch.empty(tokens, dtype=torch.float32, device=x.device)
+    quant_rows_t_kernel[(triton.cdiv(tokens, QR_ROWS),)](
+        x, q, s, R127, tokens, d, ROWS=QR_ROWS, BLOCK=triton.next_power_of_2(d), enable_fp_fusion=False)
+    return q, s
+
+
+def _scale_rows_cols(acc, a, b):
+    rows, cols = acc.shape
+    out = torch.empty((rows, cols), dtype=torch.float32, device=acc.device)
+    scale_rows_cols_kernel[(rows // SC_ROWS, cols // SC_BLOCK)](
+        acc, a, b, out, R127, cols, ROWS=SC_ROWS, BLOCK=SC_BLOCK, enable_fp_fusion=False)
+    return out
+
+
 def _quant_rows(x):
     """Per-row absmax int8 of a 2-D half tensor: (int8 rows, fp32 scales = absmax / 127); a row of
     zeros (the padding rows) gets scale 0 and zeros."""
@@ -306,7 +375,8 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
         else:
             q, qs = offload_int8.views(gate_up, 2 * inter, tokens)
     # 1. the incoming gradient per token (torch ops: a small pass, no kernel to compile)
-    g_q, s_g = _quant_rows(grad16)
+    fused = _fused_quant_ok(tokens, d)
+    g_q, s_g = _quant_rows_fused(grad16) if fused else _quant_rows(grad16)
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
@@ -346,6 +416,8 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
         done(plan.up)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
+    if fused:
+        return _scale_rows_cols(acc_x, amax, scale_gu)
     grad_x = acc_x.float().mul_((amax / 127.0)[:, None]).mul_(scale_gu[None, :])
     return grad_x
 
@@ -368,6 +440,11 @@ def _warm():
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=1, INT8_IN=False)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
+    if _fused_quant_ok(tokens, HIDDEN):
+        compile_kernel(quant_rows_t_kernel, half, i8, f32, R127, tokens, HIDDEN, ROWS=QR_ROWS,
+                       BLOCK=triton.next_power_of_2(HIDDEN), enable_fp_fusion=False)
+        compile_kernel(scale_rows_cols_kernel, i32, f32, f32, f32, R127, HIDDEN, ROWS=SC_ROWS, BLOCK=SC_BLOCK,
+                       enable_fp_fusion=False)
     return None
 
 
