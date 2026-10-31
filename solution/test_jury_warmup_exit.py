@@ -62,6 +62,8 @@ def test_early_hash_thread_is_tracked_once_and_joined(monkeypatch):
     monkeypatch.setattr(warmup, "_STOP", threading.Event())
     monkeypatch.setenv("SOUP_SOLUTION_WARMUP_START", "apply_end")
     monkeypatch.setattr(warmup, "install_launcher_build", lambda: False)
+    monkeypatch.setattr(warmup, "install_light_triton_key", lambda: False, raising=False)
+    monkeypatch.setattr(warmup, "start_launchers_ahead", lambda: None, raising=False)
     registered = []
     monkeypatch.setattr(warmup, "_register_shutdown", lambda: registered.append(True))
     entered, release = threading.Event(), threading.Event()
