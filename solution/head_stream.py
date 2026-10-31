@@ -71,7 +71,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from .fused_ce import IGNORE_INDEX, compute_dtype
+from .fused_ce import IGNORE_INDEX, compute_dtype, labelled_count
 
 # vocabulary rows per chunk: 4096 x 1536 x 2 bytes = 12 MiB per slot (the last chunk 384 rows). With
 # the early (gate|up) offload the run's peak sat at the head's start (ring 2 x 24 MiB + logits buffer
@@ -612,7 +612,7 @@ class StreamedLMHeadLoss(torch.autograd.Function):
         n, d = hidden2d.shape
         labelled = targets != IGNORE_INDEX
         order = torch.argsort(labelled.to(torch.int8), descending=True, stable=True)
-        n_labelled = int(labelled.sum().item())
+        n_labelled = labelled_count(targets, labelled)  # fused_ce.py: the host's count if planned
         if num_items is None:
             grad_scale = 1.0 / max(n_labelled, 1)
         else:

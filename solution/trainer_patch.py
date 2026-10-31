@@ -6,14 +6,31 @@ the fused head (fused_ce.py) the model leaves the per-token entropy, loss and co
 values and hands Soup's rewind recorder the per-token losses through the attribute it already reads
 (`_soup_chunked_step`, see soup_cli.trainer.rewind_hf: `row_losses_from_token_losses`).
 
+SOUP_SOLUTION_DEFER_METRICS=1: the values stay on the GPU until the step is logged. TRL reads them
+with `.item()` and Soup's rewind recorder with `float()` between the forward and the backward, and
+the first read waits for the whole forward and head to finish, so the CPU starts queueing the
+backward with the GPU empty. Here `_log_trl_metrics` keeps detached device scalars, and the rewind
+recorder gets the per-row means and token counts as device tensors (the same operations as Soup's
+`row_losses_from_token_losses`), its record queued; `flush_deferred` turns them into the same Python
+numbers, in the same order, into TRL's `_metrics` and Soup's `RewindState.on_micro_batch` right
+before TRL's `log()` averages the metrics (every step here, logging_steps 1), when the harness has
+already synchronized. The rewind log gets the same lines in the same order.
+
 Soup's trainer is a subclass of trl.SFTTrainer built at setup time; patching the attribute on the
 base class reaches it because Python looks the method up on every call. A step that is not training,
 has no labels, or where the model did not take the fused path goes through TRL's original code.
 """
 
+import os
+
 from . import fused_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR
+PENDING_ATTR = "_soup_pending_metrics"  # device scalars of the steps not logged yet
+DEFER = {"on": os.environ.get("SOUP_SOLUTION_DEFER_METRICS", "0").strip().lower()
+         not in ("0", "false", "no", ""),
+         "armed": None,  # the token_loss tensor the rewind recorder may take deferred
+         "rows": []}  # queued rewind records: (state, step, means, tokens)
 
 
 def _log_trl_metrics(trainer, mode, inputs, step):
@@ -24,18 +41,112 @@ def _log_trl_metrics(trainer, mode, inputs, step):
     attention_mask = inputs.get("attention_mask")
     if attention_mask is not None:
         entropy = (step.token_entropy * attention_mask).sum() / attention_mask.sum()
-        tokens = gather(attention_mask.sum()).sum().item()
+        tokens = gather(attention_mask.sum()).sum()
     else:
         entropy = step.token_entropy.mean()
         tokens = None
-    metrics[mode]["entropy"].append(gather(entropy).mean().item())
-    if mode == "train" and tokens is not None and hasattr(trainer, "_total_train_tokens"):
-        trainer._total_train_tokens += tokens
+    entropy = gather(entropy).mean()
+    labelled = gather(step.labelled).sum()
+    accuracy = gather(step.correct).sum() / labelled  # used only when labelled > 0
+    entry = (mode, entropy.detach(), tokens, labelled, accuracy.detach())
+    if DEFER["on"]:
+        trainer.__dict__.setdefault(PENDING_ATTR, []).append(entry)
+    else:
+        _record_metrics(trainer, entry)
+
+
+def _record_metrics(trainer, entry):
+    """One step's values into TRL's `_metrics` and `_total_train_tokens`, as TRL's compute_loss puts
+    them there: entropy, num_tokens, mean_token_accuracy."""
+    mode, entropy, tokens, labelled, accuracy = entry
+    metrics = trainer._metrics
+    metrics[mode]["entropy"].append(entropy.item())
+    if tokens is not None:
+        tokens = tokens.item()
+        if mode == "train" and hasattr(trainer, "_total_train_tokens"):
+            trainer._total_train_tokens += tokens
     if hasattr(trainer, "_total_train_tokens"):
         metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
-    labelled = gather(step.labelled).sum()
-    accuracy = (gather(step.correct).sum() / labelled).item() if labelled > 0 else 0.0
-    metrics[mode]["mean_token_accuracy"].append(accuracy)
+    metrics[mode]["mean_token_accuracy"].append(accuracy.item() if labelled.item() > 0 else 0.0)
+
+
+def flush_deferred(trainer=None):
+    """The deferred rewind records (all trainers) and this trainer's deferred metrics, in order."""
+    _flush_rewind()
+    pending = trainer.__dict__.get(PENDING_ATTR) if trainer is not None else None
+    if pending:
+        trainer.__dict__[PENDING_ATTR] = []
+        for entry in pending:
+            _record_metrics(trainer, entry)
+
+
+# ---- Soup's rewind recorder ------------------------------------------------------------------
+
+
+class _DeviceRows:
+    """Per-row values still on the GPU (a sequence for whoever reads it before the flush)."""
+
+    __slots__ = ("values",)
+
+    def __init__(self, values):
+        self.values = values
+
+    def __len__(self):
+        return self.values.shape[0]
+
+    def __iter__(self):
+        return iter(self.values.tolist())
+
+
+def _flush_rewind():
+    rows, DEFER["rows"] = DEFER["rows"], []
+    if not rows:
+        return
+    from soup_cli.trainer import rewind_hf
+
+    record = rewind_hf.RewindState._soup_original_on_micro_batch
+    for state, step, means, tokens in rows:
+        try:
+            # Soup: [float(mean) for mean in means], [int(count) for count in tokens]
+            record(state, step=step, row_loss=means.tolist(), row_tokens=tokens.tolist())
+        except Exception as exc:  # noqa: BLE001 - Soup's compute_loss never raises into training
+            state.fail(exc)
+
+
+def _patch_rewind():
+    try:
+        from soup_cli.trainer import rewind_hf
+    except Exception:  # noqa: BLE001 - no Soup rewind recorder
+        return
+    state_cls = rewind_hf.RewindState
+    if getattr(state_cls, "_soup_original_on_micro_batch", None) is not None:
+        return
+    row_losses = rewind_hf.row_losses_from_token_losses
+    on_micro_batch = state_cls.on_micro_batch
+
+    def row_losses_from_token_losses(token_loss, labels):
+        armed, DEFER["armed"] = DEFER["armed"], None
+        if armed is None or token_loss is not armed:
+            return row_losses(token_loss, labels)
+        import torch
+
+        with torch.no_grad():  # Soup's row_losses_from_token_losses, without its host reads
+            tokens = (labels[:, 1:] != -100).sum(dim=1)
+            totals = token_loss.float().sum(dim=1).to(tokens.device)
+            means = totals / tokens.clamp(min=1).to(totals.dtype)
+        return _DeviceRows(means), _DeviceRows(tokens)
+
+    def on_micro_batch_deferred(self, *, step, row_loss, row_tokens):
+        if isinstance(row_loss, _DeviceRows) and isinstance(row_tokens, _DeviceRows):
+            DEFER["rows"].append((self, step, row_loss.values, row_tokens.values))
+            return None
+        _flush_rewind()  # keep the records in order
+        return on_micro_batch(self, step=step, row_loss=row_loss, row_tokens=row_tokens)
+
+    rewind_hf.row_losses_from_token_losses = row_losses_from_token_losses
+    state_cls.on_micro_batch = on_micro_batch_deferred
+    state_cls._soup_original_on_micro_batch = on_micro_batch
+    rewind_hf._soup_original_row_losses = row_losses
 
 
 def patch_sft_trainer():
@@ -61,21 +172,39 @@ def patch_sft_trainer():
                                              num_items_in_batch=num_items_in_batch)
         step = fused_ce.LAST_STEP["step"]
         fused_ce.LAST_STEP["step"] = None
+        DEFER["armed"] = None
         if step is None:
             # the model kept its logits (not a Qwen2 causal LM, or the fused path declined): TRL's
             # metrics from the logits, as TRL computes them
             setattr(self, STEP_ATTR, None)
+            flush_deferred(self)  # keep the steps' order in _metrics
             _metrics_from_logits(self, mode, inputs, outputs)
         else:
             setattr(self, STEP_ATTR, step)
+            if DEFER["on"]:
+                DEFER["armed"] = step.token_loss  # Soup's recorder reads it right after this returns
             _log_trl_metrics(self, mode, inputs, step)
         if getattr(self, "aux_loss_enabled", False) and getattr(outputs, "aux_loss", None) is not None:
             aux = self.accelerator.gather_for_metrics(outputs.aux_loss).mean().item()
             self._metrics[mode]["aux_loss"].append(aux)
         return (loss, outputs) if return_outputs else loss
 
+    original_log = cls.log
+
+    def log(self, logs, *args, **kwargs):
+        flush_deferred(self)
+        return original_log(self, logs, *args, **kwargs)
+
     cls.compute_loss = compute_loss
+    cls.log = log
     cls._soup_fused_metrics = True
+    if DEFER["on"]:
+        _patch_rewind()
+    from .boundary import patch_step_boundary
+    from .step_pipeline import patch_step_pipeline
+
+    patch_step_boundary()  # SOUP_SOLUTION_STEP_BOUNDARY=1: the step boundary without model walks
+    patch_step_pipeline()  # SOUP_SOLUTION_NAN_FILTER=gpu, _PREFETCH_BATCH=1, _HOST_PLAN=1
 
 
 def _metrics_from_logits(trainer, mode, inputs, outputs):
