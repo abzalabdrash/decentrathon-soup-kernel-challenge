@@ -113,3 +113,37 @@ def test_fused_mlp_same_gradients_with_and_without(int8_on, monkeypatch):
         out.backward(grad.to(out.dtype))
         grads.append(xg.grad)
     assert torch.equal(grads[0], grads[1])
+
+
+@pytest.mark.parametrize("tokens", [64, 832, 1440])
+def test_fused_quant_kernels_bitwise(int8_on, monkeypatch, tokens):
+    """SOUP_SOLUTION_INT8_FUSED_QUANT: the per-token quantization and the two scalings of step 7 give
+    the torch ops' int8 values and fp32 results bit for bit (zero padding rows included)."""
+    gen = torch.Generator("cuda").manual_seed(tokens)
+    x = (torch.randn(tokens, 1536, device="cuda", generator=gen) * 3).half()
+    x[-16:] = 0
+    q_ref, s_ref = int8_on._quant_rows(x)
+    q, s = int8_on._quant_rows_fused(x)
+    assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
+    acc = torch.randint(-2**24, 2**24, (tokens, 1536), device="cuda", dtype=torch.int32, generator=gen)
+    a = torch.rand(tokens, device="cuda", generator=gen) * 50
+    b = torch.rand(1536, device="cuda", generator=gen) * 1e-3
+    ref = acc.float().mul_((a / 127.0)[:, None]).mul_(b[None, :])
+    assert torch.equal(int8_on._scale_rows_cols(acc, a, b), ref)
+
+
+def test_mlp_backward_same_with_fused_quant(int8_on, monkeypatch):
+    from types import SimpleNamespace
+
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=34).cuda()
+    plan = SimpleNamespace(gate=mlp.gate_proj, up=mlp.up_proj, down=mlp.down_proj, half=torch.float16)
+    gen = torch.Generator("cuda").manual_seed(6)
+    gate_up = (torch.randn(2 * 8960, 832, device="cuda", generator=gen) * 2).half()
+    grad16 = (torch.randn(832, 1536, device="cuda", generator=gen) * 1e-2).half()
+    buffer = torch.empty(8960 * 1536, dtype=torch.float16, device="cuda")
+    monkeypatch.setitem(int8_on._FUSED_QUANT, "on", False)
+    ref = int8_on.mlp_backward(plan, gate_up.clone(), grad16, buffer)
+    monkeypatch.setitem(int8_on._FUSED_QUANT, "on", True)
+    assert torch.equal(int8_on.mlp_backward(plan, gate_up.clone(), grad16, buffer), ref)
