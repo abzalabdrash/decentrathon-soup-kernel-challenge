@@ -1,7 +1,6 @@
-"""int8 tensor cores for the fused MLP's forward GEMM of gate|up (task I1, SOUP_SOLUTION_INT8_FWD; on
-by default in every process, like int8_bwd.py, =0 turns it off; solution/conftest.py starts every
-test of solution/ with it off, so the bitwise tests of the fp16 path keep comparing that path, and
-test_int8_fwd.py switches it on). Organizers' answer 29 allows int8 for the frozen linear layers in
+"""int8 tensor cores for the fused MLP's forward GEMM of gate|up (task I1, SOUP_SOLUTION_INT8_FWD=1;
+off by default, the same in every process; solution/conftest.py starts every test of solution/
+with it off, test_int8_fwd.py switches it on). Organizers' answer 29 allows int8 for the frozen linear layers in
 the forward and the backward by input when all 10 checks pass; answer 11 and its follow-up the
 in-run choice of the fp16 channels.
 
@@ -59,7 +58,9 @@ def _env_on(name, default):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
 
 
-_STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "1"),
+# off by default: on top of offload_int8.py the T4 measured -4.5 ms per step against ~1.3 s of
+# compile and switch on steps 1-8 (soup-i1p1-abba1: base 45.65 s, P1 44.01, I1 + P1 45.29)
+_STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "0"),
           "thread": None, "calls": 0}
 # the first START_CALLS eligible forwards stay fp16 (8 steps x 28 layers); the compile thread starts
 # at eligible forward COMPILE_CALLS (step 2: steps 0 and 1 are the CPU-heavy ones, the later steps

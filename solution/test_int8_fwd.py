@@ -222,8 +222,8 @@ def test_takeover_after_start_calls(int8_on, monkeypatch):
             int8_on._READY.set()
 
 
-def test_on_by_default():
-    """On in every process unless SOUP_SOLUTION_INT8_FWD=0 (the conftest pins it off per test)."""
+def test_off_by_default():
+    """Off in every process unless SOUP_SOLUTION_INT8_FWD=1 (the conftest pins it off per test)."""
     import os
     import subprocess
     import sys
@@ -232,9 +232,9 @@ def test_on_by_default():
     env = {k: v for k, v in os.environ.items() if k != "SOUP_SOLUTION_INT8_FWD"}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          env=env)
-    off = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
-                         env={**env, "SOUP_SOLUTION_INT8_FWD": "0"})
-    assert out.stdout.strip() == "True" and off.stdout.strip() == "False"
+    on = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
+                        env={**env, "SOUP_SOLUTION_INT8_FWD": "1"})
+    assert out.stdout.strip() == "False" and on.stdout.strip() == "True"
 
 
 def test_fp16_layers_counted_and_kept(int8_on, monkeypatch):
