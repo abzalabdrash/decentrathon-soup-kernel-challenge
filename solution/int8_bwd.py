@@ -282,6 +282,22 @@ def _column_scales(base, half, buf):
     return cached
 
 
+def _gate_up_scales(plan, buffer):
+    """(127 / shared colmax, shared colmax / 127) of [W_gate^T | W_up^T]: the larger of the two
+    weights' column scales, made once per layer and kept on the gate module (the frozen weights do
+    not change; the same torch ops as before, so the same values) instead of ~9 small launches every
+    step."""
+    cached = plan.gate.__dict__.get("_soup_int8_gu_scales")
+    if cached is not None:
+        return cached
+    inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
+    inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
+    scale_gu = torch.maximum(scale_g, scale_u)
+    cached = (_inverse(scale_gu * 127.0), scale_gu)
+    plan.gate.__dict__["_soup_int8_gu_scales"] = cached
+    return cached
+
+
 def _inverse(colmax):
     return torch.where(colmax > 0, 127.0 / colmax.clamp_min(1e-30), torch.zeros_like(colmax))
 
@@ -404,10 +420,7 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
             dgu, pmax, amax, dgu_q, 2 * inter, tokens, GROUPS=GROUPS, TR=TQ_R, TM=TQ_M)
     del dgu
     # 6. [W_gate^T | W_up^T] (D, 2I) int8 with one scale per input feature for both
-    inv_g, scale_g = _column_scales(plan.gate, plan.half, buffer)
-    inv_u, scale_u = _column_scales(plan.up, plan.half, buffer)
-    scale_gu = torch.maximum(scale_g, scale_u)
-    inv_gu = _inverse(scale_gu * 127.0)
+    inv_gu, scale_gu = _gate_up_scales(plan, buffer)
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)

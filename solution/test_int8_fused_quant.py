@@ -48,3 +48,22 @@ def test_mlp_backward_same_with_fused_quant(int8_on, monkeypatch):
     ref = int8_on.mlp_backward(plan, gate_up.clone(), grad16, buffer)
     monkeypatch.setitem(int8_on._FUSED_QUANT, "on", True)
     assert torch.equal(int8_on.mlp_backward(plan, gate_up.clone(), grad16, buffer), ref)
+
+
+def test_gate_up_scales_cached_once(int8_on):
+    """The shared column scales of [W_gate^T | W_up^T] are made once per layer, with the values the
+    per-step torch ops gave."""
+    from types import SimpleNamespace
+
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=35).cuda()
+    plan = SimpleNamespace(gate=mlp.gate_proj, up=mlp.up_proj, down=mlp.down_proj, half=torch.float16)
+    buffer = torch.empty(8960 * 1536, dtype=torch.float16, device="cuda")
+    inv_g, scale_g = int8_on._column_scales(plan.gate, plan.half, buffer)
+    inv_u, scale_u = int8_on._column_scales(plan.up, plan.half, buffer)
+    scale_ref = torch.maximum(scale_g, scale_u)
+    inv_ref = int8_on._inverse(scale_ref * 127.0)
+    first = int8_on._gate_up_scales(plan, buffer)
+    assert int8_on._gate_up_scales(plan, buffer) is first
+    assert torch.equal(first[0], inv_ref) and torch.equal(first[1], scale_ref)
