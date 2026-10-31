@@ -462,3 +462,26 @@ def test_audit_counts_training_launches_per_variant(fresh, monkeypatch, capsys):
               for line in lines}
     assert counts["example_swiglu_fwd_kernel"] >= 2 and counts["example_swiglu_bwd_kernel"] >= 2, counts
     _forget_compiled()  # the counting caches stay with this test
+
+
+def test_driver_early_then_warmup_waits(tmp_path):
+    """SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1: start_early's thread creates triton's CUDA driver (a fresh
+    process, empty triton cache); the warm-up's _prepare_triton waits for that thread and then finds
+    the driver made."""
+    code = (
+        "import time\n"
+        "from solution import warmup\n"
+        "warmup.start_early(log=False)\n"
+        "assert warmup._EARLY['thread'] is not None\n"
+        "warmup._prepare_triton()\n"
+        "assert not warmup._EARLY['thread'].is_alive()\n"
+        "assert warmup._EARLY['error'] is None, warmup._EARLY['error']\n"
+        "assert warmup._EARLY['seconds'] is not None and warmup._EARLY['waited'] is not None\n"
+        "from triton.runtime.driver import driver\n"
+        "assert driver.active.utils is not None\n"
+        "print('ok', round(warmup._EARLY['seconds'], 3), round(warmup._EARLY['waited'], 3))\n")
+    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), SOUP_SOLUTION_WARMUP_DRIVER_EARLY="1")
+    out = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env, capture_output=True, text=True,
+                         timeout=300)
+    print(out.stdout)
+    assert out.returncode == 0 and "ok" in out.stdout, out.stderr[-3000:]

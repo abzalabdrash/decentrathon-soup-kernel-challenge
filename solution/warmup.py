@@ -93,6 +93,10 @@ Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_e
 after apply() run without the workers' GIL contention),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
 SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
+SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1: the thread `start_early` starts for triton's key also creates
+triton's CUDA driver (`_prepare_triton`: torch's CUDA init on the current device and the build of
+triton's cuda_utils module with the C compiler), during apply()'s imports, so that the warm-up does
+not begin with it; the warm-up waits for that thread before it touches the driver.
 Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
 the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
 launch is compile time the first step never needed.
@@ -523,10 +527,36 @@ def _prepare_triton():
     """What the first compile of the process does once, done before the workers start so that they
     do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
     the C compiler, triton/backends/nvidia/driver.py:61-64) and `triton_key`."""
+    early = _EARLY["thread"]
+    if early is not None and early is not threading.current_thread():
+        begin = time.perf_counter()
+        early.join(EXIT_TIMEOUT)  # SOUP_SOLUTION_WARMUP_DRIVER_EARLY: never two driver creations at once
+        _EARLY["waited"] = time.perf_counter() - begin
     from triton.runtime.driver import driver
 
     driver.active.get_current_device()
     _triton_key()
+
+
+_EARLY = {"thread": None, "seconds": None, "waited": None, "error": None}
+
+
+def _early_key_and_driver(driver_too):
+    """The thread `start_early` starts: triton's key, and with SOUP_SOLUTION_WARMUP_DRIVER_EARLY=1
+    triton's CUDA driver too (see the module docstring)."""
+    begin = time.perf_counter()
+    _triton_key()
+    if driver_too:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                from triton.runtime.driver import driver
+
+                driver.active.get_current_device()
+        except Exception as exc:  # noqa: BLE001 - the warm-up creates it then
+            _EARLY["error"] = repr(exc)
+    _EARLY["seconds"] = time.perf_counter() - begin
 
 
 def _setting(name, default, kind):
@@ -641,7 +671,11 @@ def _run(device, log, workers, switch):
                   + (f" ({len(compiled) - loaded} kernels compiled, {loaded} read from the on-disk "
                      f"cache)" if _HOOKS["installed"] else "")
                   + f": {done or 'nothing'}"
-                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else "") + ahead,
+                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else "") + ahead
+                  + (f"; driver created early in {_EARLY['seconds'] or 0:.2f} s from apply begin, the "
+                     f"warm-up waited {_EARLY['waited'] or 0:.2f} s for it"
+                     + (f" (failed: {_EARLY['error']})" if _EARLY["error"] else "")
+                     if _EARLY["thread"] is not None else ""),
                   flush=True)
 
 
@@ -915,7 +949,13 @@ def start_early(log=True):
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
     install_light_triton_key()  # SOUP_SOLUTION_TRITON_KEY=light: no sha256 of libtriton.so
-    threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
+    driver_too = os.environ.get("SOUP_SOLUTION_WARMUP_DRIVER_EARLY", "0").strip().lower() not in (
+        "0", "false", "no", "")
+    early = threading.Thread(target=_early_key_and_driver, args=(driver_too,), name="solution-triton-key",
+                             daemon=True)
+    if driver_too and _EARLY["thread"] is None:
+        _EARLY["thread"] = early
+    early.start()
     start_launchers_ahead()  # SOUP_SOLUTION_LAUNCHERS_EARLY=1: the launchers built during the imports
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)
