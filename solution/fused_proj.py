@@ -88,8 +88,8 @@ from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 from .rmsnorm import norm_source, rebuild
-from .unpad import (_CTX, _compact, _cu_seqlens, _efficient_backward, _expand_heads, kernel_operands,
-                    sequences, varlen_forward)
+from .unpad import (_CTX, _compact, _cu_seqlens, _efficient_backward, _expand_heads, _expanded,
+                    kernel_operands, sequences, varlen_forward)
 from .unpad import attention as packed_attention
 
 _STATE = {"enabled": True}
@@ -1056,6 +1056,11 @@ _ATTN["one_function"] = os.environ.get("SOUP_SOLUTION_ATTN_ONE_FUNCTION", "0").s
 # without the head-major views that the next op turned back (~20 view ops less per layer and step)
 _ATTN["views"] = os.environ.get("SOUP_SOLUTION_FEWER_VIEWS", "1").strip().lower() \
     not in ("0", "false", "no", "")
+# SOUP_SOLUTION_ATTN_GLUE=1: the recompute expands k and v to the q heads once (_rebuild) and keeps
+# the expanded tensors for the attention backward, which used to expand the compact k and a clone of
+# v again (the same bytes into the same kernels; the expanded pair exists in the backward anyway)
+_ATTN["glue"] = os.environ.get("SOUP_SOLUTION_ATTN_GLUE", "0").strip().lower() \
+    not in ("0", "false", "no", "")
 
 
 def _one_function_ok(plan, dropout):
@@ -1124,11 +1129,11 @@ class _AttnBlock(torch.autograd.Function):
         cu = saved[-1]
         q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
         grad_q, grad_k, grad_v, _ = _efficient_backward(
-            grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
+            grad_out, q, _expanded(k, q, groups), _expanded(v, q, groups), out, cu, max_len, lse,
             seed, offset, scale)
         if groups > 1:
-            grad_k = grad_k.unflatten(2, (k.shape[2], groups)).sum(3)
-            grad_v = grad_v.unflatten(2, (v.shape[2], groups)).sum(3)
+            grad_k = grad_k.unflatten(2, (q.shape[2] // groups, groups)).sum(3)
+            grad_v = grad_v.unflatten(2, (q.shape[2] // groups, groups)).sum(3)
         del grad_out, q, k, v, out, lse
         # _QKVRope.backward (it took the transposes of these: the gradients of its q4, k4, v4)
         grads = _qkv_backward(ctx, saved[:ctx.qkv_count], grad_q, grad_k, grad_v, token_major=True)
@@ -1261,6 +1266,9 @@ class _AttnRecompute:
                          self.cos, self.sin, backward=False)
             v4 = _heads(qkv[:, nq + nk:], n, plan.kv_heads, plan.head_dim)
             q, k, v = kernel_operands(q4, k4, v4, half)
+        if _ATTN["glue"]:  # expanded copies of their own (no view of qkv left to compact)
+            groups = q.shape[2] // k.shape[2]
+            k, v = _expand_heads(k, groups), _expand_heads(v, groups)
         out, lse, seed, offset = varlen_forward(q, k, v, self.cu, self.max_len, self.scale)
         self.tensors = (_compact(q), _compact(k), _compact(v), out, lse, seed, offset)
         self.x16 = x16
@@ -1284,6 +1292,8 @@ class _AttnRecompute:
                 elif name == "lse" and value.dim() == 3:  # one row of all tokens, aligned
                     same = torch.equal(value[..., :plan.n_tokens], want[..., :plan.n_tokens])
                 else:
+                    if name in ("k", "v") and value.shape != want.shape:  # SOUP_SOLUTION_ATTN_GLUE
+                        want = _expand_heads(want, value.shape[2] // want.shape[2])
                     same = torch.equal(value, want.view_as(value))
                 if not same:
                     _RECOMPUTE["mismatches"].append(name)
