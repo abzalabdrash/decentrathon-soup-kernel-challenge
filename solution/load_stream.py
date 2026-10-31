@@ -179,6 +179,8 @@ class _Load:
         from .load_pinned import new_copier
 
         self.copier = new_copier(device, locate=locate)  # load_pinned.py (SOUP_SOLUTION_LOAD_PINNED=1), else None
+        if self.copier is not None:
+            self.copier.model = model  # load_spec.py's checks of each hand-over
 
     def _requests(self):
         """The pinned buffers this load will need, in the order it needs them."""
@@ -614,9 +616,19 @@ def _loader(original):
                     functional.get_4bit_type = table
             except Exception:  # noqa: BLE001 - bitsandbytes' own tables then
                 table = None
+        undo_handover = None
+        from . import load_spec
+
+        if load_spec._STATE["spec"] is not None:
+            try:
+                undo_handover = load_spec.install_handover()  # LOAD_SPEC: Params4bit._quantize takes the stand-ins
+            except Exception as exc:  # noqa: BLE001 - the loop quantizes everything itself
+                load_spec.drop(f"install: {exc!r}")
         try:
             return original(*args, **kwargs)
         finally:
+            if undo_handover is not None:
+                undo_handover()
             if table is not None and functional.get_4bit_type is table:
                 functional.get_4bit_type = table._soup_original
             if load.one_sync and load.layers_moved:
@@ -626,6 +638,12 @@ def _loader(original):
             load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on
             if load.copier is not None:
                 load.copier.close()
+            if load_spec._STATE["spec"] is not None:
+                load_spec.stop()  # joined before the pinned chunks it copies from are released
+                torch.cuda.synchronize(device)
+                report = load_spec.report()
+                if report:
+                    print(report, flush=True)
             if _early_on():
                 from .load_early import release as release_early
 

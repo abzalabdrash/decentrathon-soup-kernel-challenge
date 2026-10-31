@@ -70,6 +70,7 @@ class _File:
     def __init__(self, path, data_start, size, chunks, stamp):
         self.path, self.data_start, self.size, self.chunks = path, data_start, size, chunks
         self.stamp = stamp  # (size, mtime_ns) of the file when it was planned
+        self.tensors = {}  # key -> (dtype name, shape, first, end): the header's entries (load_spec.py)
         self.buffer = None
         self.failed = False
 
@@ -146,7 +147,10 @@ def _plan(path):
     for chunk in chunks:
         keys = [_natural(key) for first, end, key in tensors if chunk.start <= first and end <= chunk.end]
         chunk.order = min(keys) if keys else ()
-    return _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
+    entry = _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
+    entry.tensors = {key: (info["dtype"], tuple(info["shape"]), *info["data_offsets"]) for key, info in header.items()
+                     if key != "__metadata__"}
+    return entry
 
 
 def _natural(key):

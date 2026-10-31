@@ -1090,3 +1090,96 @@ def test_tiny_load_early_other_files_dropped(patched, tiny_dir, monkeypatch, tmp
     snapshot, (early, planned, copied, fallbacks, reason) = ours["result"]
     assert early == 0 and state["used"] == 0 and state["released"] and reason is None
     _compare(snapshot, without["result"][0])
+
+
+# ---- SOUP_SOLUTION_LOAD_SPEC (load_spec.py) -----------------------------------------------------------
+
+
+def _with_spec(model):
+    from solution import load_pinned
+
+    copier = load_pinned.LAST["copier"]
+    return _snapshot(model), (copier.handed_over, copier.planned, copier.copied_early, copier.fallbacks, copier.reason)
+
+
+def _spec_on(monkeypatch, half):
+    from solution import load_spec
+
+    monkeypatch.setitem(load_spec._STATE, "spec", None)
+    monkeypatch.setitem(load_spec._STATE, "handover", {})
+    for key, value in (("made", 0), ("handed", 0), ("dropped", None), ("waited", 0.0), ("first_wait", None)):
+        monkeypatch.setitem(load_spec.LAST, key, value)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_SPEC", "1")
+    spec = load_spec.start(half=half)
+    assert spec is not None and len(spec.items) == LAYERS * 7
+    return load_spec
+
+
+@cuda
+def test_tiny_load_spec_bit_equal(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_SPEC=1: every 4-bit weight quantized ahead by the thread and handed over; the
+    packed weights, every quant-state tensor and field, and every other tensor are the plain load's."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_spec)
+    _early_read(monkeypatch, tiny_dir)
+    load_spec = _spec_on(monkeypatch, torch.float16)
+    ours = _load_in_setup(patched, tiny_dir, _with_spec)
+    snapshot, (handed, planned, early, fallbacks, reason) = ours["result"]
+    assert reason is None and fallbacks == 0 and handed == LAYERS * 7, load_spec.LAST
+    assert early == planned - handed and load_spec.LAST["dropped"] is None
+    _compare(snapshot, without["result"][0])
+    plain = _load(tiny_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    _compare(snapshot, theirs)
+    assert not load_spec._STATE["handover"] and load_spec._STATE["spec"].stop
+
+
+@cuda
+def test_tiny_load_spec_mismatch_falls_back(patched, tiny_dir, monkeypatch):
+    """Speculated in another dtype than the load's: dropped at the first weight, the loop does it all."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_spec)
+    _early_read(monkeypatch, tiny_dir)
+    load_spec = _spec_on(monkeypatch, torch.bfloat16)  # the load is in fp16
+    ours = _load_in_setup(patched, tiny_dir, _with_spec)
+    snapshot, (handed, planned, early, fallbacks, reason) = ours["result"]
+    assert handed == 0 and "not the speculated" in (load_spec.LAST["dropped"] or "")
+    _compare(snapshot, without["result"][0])
+
+
+@cuda
+def test_spec_quantize_4bit_equals_bitsandbytes():
+    """load_spec._quantize_4bit with the table made once: bitsandbytes' quantize_4bit bit for bit (packed
+    weight, absmax, offset, nested state, every field), also when the default dtype is fp16 meanwhile."""
+    import bitsandbytes as bnb
+
+    from solution import load_spec
+
+    if bnb.__version__ != "0.50.2":
+        pytest.skip("load_spec follows bitsandbytes 0.50.2")
+    code = bnb.functional.get_4bit_type("nf4", device=torch.device("cuda", torch.cuda.current_device()))
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    for shape in ((256, 1536), (8960, 1536), (1536, 8960)):
+        a = (torch.randn(shape, device="cuda", generator=gen) * 0.05).half()
+        w_ref, s_ref = bnb.functional.quantize_4bit(a, blocksize=64, compress_statistics=True, quant_type="nf4",
+                                                   quant_storage=torch.uint8)
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float16)  # as transformers' local_torch_dtype on the main thread
+        try:
+            w, s = load_spec._quantize_4bit(a, code)
+        finally:
+            torch.set_default_dtype(previous)
+        assert torch.equal(w, w_ref)
+        for name in ("absmax", "code", "offset"):
+            x, y = getattr(s, name), getattr(s_ref, name)
+            assert x.dtype == y.dtype and torch.equal(x, y), name
+        assert (s.shape, s.dtype, s.blocksize, s.quant_type, s.nested) == \
+            (s_ref.shape, s_ref.dtype, s_ref.blocksize, s_ref.quant_type, s_ref.nested)
+        assert torch.equal(s.state2.absmax, s_ref.state2.absmax) and torch.equal(s.state2.code, s_ref.state2.code)
+        assert s.state2.blocksize == s_ref.state2.blocksize and s.code is not code
