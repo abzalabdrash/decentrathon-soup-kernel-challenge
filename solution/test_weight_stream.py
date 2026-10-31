@@ -202,15 +202,16 @@ def test_prefetch_runs_k_minus_1_layers_ahead(slots):
 
 
 def test_copy_and_wait_timing():
-    """stats(): every copy after the setup is timed, every wait of the compute stream is timed per
-    direction, and a layer loaded on the spot shows up as forward waiting time."""
+    """stats() with timing (SOUP_SOLUTION_STREAM_TIMING=1): every copy after the setup is timed,
+    every wait of the compute stream is timed per direction, and a layer loaded on the spot shows
+    up as forward waiting time."""
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
 
     patch_bnb_matmul4bit()
     blocks = make_stack()
     x, weight = _inputs()
-    streamer = WeightStreamer(blocks, slots=2)
+    streamer = WeightStreamer(blocks, slots=2, timing=True)
     try:
         assert streamer.setup_copy_gbps > 0.5
         _step(blocks, x, weight)
@@ -234,6 +235,36 @@ def test_copy_and_wait_timing():
               f"{stats['wait_backward_ms']:.2f} ms backward")
     finally:
         streamer.restore()
+
+
+def test_untimed_by_default(monkeypatch):
+    """Without SOUP_SOLUTION_STREAM_TIMING the steps make no timing event (the setup's bandwidth is
+    still measured) and give the same result as a timed streamer."""
+    from solution.nf4 import patch_bnb_matmul4bit
+    from solution.weight_stream import WeightStreamer
+
+    patch_bnb_matmul4bit()
+    blocks = make_stack()
+    x, weight = _inputs()
+    results = []
+    for timing in (True, None):
+        streamer = WeightStreamer(blocks, slots=2, timing=timing)
+        try:
+            assert streamer.timing is (timing is True) and streamer.setup_copy_gbps > 0.5
+            made = []
+            monkeypatch.setattr(streamer, "_event", lambda: made.append(1) or torch.cuda.Event(
+                enable_timing=True))
+            results.append([_step(blocks, x, weight) for _ in range(2)])
+            stats = streamer.stats()
+            assert stats["loads"] - 2 == 2 * 2 * (len(blocks) - 2) and streamer.late_loads == 0
+            if timing:
+                assert made and stats["copies_timed"] == stats["loads"] - 2
+            else:
+                assert not made and stats["copies_timed"] == 0 and stats["waits_forward"] == 0
+        finally:
+            streamer.restore()
+    for (out_a, grads_a), (out_b, grads_b) in zip(results[0], results[1]):
+        assert torch.equal(out_a, out_b) and _same(grads_a, grads_b)
 
 
 def test_stream_only_mlp(matmul_path):
@@ -587,7 +618,7 @@ def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
     layers = find_decoder_layers(model)
     owner = {id(m): i for i, layer in enumerate(layers) for m in layer.modules()}
     events, sleep = [], [0]
-    rebuild = fused_proj._weights
+    rebuild, attn_rebuild = fused_proj._weights, fused_proj._attn_weights
 
     def traced_weights(bases, dtype, device, offset=0):
         events.append(("rebuild", owner[id(bases[0])], None))
@@ -595,7 +626,14 @@ def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
             torch.cuda._sleep(sleep[0])
         return rebuild(bases, dtype, device, offset)
 
+    def traced_attn_weights(plan, device):  # q, k, v and o (SOUP_SOLUTION_CPU_DIET)
+        events.append(("rebuild", owner[id(plan.bases[0])], None))
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return attn_rebuild(plan, device)
+
     monkeypatch.setattr(fused_proj, "_weights", traced_weights)
+    monkeypatch.setattr(fused_proj, "_attn_weights", traced_attn_weights)
 
     def step():
         with offload_saved_tensors(), sdpa_kernel(SDPBackend.MATH):
@@ -626,8 +664,7 @@ def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
         checked = list(events)
         # the check sees a backward without the marker's loads: the forward still matches, the
         # gradients of the layers whose slots hold later layers at the end of the forward do not
-        monkeypatch.setattr(weight_stream._LayerExit, "backward",
-                            staticmethod(lambda ctx, grad: (grad, None, None)))
+        monkeypatch.setattr(weight_stream, "_layer_backward", lambda streamer, index: None)
         broken = step()
         assert torch.equal(broken[0], reference[0]) and not _same(reference, broken)
     finally:

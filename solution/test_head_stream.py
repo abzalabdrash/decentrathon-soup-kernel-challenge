@@ -167,14 +167,21 @@ def test_streamed_head_counts_and_ring(streamed):
     streamer.configure(rows=8192, slots=2)
     hidden = torch.randn(64, D, device="cuda")
     targets = _targets(64, "mixed", seed=3)
-    streamer.prefetch()  # what a training embedding lookup does
-    loads, late = streamer.loads, streamer.late_loads
-    fused_lm_head_loss(hidden, param, targets)
-    assert streamer.loads - loads == streamer.n_chunks - 2
-    assert streamer.late_loads == late
-    assert streamer._ring is None
-    stats = streamer.stats()
-    assert stats["copies_timed"] == stats["loads"]
+    results = []
+    for timing in (True, False):  # SOUP_SOLUTION_STREAM_TIMING=1, and the default
+        streamer.timing = timing
+        timed, before = streamer.stats()["copies_timed"], streamer.loads
+        streamer.prefetch()  # what a training embedding lookup does
+        loads, late = streamer.loads, streamer.late_loads
+        results.append(fused_lm_head_loss(hidden, param, targets))
+        assert streamer.loads - loads == streamer.n_chunks - 2
+        assert streamer.late_loads == late
+        assert streamer._ring is None and streamer._slot_views is None
+        stats = streamer.stats()
+        assert stats["timing"] is timing
+        assert stats["copies_timed"] - timed == (streamer.n_chunks if timing else 0)
+        assert streamer.loads - before == streamer.n_chunks
+    assert all(torch.equal(a, b) for a, b in zip(*results))
 
 
 def test_embedding_lookup_is_exact(streamed):
