@@ -1,6 +1,6 @@
 # C1: the CPU side of the training step (branch `claude/c1-cpu-diet-0b2063`)
 
-Status: draft, T4 numbers below are filled in as the sessions finish.
+Status (handover, usage limit): branch head below; defaults = all C1 switches on except ATTN_ONE_FUNCTION.
 
 ## Step 1: what the CPU does per step (T4, main a6c3fe3 + profiler, session soup-c1-prof, 3ace6b7)
 
@@ -111,4 +111,15 @@ so in the one-node attention the o_proj output's gradient (N x 1536 halves: 4.2 
 is off by default from bc35c89 (memory first), and its view savings moved to the three nodes
 (`SOUP_SOLUTION_FEWER_VIEWS=1`). Checks 3, 4, 9 pass in all five runs.
 
-**ABBA 3** (bc35c89, the final defaults): (pending)
+**Memory attribution** (namedesign, soup-c1-mem1, 4775b01, one run each): allocated peak 238.8 MiB with
+the one-node attention (default in 4775b01), 238.8 with MLP_ADDMM_INPLACE=0, 238.8 with
+LAYER_EXIT_HOOK=0, **234.6 with ATTN_ONE_FUNCTION=0** (cause confirmed); reserved 272 / nvidia-smi 401 in
+all four, so the 252 / 381 of 9e72037 also depends on allocation order of a later change (not found).
+
+**In flight / left:**
+- peagverr kernel `soup-c1-abba4` (bc35c89 = final defaults): ABBA main path vs c1 + a profiled c1 run
+  + T4 `pytest solution`; fetch with `wsl -d Ubuntu -- bash tools/kaggle_wsl.sh 2 --attach --slug
+  soup-c1-abba4 --mode variants --commit bc35c89`; it shows wall/steps3+/short steps/peak of the final
+  defaults and the per-layer timeline.
+- left: find which change after 9e72037 lost the 20 MiB reserved segment (try FEWER_VIEWS=0 and
+  DEQUANT_REUSE variants on Modal), then fill this section and the report.
