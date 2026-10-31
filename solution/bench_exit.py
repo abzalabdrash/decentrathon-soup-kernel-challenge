@@ -1,6 +1,6 @@
 """Where the end of a `soup train` process goes: base against our solution, measured on the run itself.
 
-    python -m solution.bench_exit [--rounds 2] [--variant LABEL:base|solution[:K=V,K=V]] ...
+    python -m solution.bench_exit [--rounds 2] [--variant LABEL:base|solution[:K=V/K=V]] ...
 
 Each run is the harness's own command (`harness/_train.py --config ... [--solution]`, the config from
 run_task.make_config, the same environment as run_task.train: offline, empty Triton and Inductor
@@ -243,7 +243,7 @@ def parse_variant(text):
     label, side = parts[0], parts[1] if len(parts) > 1 else "solution"
     if side not in ("base", "solution"):
         raise SystemExit(f"--variant {text}: side must be base or solution")
-    env = dict(pair.split("=", 1) for pair in (parts[2].split(",") if len(parts) > 2 and parts[2] else []))
+    env = dict(pair.split("=", 1) for pair in (re.split(r"[,/]", parts[2]) if len(parts) > 2 and parts[2] else []))
     return label, side, env
 
 

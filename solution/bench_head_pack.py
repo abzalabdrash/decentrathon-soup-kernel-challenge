@@ -2,7 +2,9 @@
 decode time per chunk, and the streamed head's time and memory with the fp16 ring against the packed
 ring at the run's token counts.
 
-    python -m solution.bench_head_pack [--rows 4096] [--tokens 300,650,830,1100,1400,1970] [--reps 6]
+    python -m solution.bench_head_pack [--rows 4096] [--tokens 300/650/830/1100/1400/1970] [--reps 6]
+
+(lists separated by "," or "/": tools/kaggle_run.py --bench takes no commas)
 
 The weight is Qwen2.5-1.5B-Instruct's tied embedding, cast bf16 -> fp16 as the run loads it. The head
 is called right after its prefetch (no layer compute to hide the first copies behind: the worst case
@@ -10,6 +12,7 @@ for the copies), alternating fp16 and packed, CUDA-synchronized wall time per he
 """
 
 import argparse
+import re
 import statistics
 import time
 
@@ -117,7 +120,7 @@ def main():
     started = time.perf_counter()
     weight = load_weight()
     print(f"weight {tuple(weight.shape)} {weight.dtype} loaded in {time.perf_counter() - started:.1f} s", flush=True)
-    for rows in [int(r) for r in args.rows.split(",")]:
+    for rows in [int(r) for r in re.split(r"[,/]", args.rows)]:
         param = torch.nn.Parameter(weight.cuda(), requires_grad=False)
         streamer = HeadStreamer(param, rows=rows, slots=2)
         del param
@@ -142,7 +145,7 @@ def main():
         for (block, warps), (ms, exact) in sweep_decode(streamer, pack).items():
             print(f"rows {rows} decode BLOCK {block} pairs, {warps} warps: {ms * 1000:.1f} us per chunk "
                   f"({rows * streamer.hidden * 3.5 / ms / 1e6:.0f} GB/s), exact {exact}", flush=True)
-        for n in [int(x) for x in args.tokens.split(",")]:
+        for n in [int(x) for x in re.split(r"[,/]", args.tokens)]:
             times, peak, same = time_heads(streamer, pack, n, args.reps)
             print(f"rows {rows} N {n:5d}: head fp16 {times['fp16']:7.2f} ms, packed {times['packed']:7.2f} ms "
                   f"({times['packed'] - times['fp16']:+.2f}); head memory above the start fp16 {peak['fp16']:.1f} "
