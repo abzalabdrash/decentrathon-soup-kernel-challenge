@@ -75,8 +75,9 @@ queues the ones made since.
 The thread, and what it costs the main thread
 ---------------------------------------------
 Everything runs in this process. The compile, the
-ptxas and C compiler subprocesses and the cubin loads drop and retake the GIL many times, so the
-thread lowers the switch interval to 1 ms while it runs (see `_run`). Its largest single cost next
+ptxas and C compiler subprocesses and the cubin loads drop and retake the GIL many times; the switch
+interval stays the interpreter's (the organizers forbade changing it, answer 31), so while the main
+thread runs Python each retake waits up to 5 ms. Its largest single cost next
 to the model load was triton's own hash, 415 MB of libtriton.so read and digested (`_triton_key`):
 `start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. With
 SOUP_SOLUTION_TRITON_KEY=light (the default; =full for triton's own) the key names libtriton.so by its
@@ -91,7 +92,7 @@ begin shows whether the warm-up fits.
 Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default)|setup
 (the thread starts when Soup's model setup begins: Soup's command line, config and data reading
 after apply() run without the workers' GIL contention),
-SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
+SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
 SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
 Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
 the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
@@ -145,7 +146,6 @@ import sys
 import threading
 import time
 
-SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
 EXIT_TIMEOUT = 60.0  # join interval of the exit's wait for the warm-up threads (see _shutdown)
 # threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
@@ -604,9 +604,8 @@ def _worker(device, stream, log):
                 print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
 
 
-def _run(device, log, workers, switch):
+def _run(device, log, workers):
     begin = time.perf_counter()
-    previous = ours = None
     helpers, stream = [], None
     try:
         import torch
@@ -615,14 +614,9 @@ def _run(device, log, workers, switch):
         torch.cuda.set_device(device)
         stream = torch.cuda.Stream(device)
         # The compile drops and retakes the GIL many times; while the main thread runs Python, every
-        # retake waits for the switch interval (5 ms by default). RTX 3050 Ti, one worker, medians of
-        # 3 (bench_warmup.py gil, before rmsnorm / nf4 / rope): 3.1 s with the main thread waiting;
-        # with it spinning a Python counter, 15.3 s at 5 ms (counter at 100% of its rate alone),
-        # 5.5 s at 1 ms (89%), 4.0 s at 0.2 ms (79%). 1 ms keeps the warm-up short and costs the main
-        # thread at most about 11% while it runs (SOUP_SOLUTION_WARMUP_SWITCH_MS sets it).
-        # The organizers forbade sys.setswitchinterval in apply() (chat, question 31, 31 Oct): the
-        # interval stays at the interpreter's default while the warm-up runs (`switch` is unused).
-        previous = ours = None
+        # retake waits for the switch interval (5 ms, the interpreter's: the organizers forbade
+        # changing it, answer 31). RTX 3050 Ti, one worker (bench_warmup.py gil): 3.1 s with the main
+        # thread waiting, 15.3 s with it spinning a Python counter.
         _prepare_triton()
         from . import launcher_one
 
@@ -658,8 +652,6 @@ def _run(device, log, workers, switch):
                 stream.synchronize()
             except Exception as exc:  # noqa: BLE001 - the warm-up is optional
                 _STATE["errors"]["(stream)"] = repr(exc)
-        if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
-            sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
         _DONE.set()
         if log and not _STOP.is_set():
@@ -1007,8 +999,7 @@ def start_background_warmup(log=True, final=True, release=False):
         if _STATE["thread"] is None:
             _STATE["begin"] = time.perf_counter()
             workers = int(_setting("SOUP_SOLUTION_WARMUP_WORKERS", WORKERS, int))
-            switch = _setting("SOUP_SOLUTION_WARMUP_SWITCH_MS", SWITCH_INTERVAL * 1000, float) / 1000
-            thread = threading.Thread(target=_run, args=(device, log, workers, switch),
+            thread = threading.Thread(target=_run, args=(device, log, workers),
                                       name="solution-warmup", daemon=True)
             _STATE["thread"] = thread
             _register_shutdown()

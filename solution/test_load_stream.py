@@ -251,3 +251,60 @@ def test_meta_init_same_setup(patched, tiny_dir, monkeypatch):
     assert ours["skipped"] > 0 and theirs["skipped"] == 0
     assert all(a.equal(b) for a, b in zip(ours["rng"], theirs["rng"]))
     assert len(ours_step) == len(theirs_step) and all(torch.equal(a, b) for a, b in zip(ours_step, theirs_step))
+
+
+def test_meta_init_same_rng_lora_and_weights(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_META_INIT on Soup's setup path without any reseeding between the load and peft:
+    (a) the CPU and CUDA generators after the whole setup, (b) every LoRA A and B tensor, (c) every
+    loaded weight (packed 4-bit data, quant-state absmax, norms, the embedding's host copy) are the
+    same bits as without the switch."""
+    import bitsandbytes as bnb
+    import peft
+    from peft import LoraConfig, get_peft_model
+
+    from solution import load_stream
+    from solution.head_stream import streamer_for
+    from solution.weight_stream import streamer_of
+
+    def run(flag):
+        monkeypatch.setenv("SOUP_SOLUTION_META_INIT", flag)
+        seen = {}
+
+        def fake_setup(self):
+            model = _load(tiny_dir)
+            weights = {}
+            for name, module in model.named_modules():
+                if isinstance(module, bnb.nn.Linear4bit):
+                    weights[name] = module.weight.data.to("cpu", copy=True)
+                    weights[name + ".absmax"] = module.weight.quant_state.absmax.to("cpu", copy=True)
+            for name, param in model.named_parameters():
+                if not isinstance(param, bnb.nn.Params4bit):
+                    streamer = streamer_for(param)
+                    weights[name] = (streamer.host if streamer is not None else param.data).to("cpu", copy=True)
+            seen["weights"] = weights
+            model = peft.prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+            self.model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05,
+                                                          target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"))
+
+        torch.manual_seed(1)  # Soup seeds once before its setup; nothing reseeds after
+        torch.cuda.manual_seed_all(1)
+        before = load_stream.LAST_META_INIT["skipped"]
+        wrapper = patched.__new__(patched)
+        wrapper._fake_setup = fake_setup.__get__(wrapper)
+        patched._setup_transformers(wrapper)
+        model = wrapper.model
+        seen["skipped"] = load_stream.LAST_META_INIT["skipped"] - before
+        seen["rng"] = (torch.get_rng_state(), torch.cuda.get_rng_state())
+        seen["lora"] = {name: param.detach().to("cpu", copy=True) for name, param in model.named_parameters()
+                        if "lora_" in name}
+        streamer_of(model).restore()
+        streamer_for(model.get_base_model().get_input_embeddings().weight).restore()
+        return seen
+
+    ours, theirs = run("1"), run("0")
+    assert ours["skipped"] > 0 and theirs["skipped"] == 0
+    assert all(a.equal(b) for a, b in zip(ours["rng"], theirs["rng"]))  # (a)
+    assert ours["lora"].keys() == theirs["lora"].keys() and len(ours["lora"]) == 4 * LAYERS
+    assert all(torch.equal(ours["lora"][k], theirs["lora"][k]) for k in theirs["lora"])  # (b)
+    assert ours["weights"].keys() == theirs["weights"].keys()
+    assert all(torch.equal(ours["weights"][k], theirs["weights"][k]) for k in theirs["weights"])  # (c)

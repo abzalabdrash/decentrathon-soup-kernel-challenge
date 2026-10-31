@@ -543,6 +543,10 @@ def _scoped_setup(original):
             _STATE["depth"] -= 1
             if _STATE["depth"] <= 0:
                 _STATE["opened"] = []  # files of loads this module did not handle
+                if _early_on():
+                    from .load_early import release as release_early
+
+                    release_early()  # LOAD_EARLY: whatever the setup did not use is dropped here
 
     return _setup_transformers
 
@@ -569,6 +573,11 @@ def _loader(original):
             return original(*args, **kwargs)
         ranges = None
         opened, _STATE["opened"] = _STATE["opened"], []
+        if _early_on():
+            from .load_early import covers, release as release_early
+
+            if not any(covers(path) for path, _ in opened):
+                release_early()  # LOAD_EARLY read other files than this load opens: drop them
         if ((_flag("SOUP_SOLUTION_LOAD_PREAD") or _early_on()) and hasattr(os, "preadv")
                 and isinstance(bound.get("state_dict"), dict) and opened):
             try:

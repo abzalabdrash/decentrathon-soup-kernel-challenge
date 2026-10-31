@@ -11,14 +11,20 @@ still waited 0.3 s for staging. The imports before it (3 s of the main thread, G
 of the four vCPUs idle.
 
 Here, first thing in apply():
-- the checkpoint files are found as transformers will find them for Soup: the `base` of the config
-  Soup runs with (`--config` in sys.argv), a local directory, or its Hugging Face cache snapshot
-  (`refs/main`), `model.safetensors` or the files of `model.safetensors.index.json`; any doubt (no
-  config, no snapshot, a header that does not parse) and nothing is read;
+- the checkpoint files are guessed as transformers will find them for Soup: the `base` of the config
+  Soup runs with (the `--config` argument of `soup train` in sys.argv, read only as a hint of which
+  files to read: an input-derived guess, not a mode switch; the same input gives the same behaviour in
+  tests and in a measured run), a local directory, or its Hugging Face cache snapshot (`refs/main`),
+  `model.safetensors` or the files of `model.safetensors.index.json`; without `--config`, a snapshot
+  or a header that parses, nothing is read;
 - a thread reads each file's data section (after the 8-byte length and the JSON header) with
   `preadv` into one host tensor per file, in chunks that end on tensor boundaries (~128 MiB), and
   registers each chunk with the driver (`cudaHostRegister`) once it is read; a chunk's event is set
   when it is pinned;
+- the guess is checked against what Soup actually loads: only a file that transformers opens itself
+  (load_stream.py records its `safe_open` calls) with the same real path, size and modification time
+  as the file read ahead is served from memory; when the handled load opens none of them, or when
+  Soup's model setup ends, the buffers are dropped and the load goes the usual way;
 - load_pinned.py, for a tensor whose file range (LOAD_PREAD's mapping of the loader's slices to the
   header) lies in a chunk, takes a view of that chunk as the staged bytes once the chunk's event is
   set, and copies it to the GPU from there (the same bytes the slice holds; the cast on the GPU as
@@ -60,8 +66,9 @@ class _Chunk:
 class _File:
     """One checkpoint file's data section in host memory."""
 
-    def __init__(self, path, data_start, size, chunks):
+    def __init__(self, path, data_start, size, chunks, stamp):
         self.path, self.data_start, self.size, self.chunks = path, data_start, size, chunks
+        self.stamp = stamp  # (size, mtime_ns) of the file when it was planned
         self.buffer = None
         self.failed = False
 
@@ -121,7 +128,8 @@ def _plan(path):
     with open(path, "rb") as f:
         length = struct.unpack("<Q", f.read(8))[0]
         header = json.loads(f.read(length))
-        size = os.fstat(f.fileno()).st_size - 8 - length
+        stat = os.fstat(f.fileno())
+        size = stat.st_size - 8 - length
     ends = sorted(info["data_offsets"][1] for key, info in header.items() if key != "__metadata__")
     chunks, start = [], 0
     for end in ends:
@@ -130,7 +138,7 @@ def _plan(path):
             start = end
     if start < size:
         chunks.append(_Chunk(start, size))
-    return _File(os.path.realpath(path), 8 + length, size, chunks)
+    return _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
 
 
 # ---------------------------------------------------------------- the reading thread
@@ -210,11 +218,23 @@ def view(path, offset, nbytes):
 
 
 def covers(path):
-    return bool(_STATE["files"]) and os.path.realpath(path) in _STATE["files"] and not _STATE["released"]
+    """Whether `path`, a file transformers opened, is one read ahead: the same real path, size and
+    modification time."""
+    if not _STATE["files"] or _STATE["released"]:
+        return False
+    entry = _STATE["files"].get(os.path.realpath(path))
+    if entry is None:
+        return False
+    try:
+        stat = os.stat(entry.path)
+    except OSError:
+        return False
+    return (stat.st_size, stat.st_mtime_ns) == entry.stamp
 
 
 def release(log=print):
-    """After the load's copies are done: unregisters the chunks and frees the memory, in a thread."""
+    """After the load's copies are done (or when the load does not use them): unregisters the chunks
+    and frees the memory, in a thread. Idempotent."""
     with _LOCK:
         if _STATE["released"] or not _STATE["files"]:
             return

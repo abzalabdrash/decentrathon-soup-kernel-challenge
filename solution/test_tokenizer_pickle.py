@@ -216,3 +216,12 @@ training:
   quantization: 4bit
 output: ./runs/out
 """
+
+
+def test_runtime_gate_is_cheap_and_on_here():
+    """The run-time gate is a version and structure check, not a pickle (the equivalence is the tests')."""
+    import time
+
+    started = time.perf_counter()
+    assert tokenizer_pickle._compatible()
+    assert time.perf_counter() - started < 0.05

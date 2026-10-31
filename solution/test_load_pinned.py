@@ -967,7 +967,7 @@ def test_real_load_bit_equal(patched, real_dir, monkeypatch, cast):
 # ---- SOUP_SOLUTION_LOAD_EARLY (load_early.py) ---------------------------------------------------------
 
 
-def _early_read(monkeypatch, path, chunk_bytes=64 << 10, fail=False):
+def _early_read(monkeypatch, path, chunk_bytes=64 << 10, fail=False, read_from=None):
     """load_early.py's reading thread started on the checkpoint in `path` (small chunks: several per
     file), its switch on, the safe_open hook installed; returns the module's state."""
     from transformers import modeling_utils
@@ -979,7 +979,7 @@ def _early_read(monkeypatch, path, chunk_bytes=64 << 10, fail=False):
     monkeypatch.setattr(load_early, "CHUNK_BYTES", chunk_bytes)
     state = {"thread": None, "files": {}, "error": None, "seconds": None, "bytes": 0, "used": 0, "released": False}
     monkeypatch.setattr(load_early, "_STATE", state)
-    files = [load_early._plan(p) for p in sorted(glob.glob(os.path.join(str(path), "*.safetensors")))]
+    files = [load_early._plan(p) for p in sorted(glob.glob(os.path.join(str(read_from or path), "*.safetensors")))]
     assert files and all(len(f.chunks) > 1 for f in files)
     state["files"] = {f.path: f for f in files}
     if fail:
@@ -1071,3 +1071,22 @@ def test_early_files_from_config_and_cache(tmp_path, monkeypatch):
     assert load_early._config_base(["soup", "train"]) is None
     monkeypatch.delenv("SOUP_SOLUTION_LOAD_EARLY", raising=False)
     assert not load_early.enabled()
+
+
+@cuda
+def test_tiny_load_early_other_files_dropped(patched, tiny_dir, monkeypatch, tmp_path):
+    """The files read ahead are not the ones the load opens (another copy of the checkpoint): the
+    buffers are dropped when the load starts, every tensor is staged the usual way, the same load."""
+    import shutil
+
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_early)
+    other = tmp_path / "copy"
+    shutil.copytree(tiny_dir, other)
+    state = _early_read(monkeypatch, tiny_dir, read_from=other)
+    ours = _load_in_setup(patched, tiny_dir, _with_early)
+    snapshot, (early, planned, copied, fallbacks, reason) = ours["result"]
+    assert early == 0 and state["used"] == 0 and state["released"] and reason is None
+    _compare(snapshot, without["result"][0])

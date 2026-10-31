@@ -28,9 +28,10 @@ container, with the pickler's own memo and framing:
   commit it: before each str, int and tuple, when the current frame holds 64 KiB or more.
 
 The pickle, and so the fingerprint, is the same byte for byte (tests on the real Qwen2.5 tokenizer
-and on Soup's map; at install a check pickles a synthetic state both ways and keeps the original path
-on any difference). Anything the markers do not reproduce (another type inside the containers, a
-duplicate or already memoized tuple, a string of 64 KiB or more, an int outside 32 bits, a dict that
+and on Soup's map, and on a synthetic state that crosses frames, batches and every str and int form;
+at run time only a cheap gate: the Python and dill versions those tests cover, datasets' pickler).
+Anything the markers do not reproduce (another type inside the containers, a duplicate or already
+memoized tuple, a string of 64 KiB or more, an int outside 32 bits, a dict that
 does not sort, a pickler without framing, protocol < 4, a memo-less "fast" pickler, dill or pickle
 dispatch other than the stock ones) takes datasets' own reducer for the whole tokenizer. Nothing else
 in the stream changes: the rest of the state, the class, the backend tokenizer with datasets' own
@@ -328,7 +329,30 @@ def _fast_reducer(original, checked=lambda: LAST["check"], counts=LAST):
     return save
 
 
-# ---------------------------------------------------------------- the install-time check
+# ---------------------------------------------------------------- the checks
+
+_PYTHONS = ((3, 11), (3, 12), (3, 13))  # pickle.py's _Pickler as the markers reproduce it (tested: 3.12, 3.13)
+_DILLS = ("0.3.8", "0.3.9", "0.4.0", "0.4.1")  # the dill releases datasets 5 supports (datasets/utils/_dill.py)
+
+
+def _compatible():
+    """The run-time gate (cheap): a Python whose pure-Python pickler the markers reproduce, a dill
+    release datasets supports, datasets' own pickler and tokenizer reducer in place. The byte-for-byte
+    equivalence with datasets' own pickle is checked by the tests (`_self_check`, and the real Qwen2.5
+    tokenizer and Soup's map in test_tokenizer_pickle.py), not at run time. Per pickler, `_usable` checks
+    its protocol, framing, memo and dispatch when the tokenizer is pickled."""
+    try:
+        import sys
+
+        import dill
+        from datasets.utils import _dill
+
+        return (sys.version_info[:2] in _PYTHONS and dill.__version__ in _DILLS
+                and callable(getattr(_dill, "_save_transformersPreTrainedTokenizerBase", None))
+                and issubclass(_dill.Pickler, pickle._Pickler))
+    except Exception:  # noqa: BLE001 - datasets' own reducer then
+        return False
+
 
 def _self_check():
     """Pickles a synthetic tokenizer-like state with datasets' pickler, plainly and through the
@@ -395,11 +419,7 @@ def install():
         replaced = [t for t, f in list(dispatch.items()) if f is original]
         dispatch[_Marker] = _save_marker
         if LAST["check"] is None:
-            try:
-                LAST["check"] = bool(_self_check())
-            except Exception as exc:  # noqa: BLE001 - datasets' own reducer then
-                LAST["check"] = False
-                LAST["fallback"] = f"check: {exc!r}"
+            LAST["check"] = _compatible()
         if not LAST["check"]:
             dispatch.pop(_Marker, None)
             return None

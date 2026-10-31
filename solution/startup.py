@@ -70,14 +70,6 @@ is installed during a run (the rules forbid it; the harness compares `pip freeze
 are the ones the calls would compute; the organizers allow the same for packages_distributions().
 This replacement stays for the whole run.
 
-The objects of all these imports live as long as the process. `freeze_imported_objects` (the end
-of apply()) moves them out of the garbage collector's reach with `gc.freeze()`, CPython's API for
-exactly that: the full collections that come later (accelerate's `free_memory` runs `gc.collect()`
-when training starts, 0.28 s on Kaggle, and Python's own) no longer walk the ~0.5 M objects
-(0.13 s per collection after apply() on the RTX 3050 Ti box, 0.00 s once frozen). Frozen objects
-are still freed by reference counting; only a reference cycle among them would never be collected,
-and at the end of apply() no model, tensor or dataset exists yet to be caught in one.
-
 The trainer build (`patch_soup_dataset_hashing`)
 ------------------------------------------------
 Soup tokenizes the training rows with `Dataset.from_list(rows).map(checked_format_row, ...)`
@@ -226,14 +218,6 @@ def _import(name, seconds):
     start = time.perf_counter()
     importlib.import_module(name)
     seconds[name] = round(time.perf_counter() - start, 3)
-
-
-def freeze_imported_objects():
-    """gc.freeze() (see the module docstring). Returns the number of objects frozen."""
-    import gc
-
-    gc.freeze()
-    return gc.get_freeze_count()
 
 
 def prepare_imports(log=True):

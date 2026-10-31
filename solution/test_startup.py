@@ -138,15 +138,6 @@ def test_distributions_copy_is_independent(monkeypatch):
         assert metadata.packages_distributions is original
 
 
-def test_freeze_in_a_fresh_process():
-    code = ("import sys; sys.path.insert(0, sys.argv[1]); import gc; "
-            "from solution.startup import freeze_imported_objects; n = freeze_imported_objects(); "
-            "print(n > 1000, gc.get_freeze_count() == n)")
-    out = subprocess.run([sys.executable, "-c", code, str(REPO)], capture_output=True, text=True,
-                         timeout=120)
-    assert out.returncode == 0 and out.stdout.split() == ["True", "True"], out.stderr[-2000:]
-
-
 @pytest.fixture(scope="module")
 def tokenizer():
     pytest.importorskip("datasets")
