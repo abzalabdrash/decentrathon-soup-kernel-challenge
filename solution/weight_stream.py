@@ -98,6 +98,9 @@ def _env_on(name, default):
 # waits are timed as well, and so are head_stream.py's chunks; off by default since the CPU-side
 # task C1 (two pairs of events per layer and pass and per head chunk, read back with queries: CPU
 # time on every step for numbers only the logs show)
+# SOUP_SOLUTION_RING_EARLY_RELEASE=1: the int8 MLP backward (int8_bwd.mlp_backward) releases each matrix's
+# slot right after its decode, not after the whole backward, so the next layer's copy starts earlier
+EARLY_RELEASE = _env_on("SOUP_SOLUTION_RING_EARLY_RELEASE", "1")
 _RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),
          "stream_timing": _env_on("SOUP_SOLUTION_STREAM_TIMING", "0")}
 
