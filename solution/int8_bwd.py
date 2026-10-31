@@ -102,8 +102,9 @@ def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, q_ptr
     # time. dL/dhidden from the int32 product and its two scale vectors, the SwiGLU derivative over
     # (gate | up) stored as (2I, tokens), written back over it in half; the group's per-token absmax
     # of what was written goes to pmax[grp, token] (no atomics: quant_t_int8_kernel takes the max).
-    # INT8_IN: (gate | up) is read from offload_int8.py's int8 form instead (q (2I, tokens) int8, qs
-    # (2I // QGROUP, tokens) fp32 scales), and the derivative goes over the int32 product itself
+    # INT8_IN: (gate | up) is read from offload_int8.py's int8 form instead (q (I, tokens) int16 holding
+    # both halves' int8, qs (2I // QGROUP, tokens) fp32 scales), and the derivative goes over the int32
+    # product itself
     # (gate_up_ptr = acc_ptr as half): d_gate[i, t] and d_up[i, t] take the two halves of acc[i, t],
     # which only this program reads, after reading it (quant_t_int8_kernel with IL reads that layout)
     tok = tl.program_id(0) * TM + tl.arange(0, TM)
@@ -122,11 +123,12 @@ def int8_swiglu_bwd_kernel(acc_ptr, w_scale_ptr, g_scale_ptr, gate_up_ptr, q_ptr
                          mask=live[None, :], other=0.0)
             su = tl.load(qs_ptr + ((inter + feat) // QGROUP)[:, None].to(tl.int64) * tokens
                          + tok[None, :], mask=live[None, :], other=0.0)
+            # one int16 per element: the gate's int8 in the low byte, the up's in the high one;
             # rounded to half as offload_int8's rebuild pass writes them: the same values either way
+            packed = tl.load(q_ptr + at, mask=live[None, :], other=0).to(tl.int32)
             half: tl.constexpr = gate_up_ptr.dtype.element_ty
-            g = (tl.load(q_ptr + at, mask=live[None, :], other=0).to(tl.float32) * sg).to(half)
-            u = (tl.load(q_ptr + up_shift + at, mask=live[None, :], other=0).to(tl.float32) * su).to(half)
-            g, u = g.to(tl.float32), u.to(tl.float32)
+            g = (((packed << 24) >> 24).to(tl.float32) * sg).to(half).to(tl.float32)
+            u = ((packed >> 8).to(tl.float32) * su).to(half).to(tl.float32)
         else:
             g = tl.load(gate_up_ptr + at, mask=live[None, :], other=0.0).to(tl.float32)
             u = tl.load(gate_up_ptr + up_shift + at, mask=live[None, :], other=0.0).to(tl.float32)
@@ -341,7 +343,7 @@ def _warm():
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M, IL=False)
     if offload_int8._STATE["on"] and offload_int8.RAW["on"]:  # its raw unpack hands the int8 form over
-        compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, i8, f32, f32, INTERMEDIATE,
+        compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, torch.int16, f32, f32, INTERMEDIATE,
                        tokens, INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=offload_int8.GROUP,
                        INT8_IN=True)
         compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens,

@@ -32,6 +32,16 @@ def _time(fn, iters=30, inner=1):
     return statistics.median(times)
 
 
+def _example_swiglu(x, hidden):
+    import triton
+
+    from solution.swiglu import example_swiglu_fwd_kernel
+
+    inter, m = hidden.shape
+    example_swiglu_fwd_kernel[(triton.cdiv(inter * m, 1024),)](x[:inter], x[inter:], hidden, inter * m,
+                                                               BLOCK=1024)
+
+
 def tiles(ms, configs):
     """quant and rebuild per layer for (tokens per program) x (warps) configurations."""
     from solution import offload_int8
@@ -42,11 +52,12 @@ def tiles(ms, configs):
         line = []
         for m in ms:
             x = (torch.randn(rows, m, device="cuda") * 2).half()
-            spare = torch.empty((rows // 2, m), dtype=x.dtype, device="cuda")
-            wire, codec = offload_int8.encode(x, spare)
-            quant = _time(lambda: offload_int8.encode(x, spare), inner=10)
+            hidden = torch.empty((rows // 2, m), dtype=x.dtype, device="cuda")
+            wire, codec = offload_int8.encode(x)
+            swiglu = _time(lambda: _example_swiglu(x, hidden), inner=10)
+            quant = _time(lambda: offload_int8.swiglu_quant(x, hidden), inner=10)
             rebuild = _time(lambda: codec.decode(wire), inner=10)
-            line.append(f"M={m}: quant {quant:.3f} rebuild {rebuild:.3f}")
+            line.append(f"M={m}: SwiGLU {swiglu:.3f} SwiGLU+int8 {quant:.3f} rebuild {rebuild:.3f}")
         print(f"tile {config:8s} " + "  ".join(line), flush=True)
 
 
@@ -56,14 +67,17 @@ def kernels_and_copies(ms, layers=28):
     offload_int8.compile_now()
     rows = 2 * 8960
     print(f"per layer ((gate|up) of {rows} rows, group {offload_int8.GROUP}); x{layers} = per step")
-    print(f"{'M':>6s} {'quant':>7s} {'rebuild':>8s} {'D2H f16':>8s} {'D2H i8':>7s} {'H2D f16':>8s} "
+    print(f"{'M':>6s} {'+quant':>7s} {'rebuild':>8s} {'D2H f16':>8s} {'D2H i8':>7s} {'H2D f16':>8s} "
           f"{'H2D i8':>7s} {'PCIe saved':>11s} {'GPU added':>10s}  (ms)")
     for m in ms:
         x = (torch.randn(rows, m, device="cuda") * 2).half()
         wire, codec = offload_int8.encode(x)
         host16 = torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
         host8 = torch.empty(wire.shape, dtype=wire.dtype, pin_memory=True)
-        quant = _time(lambda: offload_int8.encode(x), inner=10)
+        hidden = torch.empty((rows // 2, m), dtype=x.dtype, device="cuda")
+        # what the int8 path adds in the forward: SwiGLU + int8 form against the example SwiGLU alone
+        quant = (_time(lambda: offload_int8.swiglu_quant(x, hidden), inner=10)
+                 - _time(lambda: _example_swiglu(x, hidden), inner=10))
         rebuild = _time(lambda: codec.decode(wire), inner=10)
         d2h16 = _time(lambda: host16.copy_(x, non_blocking=True))
         d2h8 = _time(lambda: host8.copy_(wire, non_blocking=True))

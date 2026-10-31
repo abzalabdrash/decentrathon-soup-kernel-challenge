@@ -393,9 +393,9 @@ class Offloader:
                 self.stats["residuals" if keep else "marked"] += 1
             return saved
 
-    def _offload(self, tensor, int8=False, spare=None):
-        """`int8`: the tensor (2-D, offload_int8.applies) goes in offload_int8's int8 form (its values
-        in `spare`'s storage when given)."""
+    def _offload(self, tensor, int8=False, wire=None, reserved=None):
+        """`int8`: the tensor (2-D, offload_int8.applies) goes in offload_int8's int8 form: `wire` when
+        given (swiglu_quant's (q, s), already queued), else encoded here; `reserved`: its host slot."""
         if tensor.device != self.device:
             return tensor
         inflight = self.inflight
@@ -407,14 +407,19 @@ class Offloader:
             nbytes = offload_int8.wire_bytes(*tensor.shape)
         else:
             nbytes = tensor.numel() * tensor.element_size()
-        slot, host = self.host.push(nbytes)
+        slot, host = reserved if reserved is not None else self.host.push(nbytes)
         if slot is None:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
         home = self._current()
-        # the quantization runs on home before the copy's order event: the copy reads its output
-        wire, codec = offload_int8.encode(tensor, spare) if int8 else (tensor, None)
+        codec = None
+        if int8:  # the quantization runs on home before the copy's order event
+            codec = offload_int8.Codec(tensor.shape, tensor.dtype)
+            if wire is None:
+                wire, codec = offload_int8.encode(tensor)
+        else:
+            wire = tensor
         self._order.record(home)
         side.wait_event(self._order)
         for event in self.reads:
@@ -559,27 +564,33 @@ EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "1").strip().lower() not i
     "0", "false", "no", "")
 
 
-def offload_early(tensor, spare=None):
+def offload_early(tensor, wire=None):
     """Starts the D2H copy of `tensor` now when the active Offloader would offload it on its pack
     (the MLP's (gate|up), still in the custom Function's forward); the pack of the same tensor right
-    after the forward returns this handle. When offload_int8 applies, the first call only notes the
-    tensor, and the second, with `spare` (the MLP's hidden activation after its last reader, the down
-    GEMM), quantizes it into spare's storage and starts that copy: no new buffer of its size."""
+    after the forward returns this handle. When offload_int8 applies, it only reserves the host slot
+    and returns "int8": the caller then makes the int8 form (offload_int8.swiglu_quant, in place) and
+    calls again with it as `wire`, which starts that copy. Returns None otherwise."""
     offloader = _ACTIVE["offloader"]
     if offloader is None:
-        return
+        return None
     from . import offload_int8
 
-    if spare is not None:
-        pending = offloader.pending
-        offloader.pending = None
-        if pending is None or pending() is not tensor:
-            return  # went half (or not at all) at the first call
+    if wire is not None:
+        pending, offloader.pending = offloader.pending, None
+        if pending is None or pending[0]() is not tensor:
+            raise RuntimeError("offload_early: an int8 form for a tensor without a reserved slot")
         with offloader.lock:
-            saved = offloader._offload(tensor, int8=True, spare=spare)
+            saved = offloader._offload(tensor, int8=True, wire=wire, reserved=pending[1:])
     elif offloader.eligible(tensor) and offload_int8.applies(tensor):
-        offloader.pending = weakref.ref(tensor)
-        return
+        with offloader.lock:
+            if offloader.pending is not None:  # reserved and never filled: give the slot back
+                offloader.pending[1].released = True
+            slot, host = offloader.host.push(offload_int8.wire_bytes(*tensor.shape))
+        if slot is not None:
+            offloader.pending = (weakref.ref(tensor), slot, host)
+            return "int8"
+        offloader.pending = None
+        saved = offloader.pack(tensor)  # no pinned memory left: kept on the GPU, in half
     else:
         saved = offloader.pack(tensor)
     if saved is not tensor:

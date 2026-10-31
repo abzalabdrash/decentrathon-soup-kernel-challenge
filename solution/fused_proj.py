@@ -1534,18 +1534,24 @@ class _MLP(torch.autograd.Function):
         x16 = _padded_half(x.reshape(n, d), n, padded, half)
         gate_up = torch.empty((2 * inter, padded), dtype=half, device=x.device)
         _gate_up_matmul(plan, None, x16.t(), gate_up)
+        int8 = False
         if plan.early:
             from .offload import offload_early
 
-            offload_early(gate_up)  # its copy to the host runs under SwiGLU and the down GEMM
+            # its copy to the host runs under SwiGLU and the down GEMM; int8 (offload_int8.py): the
+            # SwiGLU below writes the int8 form over it, and that copy starts right after
+            int8 = offload_early(gate_up) == "int8"
         hidden = torch.empty((inter, padded), dtype=half, device=x.device)
         count = inter * padded
-        example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
-            gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
+        if int8:
+            from .offload_int8 import swiglu_quant
+
+            offload_early(gate_up, wire=swiglu_quant(gate_up, hidden))
+        else:
+            example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
+                gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
         w = _ring_weights(plan, (plan.down,), x.device, 1)
         out = torch.mm(hidden.t(), _t(w))  # (padded, D)
-        if plan.early:  # an int8 offload (offload_int8.py) starts here, its values in hidden's storage
-            offload_early(gate_up, spare=hidden)
         # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
         # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
         ctx.source = (norm_source(x) if plan.recompute and n == padded and _ATTN["rebuild_x16"]

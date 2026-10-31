@@ -41,7 +41,9 @@ def test_kernels_match_torch(int8_on, tokens):
     wire, codec = int8_on.encode(x)
     assert wire.dtype == torch.uint8 and wire.numel() == int8_on.wire_bytes(*x.shape)
     assert wire.numel() < 0.53 * x.numel() * 2
-    q, s = int8_on.views(wire, *x.shape)
+    packed, s = int8_on.views(wire, *x.shape)
+    packed = packed.to(torch.int32)  # the gate's int8 in the low byte, the up's in the high one
+    q = torch.cat([(packed << 24) >> 24, packed >> 8])
     rq, rs, rebuilt = _reference(x, int8_on.GROUP)
     assert torch.equal(s, rs)
     # the kernel's x * (127 / amax) may round differently from torch's at an exact .5 boundary
@@ -65,6 +67,30 @@ def _roundtrip(module, v):
     return codec.decode(wire)
 
 
+def test_swiglu_quant_keeps_the_swiglu_and_writes_the_same_int8_form(int8_on):
+    """swiglu_quant: the hidden activation bit for bit the example kernel's, and in place over the gate
+    half the int8 form encode makes from the untouched tensor (bit for bit)."""
+    import triton
+
+    from solution.swiglu import example_swiglu_fwd_kernel
+
+    g = torch.Generator("cuda").manual_seed(9)
+    tokens, inter = 840, 8960
+    x = (torch.randn(2 * inter, tokens, device="cuda", generator=g) * 2).half()
+    ref_hidden = torch.empty((inter, tokens), dtype=x.dtype, device="cuda")
+    example_swiglu_fwd_kernel[(triton.cdiv(inter * tokens, 1024),)](
+        x[:inter], x[inter:], ref_hidden, inter * tokens, BLOCK=1024)
+    wire, codec = int8_on.encode(x)
+    ref_q, ref_s = int8_on.views(wire, *x.shape)
+    hidden = torch.empty_like(ref_hidden)
+    y = x.clone()
+    q, s = int8_on.swiglu_quant(y, hidden)
+    assert torch.equal(hidden, ref_hidden)
+    assert q.data_ptr() == y.data_ptr() and q.dtype == torch.int16 and q.shape == (inter, tokens)
+    assert torch.equal(q, ref_q) and torch.equal(s, ref_s)
+    assert torch.equal(codec.decode((q, s)), codec.decode(wire))
+
+
 class Keep(torch.autograd.Function):
     """Returns x and saves `saved`; the gradient of x is grad * saved."""
 
@@ -79,29 +105,31 @@ class Keep(torch.autograd.Function):
         return grad * saved, None
 
 
-def _spare(t, kind):
-    """What the fused MLP passes as offload_early's spare: its hidden activation ((rows / 2, tokens)
-    half, exactly the int8 size), or a tensor too small to hold it (an int8 buffer is allocated)."""
-    rows, tokens = t.shape
-    return torch.empty((rows // 2, tokens) if kind == "hidden" else (8, tokens), dtype=t.dtype,
-                       device=t.device)
+def _early(t):
+    """offload_early as the fused MLP calls it: when the tensor goes int8, swiglu_quant writes the int8
+    form over it (into a scratch hidden) and the second call starts its copy."""
+    from solution.offload import offload_early
+    from solution.offload_int8 import swiglu_quant
+
+    if offload_early(t) == "int8":
+        hidden = torch.empty((t.shape[0] // 2, t.shape[1]), dtype=t.dtype, device=t.device)
+        offload_early(t, wire=swiglu_quant(t, hidden))
 
 
-def _chain(values, early, delay, spare="hidden"):
-    """x through one Keep per tensor of `values` (each made fresh on the GPU, offload_early's two
-    calls first, as the fused MLP makes them), with GPU sleeps between, inside offload_saved_tensors;
+def _chain(values, early, delay):
+    """x through one Keep per tensor of `values` (each made fresh on the GPU, offload_early's calls
+    first, as the fused MLP makes them), with GPU sleeps between, inside offload_saved_tensors;
     returns x.grad and the stats."""
-    from solution.offload import offload_early, offload_saved_tensors
+    from solution.offload import offload_saved_tensors
 
     x = torch.ones(values[0].shape, device="cuda", dtype=torch.float16, requires_grad=True)
     with offload_saved_tensors(**early) as off:
         h = x
         for v in values:
             t = v.clone()  # owns its storage, made on the compute stream
-            offload_early(t)
             if delay:
                 torch.cuda._sleep(SLEEP // 4)
-            offload_early(t, spare=_spare(t, spare))
+            _early(t)
             h = Keep.apply(h, t)
             del t
         if delay:
@@ -111,9 +139,8 @@ def _chain(values, early, delay, spare="hidden"):
     return x.grad, off.stats
 
 
-@pytest.mark.parametrize("spare", ["hidden", "small"])
 @pytest.mark.parametrize("knobs", [{}, {"prefetch": 0}, {"max_inflight": 4}])
-def test_int8_handles_through_every_way_back(int8_on, knobs, spare):
+def test_int8_handles_through_every_way_back(int8_on, knobs):
     """Six (gate|up)-shaped tensors offloaded early as int8: the backward gets each one rebuilt from
     its int8 form (the product of all of them, exactly), whichever way it came back."""
     tokens = 256
@@ -125,7 +152,7 @@ def test_int8_handles_through_every_way_back(int8_on, knobs, spare):
     for r in reversed(rebuilt):  # the backward multiplies from the last Keep to the first
         expected = expected * r
     knobs = {"min_numel": 1, **knobs}
-    grad, stats = _chain(values, knobs, delay=True, spare=spare)
+    grad, stats = _chain(values, knobs, delay=True)
     assert stats["int8"] == 6 and stats["early"] == 6
     back = stats["still_on_gpu"] + stats["prefetch_hits"] + stats["fetched"]
     assert back == 6
@@ -137,21 +164,21 @@ def test_int8_handles_through_every_way_back(int8_on, knobs, spare):
 
 
 def test_written_after_quantization_goes_half(int8_on):
-    """A tensor written in place between offload_early and its save is not taken from the int8 handle
+    """A tensor written in place between its int8 form and its save is not taken from the int8 handle
     (its version moved): the save offloads it again in half, the backward gets the written values."""
-    from solution.offload import offload_early, offload_saved_tensors
+    from solution.offload import offload_saved_tensors
 
     x = torch.ones(2 * 8960, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     t = (torch.randn(2 * 8960, 64, device="cuda") * 0.3).half()
+    written = (torch.randn(2 * 8960, 64, device="cuda") * 0.3).half()
     with offload_saved_tensors(min_numel=1) as off:
-        offload_early(t)
-        offload_early(t, spare=_spare(t, "hidden"))
-        t.add_(1)
+        _early(t)  # the int8 form now sits over t's gate half
+        t.copy_(written)
         h = Keep.apply(x, t)
         h.backward(torch.ones_like(h))
     torch.cuda.synchronize()
     assert off.stats["int8"] == 1 and off.stats["offloaded"] == 2
-    assert torch.equal(x.grad, t)
+    assert torch.equal(x.grad, written)
 
 
 def test_takeover_after_start_calls(int8_on, monkeypatch):
@@ -273,8 +300,7 @@ def test_no_record_stream_and_no_cpu_wait_on_the_int8_path(int8_on, monkeypatch)
         ys = []
         for x, v in zip(xs, values):
             t = v.clone()
-            offload.offload_early(t)
-            offload.offload_early(t, spare=_spare(t, "hidden"))
+            _early(t)
             ys.append(Keep.apply(x, t))
             del t
         torch.cuda._sleep(SLEEP)  # the copies are still queued when the backward starts
@@ -383,4 +409,4 @@ def test_int8_backward_from_the_int8_form_allocates_no_more(int8_on, monkeypatch
     print(f"\nint8 MLP backward at {tokens} tokens: (gate|up) and allocations {half_peak / 2**20:.1f} "
           f"MiB from the half form, {int8_peak / 2**20:.1f} MiB from the int8 form")
     scales = 4 * (2 * 8960 // int8_on.GROUP) * tokens
-    assert int8_peak <= half_peak + scales + (1 << 16)  # allocation rounding
+    assert int8_peak <= half_peak + scales + (2 << 20)  # large blocks are rounded to 2 MiB
