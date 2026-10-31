@@ -77,6 +77,41 @@ Relative error against the fp16 MLP backward with the half offload, one Qwen2.5-
 Groups of 64 / 256 features: 0.45 / 0.53 % alone, the same 2.3 % combined. The int8 offload adds
 ~0.5 % in quadrature to the 2.2 % that the int8 MLP backward already puts on the gradients.
 
+**Real layers, real activations** (`python -m solution.bench_offload_int8 --real 2 13 27 --data
+data/train.jsonl`, 10da017, RTX 5060 in fp16): Qwen2.5-1.5B loaded in NF4 as Soup loads it, the
+training rows through the plain transformers model for each layer's real input, then that layer (its own
+NF4 weights and norms, LoRA r=16 on q and v around its own q_proj / v_proj, random A and B) through the
+fused path; relative error against the fp16 MLP backward with the half offload:
+
+| layer, rows (tokens) | path | dL/dx | LoRA A_q, B_q, A_v, B_v |
+|---|---|---|---|
+| 2, rows 0-3 (884) | fp16 backward + int8 offload | 0.0117 | 0.0147 0.0124 0.0160 0.0140 |
+| | int8 backward + half offload (main) | 0.0708 | 0.0737 0.0695 0.1013 0.0811 |
+| | int8 backward + int8 offload (P1) | 0.0719 | 0.0736 0.0715 0.1012 0.0822 |
+| 2, 4 longest of rows 0-63 (2,048) | fp16 backward + int8 offload | 0.0117 | 0.0150 0.0146 0.0105 0.0123 |
+| | main | 0.0712 | 0.0775 0.0713 0.0675 0.0724 |
+| | P1 | 0.0723 | 0.0812 0.0759 0.0705 0.0769 |
+| 13, rows 0-3 (884) | fp16 backward + int8 offload | 0.0056 | 0.0048 0.0057 0.0058 0.0061 |
+| | main | 0.0255 | 0.0229 0.0238 0.0243 0.0279 |
+| | P1 | 0.0261 | 0.0229 0.0233 0.0249 0.0280 |
+| 13 (2,048) | fp16 backward + int8 offload | 0.0055 | 0.0073 0.0063 0.0056 0.0063 |
+| | main | 0.0253 | 0.0327 0.0276 0.0244 0.0270 |
+| | P1 | 0.0259 | 0.0341 0.0306 0.0240 0.0274 |
+| 27, rows 0-3 (884) | fp16 backward + int8 offload | 0.0077 | 0.0074 0.0075 0.0057 0.0076 |
+| | main | 0.0391 | 0.0385 0.0398 0.0302 0.0387 |
+| | P1 | 0.0398 | 0.0386 0.0398 0.0282 0.0389 |
+| 27 (2,048) | fp16 backward + int8 offload | 0.0077 | 0.0083 0.0087 0.0102 0.0079 |
+| | main | 0.0394 | 0.0370 0.0425 0.0338 0.0389 |
+| | P1 | 0.0402 | 0.0372 0.0427 0.0364 0.0393 |
+
+On real activations the int8 offload alone moves the LoRA gradients by 0.5-1.6 % (layer 2 most: its
+gate|up have outlier features), 2-3x the synthetic figure. Main's int8 MLP backward is the larger term,
+2.3-10 % (7-10 % in layer 2, against 2.2 % on synthetic data); on top of it P1 changes the error against
+fp16 by at most +0.5 points (sum in quadrature). P1 against main directly: 1.4-4.2 %, because the int8
+backward's per-token quantization of dL/d(gate|up) rounds differently once its inputs move (each path is
+~7 % from fp16 in layer 2, their difference is part of that). The checks' curves (section 6) are where
+these errors would show; layer 2's 7-10 % is a property of main's int8 backward worth a look on its own.
+
 ## 4. Cost and gain per layer (T4, soup-p1-bench2, launch latency excluded)
 
 Copies (pinned host, one layer): D2H 2.35 -> 1.19 ms at 832 tokens, 5.61 -> 2.91 ms at 2,048; H2D
