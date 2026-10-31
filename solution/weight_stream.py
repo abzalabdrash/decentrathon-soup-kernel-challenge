@@ -221,6 +221,7 @@ def pinned_host_buffer(nbytes, owner):
     if not ok or not buffer.is_pinned():
         if ok:
             _unregister(buffer)
+        del buffer  # the fallback must not hold two full host copies at once (codex/review-1)
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
     finalizer = weakref.finalize(owner, _unregister, buffer)
     _PINNED.append(finalizer)

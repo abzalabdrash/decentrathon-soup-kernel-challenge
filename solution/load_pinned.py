@@ -45,6 +45,17 @@ bitsandbytes launches its kernels on the legacy default stream, a slice that is 
 planned, an error) takes the original job for that tensor, and for every later one unless only
 that tensor's staging failed. Switch: SOUP_SOLUTION_LOAD_PINNED (on by default since the night
 integration; =0 takes the original loader).
+
+SOUP_SOLUTION_LOAD_PREAD=1 (with the GPU cast): the thread's memmove from the slice is the first
+touch of the safetensors mmap in this process, so every 4 KiB page costs a page fault on top of the
+copy: on the T4 the staging took 0.96 s for 2.5 GB and the loop waited 0.23 s for it; on the WSL box
+the whole checkpoint (2.88 GiB, page cache warm) takes 1.37 s that way against 0.24 s with
+`os.preadv` from the file into the pinned buffer. load_stream.py records which file and key each
+slice of the load is (transformers opens the files with `safe_open` and hands the slices to the
+loop in `state_dict`), and the plan reads each tensor's byte range from the file's safetensors header
+(8-byte length, JSON with dtype, shape and data offsets); a tensor whose header entry agrees with
+its slice (dtype, shape, byte count) is staged with `preadv` of exactly those bytes (the bytes the
+mmap view shows), anything else with the slice as before.
 """
 
 import ctypes
@@ -74,19 +85,33 @@ def _env_int(name, default, low, high):
     return min(max(value, low), high)
 
 
-def new_copier(device, log=print):
+def new_copier(device, log=print, locate=None):
     """A PinnedCopier for a load that load_stream.py handles (to `device`), or None when switched off
     or when one cannot be made (the load then runs as before)."""
     if not enabled():
         return None
     try:
         cast = os.environ.get("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu").strip().lower()
-        return PinnedCopier(device, window=_env_int("SOUP_SOLUTION_LOAD_PINNED_WINDOW", 0, 0, 2),
+        return PinnedCopier(device, locate=locate if cast != "cpu" else None,
+                            window=_env_int("SOUP_SOLUTION_LOAD_PINNED_WINDOW", 0, 0, 2),
                             slots=_env_int("SOUP_SOLUTION_LOAD_PINNED_SLOTS", 4, 2, 16),
                             cast="cpu" if cast == "cpu" else "gpu", log=log)
     except Exception as exc:  # noqa: BLE001 - load as usual
         log(f"[solution] pinned load copies skipped: {exc!r}")
         return None
+
+
+def _read_into(fd, offset, buffer, nbytes):
+    """`nbytes` of the file `fd` from `offset` into the start of the uint8 CPU tensor `buffer`
+    (preadv may return less than asked: it is called again for the rest)."""
+    view = (ctypes.c_char * nbytes).from_address(buffer.data_ptr())
+    memory = memoryview(view).cast("B")
+    done = 0
+    while done < nbytes:
+        got = os.preadv(fd, [memory[done:]], offset + done)
+        if got <= 0:
+            raise OSError(f"short read: {done} of {nbytes} bytes at {offset}")
+        done += got
 
 
 def _as_device(value):
@@ -104,12 +129,13 @@ def _as_device(value):
 class _Entry:
     """One checkpoint tensor of the plan and where it is: staged in a buffer, copied (ahead) to the GPU."""
 
-    __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "stage_dtype", "nbytes", "job", "ready",
+    __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "stage_dtype", "nbytes", "job", "where", "ready",
                  "released", "staged", "error", "out", "event")
 
     def __init__(self, index, source, shape, src_dtype, dtype, stage_dtype, job):
         self.index, self.source, self.shape = index, source, shape
         self.src_dtype, self.dtype, self.job = src_dtype, dtype, job
+        self.where = None  # (file descriptor, byte offset) when it is read from the file (LOAD_PREAD)
         self.stage_dtype = stage_dtype  # in the buffer and copied: `dtype`, or `src_dtype` cast on the GPU
         numel = 1
         for size in shape:
@@ -126,10 +152,12 @@ class PinnedCopier:
     the loop's first pass and returns the job the second pass calls; `close` ends it when the load
     returns or raises. Device operations are small methods, so that the CPU tests can replace them."""
 
-    def __init__(self, device, window=0, slots=4, cast="gpu", log=print):
+    def __init__(self, device, window=0, slots=4, cast="gpu", log=print, locate=None):
         self.device = torch.device(device)
         self.window, self.slots, self.log = max(0, int(window)), max(1, int(slots)), log
         self.cast = cast
+        self.locate = locate  # slice -> (fd, offset, nbytes, dtype name, shape) or None (load_stream.py)
+        self.read_from_file = 0
         self._owner = threading.get_ident()
         self._entries = []
         self._next = 0  # index of the entry the loop must ask for next
@@ -241,7 +269,17 @@ class PinnedCopier:
         stage = src_dtype if self.cast == "gpu" and src_dtype.itemsize == target.itemsize else target
         entry = _Entry(len(self._entries), source, tuple(int(size) for size in source.get_shape()),
                        src_dtype, target, stage, job)
-        return entry if 0 < entry.nbytes <= MAX_TENSOR_BYTES else None
+        if not 0 < entry.nbytes <= MAX_TENSOR_BYTES:
+            return None
+        if self.locate is not None and stage == src_dtype:
+            try:
+                found = self.locate(source)
+                if (found is not None and found[2] == entry.nbytes and found[3] == source.get_dtype()
+                        and tuple(found[4]) == entry.shape):
+                    entry.where = (found[0], found[1])
+            except Exception:  # noqa: BLE001 - staged from the slice
+                entry.where = None
+        return entry
 
     # --- the jobs (second pass) ---------------------------------------------------------------------
 
@@ -347,6 +385,8 @@ class PinnedCopier:
                 filled = time.perf_counter()
                 try:
                     entry.staged = self._stage(entry, self._buffers[slot].buffer)
+                    if entry.where is not None:
+                        self.read_from_file += 1
                 except Exception as exc:  # noqa: BLE001 - this tensor takes the original path
                     entry.error = exc
                 self.fill_seconds += time.perf_counter() - filled
@@ -362,7 +402,12 @@ class PinnedCopier:
     def _stage(entry, buffer):
         """The checkpoint slice (the same `slice[...]` as `_materialize_copy`) in the buffer: converted
         as its `.to(device, dtype)` converts it on the CPU before the copy to the GPU (the same
-        kernel), or its raw bytes when the GPU casts them (or when there is nothing to cast)."""
+        kernel), or its raw bytes when the GPU casts them (or when there is nothing to cast); with a
+        file range (LOAD_PREAD) those raw bytes read from the file."""
+        if entry.where is not None:
+            staged = buffer[:entry.nbytes].view(entry.stage_dtype).view(entry.shape)
+            _read_into(entry.where[0], entry.where[1], buffer, entry.nbytes)
+            return staged
         source = entry.source[...]
         if (not torch.is_tensor(source) or source.device.type != "cpu" or source.dtype != entry.src_dtype
                 or tuple(source.shape) != entry.shape):
@@ -426,7 +471,8 @@ class PinnedCopier:
         LAST["copier"] = self
         if self.planned:
             self.log(f"[solution] pinned load copies: {self.copied} of {self.planned} checkpoint tensors "
-                     f"({self.copied_bytes / 2**20:.0f} MiB, {self.copied_ahead} copied ahead on a side stream, "
+                     + (f"({self.read_from_file} read from the file with preadv) " if self.read_from_file else "")
+                     + f"({self.copied_bytes / 2**20:.0f} MiB, {self.copied_ahead} copied ahead on a side stream, "
                      f"window {self.window}, cast on the {self.cast.upper()}) through {len(buffers)} pinned buffers of "
                      f"{self.slot_bytes / 2**20:.1f} MiB; staging {self.fill_seconds:.2f} s in a thread "
                      f"(+{self.slot_wait_seconds:.2f} s waiting for buffers), the loop waited "

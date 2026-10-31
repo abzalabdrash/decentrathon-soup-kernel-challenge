@@ -78,14 +78,24 @@ Everything runs in this process. The compile, the
 ptxas and C compiler subprocesses and the cubin loads drop and retake the GIL many times, so the
 thread lowers the switch interval to 1 ms while it runs (see `_run`). Its largest single cost next
 to the model load was triton's own hash, 415 MB of libtriton.so read and digested (`_triton_key`):
-`start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. At
+`start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. With
+SOUP_SOLUTION_TRITON_KEY=light (the default; =full for triton's own) the key names libtriton.so by its
+size, modification time and inode instead (`_light_triton_key`): on the 4-vCPU T4 box the 1.4
+CPU-seconds of that hash run next to the GIL-bound imports, and the key only names entries of the
+run's own, initially empty, cache (T4, soup-s1-v4 and soup-s1-v5: with EMBED_ASYNC and
+ENTRY_POINTS, the first step 0.38-0.42 s earlier). At
 exit, `_shutdown` stops the warm-up between two registrations. `watch_compiles()` logs any compile
 (or on-disk cache read) outside the warm-up; the log line "waited N s for the warmup" at `train`
 begin shows whether the warm-up fits.
 
-Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default),
+Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default)|setup
+(the thread starts when Soup's model setup begins: Soup's command line, config and data reading
+after apply() run without the workers' GIL contention),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
 SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
+Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
+the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
+launch is compile time the first step never needed.
 
 The launchers (SOUP_SOLUTION_LAUNCHER_OPT, SOUP_SOLUTION_LAUNCHER_NICE; off by default)
 ------------------------------------------------------------------------------------
@@ -102,6 +112,28 @@ that level through triton's own hook for it (`triton.knobs.build.impl`), with th
 sources, flags and libraries otherwise; SOUP_SOLUTION_LAUNCHER_NICE=<n> runs the compiler under
 `nice -n <n>`, so the main thread gets a CPU first when the machine is full. The kernels themselves
 (the cubins from ptxas) do not change.
+
+The launchers ahead (SOUP_SOLUTION_LAUNCHERS_EARLY=1, with the build above)
+---------------------------------------------------------------------------
+On the T4 the launcher builds were still the largest part of the warm-up after -O0: in the startup
+profile of soup-s1-diag0 the two workers spent 2.3 of their 7.2 thread-seconds during Soup's model
+load waiting for these compiler processes, one at a time per worker, on the warm-up's critical path.
+A launcher's source depends only on the kernel's argument kinds (triton/backends/nvidia/driver.py
+`make_launcher(constants, signature, tensordesc_meta)`: pointers of any dtype become the same
+CUdeviceptr, `constants` is not read), and those are known before anything compiles. So
+`start_early` (apply begin) starts a thread that, while the main thread imports (GIL-bound work on
+one of the 4 vCPUs, the other three mostly idle): sets up triton's CUDA driver (its cuda_utils module,
+the first build, which `_prepare_triton` would do at the warm-up's start); runs every registration
+that compiles Triton kernels, the late ones of fused_proj.py, rmsnorm.py and head_stream.py too,
+with triton's `knobs.runtime.jit_cache_hook` answering "skip" for this thread only (jit.py
+`_do_compile`: the hook sees the signature, nothing is compiled, cached or launched), which gives
+the signatures of the launches the warm-up will compile; makes their launcher sources with triton's
+own `make_launcher`; and builds each distinct one with the build above (the same command, compiler and
+flags), two at a time, in a directory of this process removed at exit. When the warm-up then builds
+a launcher, the build hook finds a source with the same text built ahead (or waits for it if its
+build is still running) and hands triton that file; any other source, or a failed build ahead, is
+built as before. The set is a superset (registrations a switch leaves out are built too, on CPUs that
+are idle then); the kernels, their launchers and the launch path are the ones triton makes.
 """
 
 import atexit
@@ -114,7 +146,7 @@ import threading
 import time
 
 SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
-EXIT_TIMEOUT = 60.0  # seconds the interpreter's exit waits for the warm-up thread (see _shutdown)
+EXIT_TIMEOUT = 60.0  # join interval of the exit's wait for the warm-up threads (see _shutdown)
 # threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
 # 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
@@ -147,8 +179,8 @@ _LOCK = threading.Lock()
 
 
 def _new_state():
-    return {"thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
-            "errors": {}, "queue": queue.Queue(), "queued": set(), "closed": False}
+    return {"thread": None, "key_thread": None, "idents": set(), "begin": None, "seconds": None,
+            "results": {}, "errors": {}, "queue": queue.Queue(), "queued": set(), "closed": False}
 
 
 _STATE = _new_state()
@@ -426,6 +458,67 @@ def _triton_key():
             pass
 
 
+def _light_triton_key():
+    """triton/runtime/cache.py `triton_key` with libtriton.so named by its size, modification time
+    and inode instead of a sha256 of its 415 MB (SOUP_SOLUTION_TRITON_KEY=light): the key names the
+    entries of triton's on-disk cache, which the harness gives every run fresh and empty
+    (TRITON_CACHE_DIR in the run's directory, harness/run_task.py), so within a run any key that
+    identifies the installed triton does what triton's does; the kernels compiled are the same. The
+    other parts (the version and a sha256 of each source file of triton's compiler, backends and
+    language packages) are triton's own, in its order."""
+    import functools
+    import hashlib
+    import pkgutil
+    import sysconfig
+
+    from triton import __version__
+    from triton.runtime import cache
+
+    @functools.lru_cache()
+    def triton_key():
+        triton_path = os.path.dirname(os.path.dirname(os.path.abspath(cache.__file__)))
+        contents = []
+        with open(cache.__file__, "rb") as f:
+            contents += [hashlib.sha256(f.read()).hexdigest()]
+        for path, prefix in ((os.path.join(triton_path, "compiler"), "triton.compiler."),
+                             (os.path.join(triton_path, "backends"), "triton.backends.")):
+            for lib in pkgutil.walk_packages([path], prefix=prefix):
+                with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
+                    contents += [hashlib.sha256(f.read()).hexdigest()]
+        ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
+        stat = os.stat(os.path.join(triton_path, "_C", f"libtriton.{ext}"))
+        contents.append(f"libtriton:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}")
+        language_path = os.path.join(triton_path, "language")
+        for lib in pkgutil.walk_packages([language_path], prefix="triton.language."):
+            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
+                contents += [hashlib.sha256(f.read()).hexdigest()]
+        return f"{__version__}" + "-".join(contents)
+
+    triton_key._soup_light = True
+    return triton_key
+
+
+def install_light_triton_key():
+    """SOUP_SOLUTION_TRITON_KEY=light (the default; any other value keeps triton's own key): triton's
+    cache key without hashing libtriton.so (see _light_triton_key), unless triton computed its key
+    already. Returns whether it is in place."""
+    if os.environ.get("SOUP_SOLUTION_TRITON_KEY", "light").strip().lower() != "light":
+        return False
+    try:
+        from triton.runtime import cache
+
+        current = cache.triton_key
+        if getattr(current, "_soup_light", False):
+            return True
+        info = getattr(current, "cache_info", None)
+        if info is None or info().currsize:
+            return False  # computed already (or not triton's lru_cache function): keep it
+        cache.triton_key = _light_triton_key()
+        return True
+    except Exception:  # noqa: BLE001 - triton's own key then
+        return False
+
+
 def _prepare_triton():
     """What the first compile of the process does once, done before the workers start so that they
     do not all do it at the same time: the CUDA driver object and its cuda_utils module (built with
@@ -454,11 +547,16 @@ def _shutdown():
     ("terminate called without an active exception", exit code 134; T13 saw it in 3 of 6 runs of
     the tests). Waiting for the current registration only keeps the tests' exit short, where
     waiting for the whole warm-up would add its seconds. In a training run the warm-up is long
-    done at exit: nothing to wait for."""
+    done at exit: nothing to wait for. The wait has no deadline (EXIT_TIMEOUT is only the join
+    interval): returning while a compile is still running brings the abort back, and a run that
+    never ends fails the same checks as one that aborts. The early triton-key thread is waited for
+    too (codex/review-1, 49c639b)."""
     _STOP.set()
-    thread = _STATE["thread"]
-    if thread is not None and thread is not threading.current_thread():
-        thread.join(EXIT_TIMEOUT)
+    current = threading.current_thread()
+    for thread in (_STATE["thread"], _STATE.get("key_thread"), _AHEAD["thread"]):  # the launchers ahead stop between two builds
+        if thread is not None and thread is not current:
+            while thread.is_alive():  # no deadline: a live compiler thread under finalization aborts the process
+                thread.join(EXIT_TIMEOUT)
 
 
 def _register_shutdown():
@@ -490,13 +588,17 @@ def _worker(device, stream, log):
                                        else round(time.perf_counter() - start, 3))
         except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
             _STATE["errors"][name] = repr(exc)
-            if log:
+            # not once the exit has begun (_STOP), like the "warmup done" line: printed after
+            # pytest's summary, a line with " failed" becomes the last summary line that
+            # harness/check_rules.py run_tests() reads, and check 10 fails with 79 passed
+            if log and not _STOP.is_set():
                 print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
 
 
 def _run(device, log, workers, switch):
     begin = time.perf_counter()
     previous = ours = None
+    helpers, stream = [], None
     try:
         import torch
 
@@ -516,20 +618,29 @@ def _run(device, log, workers, switch):
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any
         # Executor, triton/runtime/_async_compile.py)
-        helpers = [threading.Thread(target=_worker, args=(device, stream, log),
-                                    name=f"solution-warmup-{i}", daemon=True)
-                   for i in range(1, workers)]
-        for helper in helpers:
+        for i in range(1, workers):
+            helper = threading.Thread(target=_worker, args=(device, stream, log),
+                                      name=f"solution-warmup-{i}", daemon=True)
             helper.start()
+            helpers.append(helper)  # only the threads that started are joined
         _worker(device, stream, log)
-        for helper in helpers:
-            helper.join()
-        stream.synchronize()
     except Exception as exc:  # noqa: BLE001
+        exiting = _STOP.is_set()  # the exit has begun: print nothing (see _worker)
+        _STOP.set()  # the helpers finish the registration they are in and take no new one
         _STATE["errors"]["(thread)"] = repr(exc)
-        if log:
+        if log and not exiting:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
+        # this thread's own setup or a later helper's start can fail while an earlier helper is
+        # inside the compiler: _DONE (and the end of this thread, which the exit waits for) must
+        # mean that every worker is gone (codex/review-1, 49c639b)
+        for helper in helpers:
+            helper.join()
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception as exc:  # noqa: BLE001 - the warm-up is optional
+                _STATE["errors"]["(stream)"] = repr(exc)
         if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
             sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
@@ -539,12 +650,62 @@ def _run(device, log, workers, switch):
                              for name, s in _STATE["results"].items())
             compiled = [c for c in COMPILES if c["thread"] in _STATE["idents"]]
             loaded = sum(1 for c in compiled if c.get("cache_hit"))
+            ahead = (f"; launchers built ahead: {_AHEAD['built']} in {_AHEAD['seconds'] or 0:.2f} s from apply "
+                     f"begin, {_AHEAD['hits']} used, the warm-up waited {_AHEAD['waited']:.2f} s for them"
+                     + (f", {_AHEAD['failed']} failed" if _AHEAD["failed"] else "")
+                     + (f", stopped: {_AHEAD['error']}" if _AHEAD["error"] else "")
+                     if _AHEAD["thread"] is not None else "")
             print(f"[solution] warmup done in {_STATE['seconds']:.2f} s"
                   + (f" ({len(compiled) - loaded} kernels compiled, {loaded} read from the on-disk "
                      f"cache)" if _HOOKS["installed"] else "")
                   + f": {done or 'nothing'}"
-                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else ""),
+                  + (f"; failed: {', '.join(_STATE['errors'])}" if _STATE["errors"] else "") + ahead,
                   flush=True)
+
+
+_AHEAD = {"entries": {}, "dir": None, "probe": None, "thread": None, "seconds": None, "built": 0,
+          "failed": 0, "hits": 0, "waited": 0.0, "error": None}
+_AHEAD_LOCK = threading.Lock()
+AHEAD_BUILDERS = 2  # builds ahead at a time: the vCPUs left idle by the imports (see the module docstring)
+AHEAD_WAIT = 60.0  # seconds a build waits for the same source built ahead before it builds it itself
+
+
+class _Ahead:
+    """One launcher source built ahead."""
+
+    __slots__ = ("done", "path", "error")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.path = self.error = None
+
+
+def _source_key(text):
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _built_ahead(src):
+    """The path of the launcher built ahead from the same source text as the file `src`, or None."""
+    entries = _AHEAD["entries"]
+    if not entries:
+        return None
+    try:
+        with open(src, encoding="utf-8") as f:
+            key = _source_key(f.read())
+    except (OSError, UnicodeDecodeError):
+        return None
+    entry = entries.get(key)
+    if entry is None:
+        return None
+    started = time.perf_counter()
+    entry.done.wait(AHEAD_WAIT)
+    _AHEAD["waited"] += time.perf_counter() - started
+    if entry.path is None or not os.path.exists(entry.path):
+        return None
+    _AHEAD["hits"] += 1
+    return entry.path
 
 
 def _launcher_build(level, nice):
@@ -559,7 +720,11 @@ def _launcher_build(level, nice):
 
     nice_cmd = ["nice", "-n", str(nice)] if nice and shutil.which("nice") else []
 
-    def build(name, src, srcdir, library_dirs, include_dirs, libraries):
+    def build(name, src, srcdir, library_dirs, include_dirs, libraries, ahead=True):
+        if ahead:
+            path = _built_ahead(src)
+            if path is not None:
+                return path
         suffix = sysconfig.get_config_var("EXT_SUFFIX")
         so = os.path.join(srcdir, "{name}{suffix}".format(name=name, suffix=suffix))
         cc = os.environ.get("CC")
@@ -584,6 +749,154 @@ def _launcher_build(level, nice):
 
     build._soup_launcher_build = (level, nice)
     return build
+
+
+def _probe_hook(previous):
+    """triton's jit_cache_hook while the launchers are probed: "skip" (True) for the probing thread,
+    with the launch's signature recorded; the previous hook's answer for every other thread."""
+
+    def hook(**kwargs):
+        probe = _AHEAD["probe"]
+        if probe is not None and threading.get_ident() == probe["ident"]:
+            info = kwargs.get("compile") or {}
+            signature = info.get("signature")
+            if isinstance(signature, dict):
+                probe["signatures"].append(dict(signature))
+            return True
+        return previous(**kwargs) if previous is not None else None
+
+    hook._soup_probe = True
+    return hook
+
+
+def _probe_registrations():
+    """(name, fn) of every registration that compiles Triton kernels in a run, the late ones included
+    (a superset of what apply() will register: see the module docstring)."""
+    import functools
+
+    out = [(name, fn) for name, fn in list(WARMUPS) if name not in FIRST]
+    try:
+        from . import fused_proj, head_stream, rmsnorm
+
+        out += [("fused_proj_x16_rebuild", rmsnorm.warm_rebuild),
+                ("fused_proj_masked_pair_sum", fused_proj._warm_masked_pair_sum),
+                ("fused_proj_nf4_dequant3", fused_proj._warm_dequant3),
+                ("rms_norm_rows_bwd_split", rmsnorm.warm_bwd_split),
+                ("head_stream_kernels", functools.partial(head_stream._warm_kernels, head_stream._config()[0]))]
+    except Exception:  # noqa: BLE001 - this file's registrations only
+        pass
+    return out
+
+
+def _launchers_ahead(build):
+    """The thread of SOUP_SOLUTION_LAUNCHERS_EARLY (see the module docstring)."""
+    import tempfile
+
+    started = time.perf_counter()
+    try:
+        import torch
+        from triton import knobs
+        from triton.backends.nvidia import driver as nvidia
+        from triton.runtime.driver import driver
+
+        torch.cuda.set_device(torch.cuda.current_device())
+        driver.active.get_current_device()  # cuda_utils: triton's first build, through the hook
+        with _LOCK:
+            if not getattr(knobs.runtime.jit_cache_hook, "_soup_probe", False):
+                knobs.runtime.jit_cache_hook = _probe_hook(knobs.runtime.jit_cache_hook)
+        probe = {"ident": threading.get_ident(), "signatures": []}
+        _AHEAD["probe"] = probe
+        try:
+            for _, fn in _probe_registrations():
+                if _STOP.is_set():
+                    break
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 - that registration's launchers are built when it runs
+                    pass
+        finally:
+            _AHEAD["probe"] = None
+        sources = {}
+        for signature in probe["signatures"]:
+            if any(isinstance(ty, str) and ty.startswith("tensordesc") for ty in signature.values()):
+                continue  # tensor descriptors take metadata of the compiled kernel
+            text = nvidia.make_launcher({}, signature, None)
+            sources.setdefault(_source_key(text), text)
+        with _AHEAD_LOCK:
+            entries = {key: _Ahead() for key in sources if key not in _AHEAD["entries"]}
+            _AHEAD["entries"].update(entries)
+        directory = tempfile.mkdtemp(prefix="soup-launchers-")
+        _AHEAD["dir"] = directory
+        atexit.register(_remove_tree, directory)
+        jobs = queue.Queue()
+        for key, entry in entries.items():
+            jobs.put((key, entry))
+        library_dirs, include_dirs, libraries = nvidia.library_dirs(), nvidia.include_dirs, nvidia.libraries
+
+        def builder():
+            while not _STOP.is_set():
+                try:
+                    key, entry = jobs.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    srcdir = os.path.join(directory, key[:16])
+                    os.makedirs(srcdir, exist_ok=True)
+                    src = os.path.join(srcdir, "__triton_launcher.c")
+                    with open(src, "w", encoding="utf-8") as f:
+                        f.write(sources[key])
+                    entry.path = build("__triton_launcher", src, srcdir, list(library_dirs), list(include_dirs),
+                                       list(libraries), ahead=False)
+                    _AHEAD["built"] += 1
+                except Exception as exc:  # noqa: BLE001 - the warm-up builds it then
+                    entry.error = repr(exc)
+                    _AHEAD["failed"] += 1
+                finally:
+                    entry.done.set()
+
+        helpers = [threading.Thread(target=builder, name="solution-launchers-1", daemon=True)
+                   for _ in range(AHEAD_BUILDERS - 1)]
+        for helper in helpers:
+            helper.start()
+        builder()
+        for helper in helpers:
+            helper.join()
+    except Exception as exc:  # noqa: BLE001 - the warm-up builds its launchers itself
+        _AHEAD["error"] = repr(exc)
+    finally:
+        for entry in list(_AHEAD["entries"].values()):
+            entry.done.set()  # nobody waits for a build that will not come
+        _AHEAD["seconds"] = round(time.perf_counter() - started, 3)
+
+
+def _remove_tree(path):
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def start_launchers_ahead():
+    """SOUP_SOLUTION_LAUNCHERS_EARLY=1: starts the thread (once), when the launcher build hook is
+    ours and there is a CUDA device. Returns the thread or None."""
+    if os.environ.get("SOUP_SOLUTION_LAUNCHERS_EARLY", "0").strip().lower() in ("0", "false", "no", ""):
+        return None
+    try:
+        import torch
+        from triton import knobs
+
+        build = knobs.build.impl
+        if not getattr(build, "_soup_launcher_build", None) or not torch.cuda.is_available():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    with _AHEAD_LOCK:
+        if _AHEAD["thread"] is None:
+            thread = threading.Thread(target=_launchers_ahead, args=(build,), name="solution-launchers",
+                                      daemon=True)
+            _AHEAD["thread"] = thread
+            _register_shutdown()
+            thread.start()
+    return _AHEAD["thread"]
 
 
 def install_launcher_build():
@@ -619,13 +932,20 @@ def start_early(log=True):
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
-    threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
+    install_light_triton_key()  # SOUP_SOLUTION_TRITON_KEY=light: no sha256 of libtriton.so
+    with _LOCK:
+        if _STATE["key_thread"] is None:  # joined at exit like the warm-up thread (_shutdown)
+            thread = threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True)
+            _STATE["key_thread"] = thread
+            _register_shutdown()
+            thread.start()
+    start_launchers_ahead()  # SOUP_SOLUTION_LAUNCHERS_EARLY=1: the launchers built during the imports
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)
     return None
 
 
-def start_background_warmup(log=True, final=True):
+def start_background_warmup(log=True, final=True, release=False):
     """Queues every registration not queued yet and, on the first call, starts the daemon thread
     that runs them with WORKERS workers (SOUP_SOLUTION_WARMUP_WORKERS), on the caller's CUDA
     device and on a stream of its own. `final` (the call at the end of apply()): nothing more will
@@ -659,6 +979,10 @@ def start_background_warmup(log=True, final=True):
             _STATE["queue"].put((name, fn))
         if final:
             _STATE["closed"] = True
+        if (_STATE["thread"] is None and not release
+                and os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "setup"):
+            _STATE["deferred"] = True  # patch_soup_warmup starts it when Soup's setup begins
+            return None
         if _STATE["thread"] is None:
             _STATE["begin"] = time.perf_counter()
             workers = int(_setting("SOUP_SOLUTION_WARMUP_WORKERS", WORKERS, int))
@@ -750,6 +1074,9 @@ def watch_compiles(log=True):
                     "cache_hit": getattr(local, "cache_hit", None),
                 }
                 COMPILES.append(record)
+                if _AUDIT["on"]:
+                    _AUDIT["compiled"].append((getattr(kwargs.get("fn"), "jit_function", None),
+                                              kwargs.get("key"), record))
                 if log and record["thread"] not in _STATE["idents"]:
                     what = ("kernel loaded from the on-disk cache" if record["cache_hit"]
                             else "compile")
@@ -804,6 +1131,60 @@ def preload_in_background(modules, log=True):
     return ready
 
 
+# SOUP_SOLUTION_WARMUP_AUDIT=1 (diagnostics): (jit function, key, COMPILES record) of every compile
+_AUDIT = {"on": os.environ.get("SOUP_SOLUTION_WARMUP_AUDIT", "0").strip().lower() not in ("0", "false", "no", ""),
+          "compiled": [], "counters": []}
+
+
+class _CountingCache(dict):
+    """A JITFunction's in-memory kernel cache that counts its lookups by key: `JITFunction.run`
+    looks every launch up with `kernel_cache.get(key)` (jit.py:712) and `_do_compile` stores into
+    the same dict, read again from `device_caches` on each call."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.lookups = {}
+
+    def get(self, key, default=None):
+        self.lookups[key] = self.lookups.get(key, 0) + 1
+        return super().get(key, default)
+
+
+def _audit_begin():
+    """Swaps the kernel cache of every function the warm-up compiled for a counting copy (same
+    entries), so that from here on each launch is counted under its key."""
+    try:
+        done = set()
+        for fn, _key, _record in list(_AUDIT["compiled"]):
+            if fn is None or id(fn) in done:
+                continue
+            done.add(id(fn))
+            for device, entry in list(fn.device_caches.items()):
+                if isinstance(entry[0], _CountingCache):
+                    continue
+                counting = _CountingCache(entry[0])
+                fn.device_caches[device] = (counting, *entry[1:])
+                _AUDIT["counters"].append((fn, counting))
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(f"[solution] warmup audit failed: {exc!r}", flush=True)
+
+
+def _audit_report():
+    try:
+        lookups = {}
+        for fn, counting in _AUDIT["counters"]:
+            for key, count in counting.lookups.items():
+                lookups[(id(fn), key)] = lookups.get((id(fn), key), 0) + count
+        for fn, key, record in _AUDIT["compiled"]:
+            where = "warm-up" if record["thread"] in _STATE["idents"] else "training"
+            count = lookups.get((id(fn), key), 0) if fn is not None else "?"
+            print(f"[solution] warmup audit: {record['kernel']} compiled in the {where} "
+                  f"({record['seconds']:.2f} s), launched {count} times in training "
+                  f"({record['spec']}; num_warps={record['num_warps']})", flush=True)
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(f"[solution] warmup audit failed: {exc!r}", flush=True)
+
+
 def patch_soup_warmup(start_in_setup=False):
     """Soup hooks for the warm-up: with `start_in_setup`, start it when
     SFTTrainerWrapper._setup_transformers begins (instead of from apply()); in every case, when
@@ -818,8 +1199,9 @@ def patch_soup_warmup(start_in_setup=False):
     original_train = cls.train
 
     def _setup_transformers(self, *args, **kwargs):
-        if start_in_setup:
-            start_background_warmup()
+        if start_in_setup or _STATE.get("deferred"):
+            _STATE["deferred"] = False
+            start_background_warmup(release=True)
         return original_setup(self, *args, **kwargs)
 
     def train(self, *args, **kwargs):
@@ -828,7 +1210,13 @@ def patch_soup_warmup(start_in_setup=False):
             finished = wait_for_warmup(60.0)
             print(f"[solution] waited {time.perf_counter() - start:.2f} s for the warmup"
                   + ("" if finished else " (not finished)"), flush=True)
-        return original_train(self, *args, **kwargs)
+        if not _AUDIT["on"]:
+            return original_train(self, *args, **kwargs)
+        _audit_begin()
+        try:
+            return original_train(self, *args, **kwargs)
+        finally:
+            _audit_report()
 
     cls._setup_transformers = _setup_transformers
     cls.train = train
