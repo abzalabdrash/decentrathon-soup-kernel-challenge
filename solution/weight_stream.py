@@ -108,8 +108,8 @@ EARLY_RELEASE = _env_on("SOUP_SOLUTION_RING_EARLY_RELEASE", "1")
 MLP_SLOTS = {name: max(1, min(2, int(os.environ.get(f"SOUP_SOLUTION_RING_SLOTS_{name.upper()}", "1") or 1)))
              for name in ("gate", "up", "down")}
 # SOUP_SOLUTION_STREAM_DIET=1 (task P3): an untimed copy and wait call the events directly (no torch Python
-# wrappers) and switch to the copy stream only around the copy itself
-_DIET = _env_on("SOUP_SOLUTION_STREAM_DIET", "1")
+# wrappers) and switch to the copy stream only around the copy itself; off by default (no gain on the T4, P4)
+_DIET = _env_on("SOUP_SOLUTION_STREAM_DIET", "0")
 _record = torch._C._CudaEventBase.record
 _wait_on = torch._C._CudaEventBase.wait
 _RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),

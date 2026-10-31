@@ -124,8 +124,9 @@ TIMING = os.environ.get("SOUP_SOLUTION_OFFLOAD_TIMING", "0").strip().lower() not
 # are recorded again instead of made per copy (re-recording one on the same side stream only makes a
 # stale wait wait longer, never shorter); the forward's drain and window wait once, for the newest copy
 # in flight (the side stream completes its copies in order); the event calls skip torch's Python wrappers;
-# the int8 form's views of a pinned slot are cached (offload_int8.host_views)
-DIET = os.environ.get("SOUP_SOLUTION_STREAM_DIET", "1").strip().lower() not in ("0", "false", "no", "")
+# the int8 form's views of a pinned slot are cached (offload_int8.host_views). Off by default: no gain on
+# the T4 (task P4, docs/notes/p3-cpu-streams.md)
+DIET = os.environ.get("SOUP_SOLUTION_STREAM_DIET", "0").strip().lower() not in ("0", "false", "no", "")
 _record = torch._C._CudaEventBase.record  # Event.record / Event.wait without the Python wrapper
 _wait_on = torch._C._CudaEventBase.wait
 

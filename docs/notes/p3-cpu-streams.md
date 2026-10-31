@@ -45,3 +45,25 @@ Locally (RTX 5060 host) the pieces of one `_load` cost ~1 us each (record, strea
   ring's slot layout and early release's per-matrix timing; not something to land in the last hours.
 - Outside these files: Triton's per-launch overhead (launch paths: fewer launches, the launcher's
   current_stream) and the harness's per-launch timing are the larger CPU items (I1).
+
+## P4: verdict NO-GO, `SOUP_SOLUTION_STREAM_DIET` off by default (branch `claude/p4-stream-diet`)
+
+ABBA on Modal T4, code 08d4a29 (P3's runs, `soup-p3-diet-pub` and `soup-p3-diet-jury`, warm run + rounds, both
+variants in one container; P4's own reruns were stopped at the code freeze before their first measured run):
+
+| rows | off: wall s (runs) | on: wall s (runs) | train loop off / on | peak MiB | checks 3/4/9 |
+|---|---|---|---|---|---|
+| public, PCIe x8 | 45.60 45.57 45.43, mean 45.53 | 45.78 45.54 45.38, mean 45.57 | 29.31 / 29.31 | 396 / 396 | PASS in all |
+| jury-like (42000:42256, 51800:52056, seed 157), x16 | 52.22 52.42, mean 52.32 | 53.36 52.35, mean 52.86 | 32.03 / 32.35 | 454 / 454 | PASS in all |
+
+No gain (the criterion was -0.2 s on the public rows): the train loop is the same to 0.01 s, so the ~2-4 ms
+per step of CPU P3 estimated is not on the critical path, or is lost in noise. Eval loss equal to 1e-4.
+
+Review of the ordering: the pooled events go back only from `_Saved.__del__` (no later wait can name them) or
+right after a stream waited on them (an enqueued wait snapshots the record it saw, re-recording does not
+move it); the one wait for the newest copy is sound because every D2H runs on the one side stream in
+inflight order; weight_stream's direct calls record and wait on the same streams as before. Pool pops run
+under `Offloader.lock`, `__del__` only appends. The delayed-reader tests (test_offload: slot reuse, kept
+until copied, prefetched, single-stream; test_offload_int8: every way back, int8 stream rules;
+test_weight_stream: slot not overwritten while read) now run with the diet off and on: 81 passed locally,
+the one failure the known bf16 one of test_ring_switch_and_fallbacks.
