@@ -63,7 +63,20 @@ START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_START_CALLS", "112"))
 CHUNKS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_CHUNKS", "1"))
 # which GEMMs run int8: "all" (gate|up and down) or "gu" (gate|up only: its epilogue writes the
 # SwiGLU output in half as well, and down stays the fp16 GEMM of fused_proj.py)
-MODE = os.environ.get("SOUP_SOLUTION_INT8_FWD_MODE", "all").strip().lower()
+MODE = os.environ.get("SOUP_SOLUTION_INT8_FWD_MODE", "gu").strip().lower()
+
+
+def _layers(text):
+    """'0-4' / '1,2,4' / '1.2.4' / '1:3' -> frozenset of layer indices (ranges inclusive)."""
+    out = set()
+    for part in text.replace(",", " ").replace(".", " ").replace(":", "-").split():
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return frozenset(out)
+
+
+# layers (decoder layer_idx, rmsnorm.py's decoder patch tags the MLP) whose MLP forward stays fp16
+FP16_LAYERS = _layers(os.environ.get("SOUP_SOLUTION_INT8_FWD_FP16_LAYERS", ""))
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 GU_ROWS, GU_CB = 8, 8  # gate/up decode: rows per program, 64-element blocks per row per iteration

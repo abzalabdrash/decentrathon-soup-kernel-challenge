@@ -140,6 +140,7 @@ class _Probe:
         self.record = False
         self.stats = collections.defaultdict(lambda: collections.defaultdict(list))
         self.fp16_layers = set(fp16_layers)
+        self.only = None  # with a layer index: only that layer's MLP runs int8
 
     def forward(self, mlp, x):
         from solution import int8_fwd
@@ -151,7 +152,8 @@ class _Probe:
         n = x2.shape[0]
         padded = -(-n // 16) * 16
         inter, d = mlp.gate_proj.out_features, shape[-1]
-        if self.use == "fp16" or layer in self.fp16_layers or n <= 16:
+        if (self.use == "fp16" or layer in self.fp16_layers or n <= 16
+                or (self.only is not None and layer != self.only)):
             return self._reference(mlp, x2)[2][:n].view(*shape[:-1], d)
         ops = _ops(mlp.gate_proj, mlp.up_proj, mlp.down_proj)
         buffer = torch.empty(inter * d, dtype=torch.float16, device=x.device)
@@ -207,7 +209,6 @@ class _Probe:
         # int8 down alone, on the fp16 SwiGLU output (its (gate|up) padded, one group of maxima)
         gu_ref = torch.zeros((2 * inter, padded), dtype=torch.float16, device=x2.device)
         gu_ref[:, :n] = gate_up
-        hp = torch.zeros((inter, padded), dtype=torch.float32, device=x2.device)
         g, u = gu_ref[:inter].float(), gu_ref[inter:].float()
         hp = g * torch.sigmoid(g) * u
         out_down = int8_fwd.down_forward(gu_ref, hp.abs().amax(0, keepdim=True), ops[2], buffer,
@@ -282,7 +283,26 @@ def errors(args):
         print(f"loss int8 {use}: {statistics.mean(losses[use]):.5f} (mean {shift * 100:+.3f} %, "
               f"mean |rel| per row {statistics.mean(rel) * 100:.3f} %, max {max(rel) * 100:.3f} %)",
               flush=True)
-    print("JSON " + json.dumps({"layers": summary, "losses": losses}))
+    single = {}
+    if args.single:
+        # one layer at a time in int8 "gu", the others fp16: each layer's own share of the shift
+        probe.record, probe.fp16_layers = False, set()
+        print(f"\nsingle layers in int8 {args.single}: loss shift, mean |rel| per row", flush=True)
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            for layer in range(len(model.model.layers)):
+                probe.use, probe.only = args.single, layer
+                got = []
+                for ids, n_prompt in rows[:args.single_rows]:
+                    ids = ids.cuda()[None]
+                    logits = model(input_ids=ids).logits.float()
+                    got.append(F.cross_entropy(logits[0, n_prompt - 1:-1], ids[0, n_prompt:]).item())
+                ref = base[:len(got)]
+                shift = (statistics.mean(got) - statistics.mean(ref)) / statistics.mean(ref)
+                rel = statistics.mean(abs(a - b) / b for a, b in zip(got, ref))
+                single[layer] = (shift, rel)
+                print(f"  layer {layer:2d}: {shift * 100:+.3f} %  {rel * 100:.3f} %", flush=True)
+        probe.only = None
+    print("JSON " + json.dumps({"layers": summary, "losses": losses, "single": single}))
 
 
 def main():
@@ -297,6 +317,9 @@ def main():
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--max-len", type=int, default=512)
     parser.add_argument("--fp16-layers", type=int, nargs="*", default=[])
+    parser.add_argument("--single", choices=["gu", "all"], default=None,
+                        help="also the loss with one layer at a time in this int8 variant")
+    parser.add_argument("--single-rows", type=int, default=12)
     args = parser.parse_args()
     if args.errors:
         errors(args)

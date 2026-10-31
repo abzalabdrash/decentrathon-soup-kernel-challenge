@@ -193,3 +193,34 @@ def test_off_by_default_under_pytest():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          env=env)
     assert out.stdout.strip() == "False"
+
+
+def test_fp16_layers_counted_and_kept(int8_on, monkeypatch):
+    """A layer of FP16_LAYERS (the decoder layer's index on its MLP) counts toward START_CALLS and
+    runs the fp16 forward bit for bit; an untagged MLP counts as listed."""
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=23).cuda().train()
+    x = torch.randn(1, 832, 1536, device="cuda")
+    monkeypatch.setattr(int8_on, "FP16_LAYERS", frozenset({3}))
+    outs = []
+    for idx, on in ((3, True), (None, True), (5, True), (5, False)):
+        if idx is None:
+            mlp.__dict__.pop("_soup_layer_idx", None)
+        else:
+            mlp.__dict__["_soup_layer_idx"] = idx
+        int8_on._STATE["on"] = on
+        calls = int8_on._STATE["calls"]
+        with torch.autocast("cuda", dtype=torch.float16):
+            outs.append(mlp(x.clone().requires_grad_(True)).detach())
+        assert int8_on._STATE["calls"] == calls + (1 if on else 0)
+    listed, untagged, int8, fp16 = outs
+    assert torch.equal(listed, fp16) and torch.equal(untagged, fp16) and not torch.equal(int8, fp16)
+    assert _layers_parse()
+
+
+def _layers_parse():
+    from solution.int8_fwd import _layers
+
+    return (_layers("0-4") == {0, 1, 2, 3, 4} and _layers("1.2.4") == {1, 2, 4}
+            and _layers("") == frozenset() and _layers("2,26") == {2, 26})

@@ -1512,10 +1512,11 @@ def _recompute_backward(plan, x16, grad_hidden, padded):
     return _accumulate(result, gate_up[inter:].t(), w)
 
 
-def _int8_forward_ops(plan, n):
+def _int8_forward_ops(plan, n, mlp):
     """SOUP_SOLUTION_INT8_FWD: nf4.py's operands of (gate, up, down) when int8_fwd.py takes this
-    training forward (counted by int8_fwd.usable, which fixes the switch point), else None. The
-    caller has checked that autograd is on; (gate|up) must be what the backward keeps."""
+    training forward (counted by int8_fwd.usable, which fixes the switch point; the layers of
+    int8_fwd.FP16_LAYERS are counted and stay fp16), else None. The caller has checked that
+    autograd is on; (gate|up) must be what the backward keeps."""
     if not int8_fwd._STATE["on"] or plan.recompute:
         return None
     gate, up, down = plan.gate, plan.up, plan.down
@@ -1524,6 +1525,10 @@ def _int8_forward_ops(plan, n):
     ops = tuple(_nf4_args(base, plan.half) for base in (gate, up, down))
     if None in ops or not int8_fwd.usable(-(-n // 8) * 8):
         return None
+    if int8_fwd.FP16_LAYERS:
+        index = mlp.__dict__.get("_soup_layer_idx")  # None: no rmsnorm decoder patch, as listed
+        if index is None or index in int8_fwd.FP16_LAYERS:
+            return None
     return tuple(found[1] for found in ops)
 
 
@@ -1709,7 +1714,7 @@ def patch_qwen2_mlp_fused():
 
         if torch.is_grad_enabled():
             plan.early = EARLY and not plan.recompute and x.requires_grad
-            plan.int8 = _int8_forward_ops(plan, x.numel() // x.shape[-1])
+            plan.int8 = _int8_forward_ops(plan, x.numel() // x.shape[-1], self)
             if plan.early or (DRAIN_LAST and self is _CTX["last_mlp"]):
                 drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
