@@ -7,7 +7,7 @@ Decentrathon 6.0, трек 01 Soup Kernel Challenge. Описание решен
 - Repository, final commit: https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/commit/0b2cb75
   (код заморожен на 0b2cb75; папка `solution/` совпадает с 6c426d1)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
-  README.md): https://www.kaggle.com/code/slerfas/soup-final-public?scriptVersionId=<PUB_VERSION_ID>
+  README.md): https://www.kaggle.com/code/slerfas/soup-final-public
 - Demo video (up to 3 minutes): `<VIDEO_URL>` (сценарий: [docs/PRESENTATION.md](docs/PRESENTATION.md))
 - Presentation: `<PRESENTATION_URL>` (план слайдов: [docs/PRESENTATION.md](docs/PRESENTATION.md))
 
@@ -73,9 +73,9 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
 
 | | Base Soup | Ours | Ratio | m13: base → ours |
 |---|---|---|---|---|
-| Time of `soup train`, s | `<PUB_BASE_S>` | `<PUB_WALL_S>` | speedup x`<PUB_S>` | 83,18 → 45,28 (x1,837) |
-| Peak GPU memory, MiB | `<PUB_BASE_MIB>` | `<PUB_PEAK>` | base/ours x`<PUB_M>` | 14 345 → 395 (x36,32) |
-| Eval loss (public rows) | `<PUB_BASE_EVAL>` | `<PUB_EVAL>` | `<PUB_EVAL_PCT>` vs base | 2,04963 → 2,04980 (+0,008 %) |
+| Time of `soup train`, s | `93,0` | `47,7` | speedup x`1,948` | 83,18 → 45,28 (x1,837) |
+| Peak GPU memory, MiB | `14 345` | `395` | base/ours x`36,3` | 14 345 → 395 (x36,32) |
+| Eval loss (public rows) | `2,04966` | `2,04964` | `-0,001 %` vs base | 2,04963 → 2,04980 (+0,008 %) |
 
 Полный прогон soup-final-full: s = `1,875`, пик `395` MiB, eval `+0,002 %`,
 `10 из 10`. Протокол жюри на других строках (base, solution, solution, base): soup-final-j1
@@ -83,7 +83,7 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
 s = `1,841`, пик `415` MiB, eval `+0,002 %`, `10 из 10`. До заморозки — 10 из 10 на всех
 18 наборах строк и seed из `docs/STATUS.md`; все прогоны и стресс-формы: README.md, разделы 3.1–3.3.
 
-- [ ] All 10 checks of `harness/check_rules.py` passed (финальные прогоны: `<PUB_CHECKS>`; до заморозки 10 из 10 во всех 18 прогонах жюри и в полных прогонах main 31 октября)
+- [ ] All 10 checks of `harness/check_rules.py` passed (финальные прогоны: `10 из 10`; до заморозки 10 из 10 во всех 18 прогонах жюри и в полных прогонах main 31 октября)
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits
 
 ## Presentation covers

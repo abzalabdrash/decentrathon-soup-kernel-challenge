@@ -7,7 +7,7 @@ bitsandbytes, trl и Soup: обучение то же, а время коман�
 10 проверок и баллы организаторов сохранены в [docs/KIT_README.md](docs/KIT_README.md).
 
 - Публичный Kaggle-ноутбук (сохранённая версия с `COMMIT` = финальный коммит):
-  `https://www.kaggle.com/code/slerfas/soup-final-public?scriptVersionId=<PUB_VERSION_ID>`
+  `https://www.kaggle.com/code/slerfas/soup-final-public`
 - Финальный коммит: `0b2cb75` (код заморожен на 0b2cb75; папка `solution/` совпадает с 6c426d1)
 - Заполненная форма сдачи: [SUBMISSION.md](SUBMISSION.md)
 
@@ -34,8 +34,8 @@ solution, base): soup-final-j1 (seed 67) — s = `1,803`, пик `415` MiB, eval
 `10 из 10`; soup-final-j2 (seed 89) — s = `1,841`, пик `415` MiB, eval `+0,002 %`,
 `10 из 10`. До заморозки решение прошло 10 из 10 во всех прогонах жюри из
 [docs/STATUS.md](docs/STATUS.md), 18 наборов строк и seed; последний (f152a56, seed 137): s = 1,808,
-пик 435 MiB, eval +0,004 % (раздел 3.2). Публичный ноутбук soup-final-public: s = `<PUB_S>`, пик
-`<PUB_PEAK>` MiB, `<PUB_CHECKS>`.
+пик 435 MiB, eval +0,004 % (раздел 3.2). Публичный ноутбук soup-final-public: s = `1,948`, пик
+`395` MiB, `10 из 10`.
 
 Скорость сессий Kaggle гуляет: база в наших прогонах 31 октября шла от 79,1 до 101,9 с. Поэтому
 сравниваем s (база и решение в одной сессии), а не секунды.
@@ -614,7 +614,7 @@ mem-efficient attention, поэлементные torch, наши) стек по
 ### 2.1 Kaggle-ноутбук (так перезапускает жюри)
 
 Публичный ноутбук с финальным коммитом: https://www.kaggle.com/code/slerfas/soup-final-public (сохранённая
-версия `<PUB_VERSION_ID>`; Copy & Edit, затем Run All). Или с нуля:
+версия `1 (единственная сохранённая версия, COMMIT = 0b2cb75)`; Copy & Edit, затем Run All). Или с нуля:
 
 1. Kaggle → **Create → New Notebook → File → Import Notebook**, файл `templates/kaggle_notebook.ipynb`.
 2. Справа: **Accelerator: GPU T4 x2**, **Internet: on** (нужен аккаунт с подтверждённым телефоном).
@@ -738,11 +738,11 @@ f152a56: 506 прошли, 5 пропущены, 0 упали; 79 тестов S
 
 | | База | Решение | Отношение |
 |---|---:|---:|---:|
-| Время команды, с | `<PUB_BASE_S>` | `<PUB_WALL_S>` | s = `<PUB_S>` |
-| Пик nvidia-smi, MiB | `<PUB_BASE_MIB>` | `<PUB_PEAK>` | m = `<PUB_M>` |
-| Eval loss | `<PUB_BASE_EVAL>` | `<PUB_EVAL>` | `<PUB_EVAL_PCT>` |
-| Своих ядер | | `<PUB_OWN_PCT>` | |
-| Проверки | | `<PUB_CHECKS>` | |
+| Время команды, с | `93,0` | `47,7` | s = `1,948` |
+| Пик nvidia-smi, MiB | `14 345` | `395` | m = `36,3` |
+| Eval loss | `2,04966` | `2,04964` | `-0,001 %` |
+| Своих ядер | | `20,8 %` | |
+| Проверки | | `10 из 10` | |
 
 Как шло к этому (полные прогоны, s в своей сессии):
 
