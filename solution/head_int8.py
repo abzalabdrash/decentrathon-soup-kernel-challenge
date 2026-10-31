@@ -100,9 +100,11 @@ ACC_BLOCK = 512
 # warps of the chunk kernel: T4, one head at 830 tokens, 16 warps 5.8-6.0 ms against 8.5-9.8 for 8 and 8.0-9.5
 # for 4 (soup-h1-kern1; head_stream's fp16 kernel is fastest with 8); 2-8 rows per program were slower
 WARPS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARPS", "16"))
-# hidden rows per forward GEMM: a chunk's int32 logits are twice the fp16 head's per row; in blocks of
-# 512 rows the int8 head's memory stays 2-7 MiB below the fp16 head's at 512-2048 tokens (soup-h1-bench1)
-FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "512")) // 8 * 8, 24)
+# hidden rows per forward GEMM: a chunk's int32 logits are twice the fp16 head's per row. 1024: one
+# GEMM and one kernel launch per chunk up to 1024 tokens (each launch costs CPU on the training path);
+# the head's memory then +1 MiB over the fp16 head's at 830 tokens, 512 kept it 2-7 MiB below
+# (soup-h1-bench1)
+FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "1024")) // 8 * 8, 24)
 
 
 def smoothing(streamer):
@@ -130,7 +132,7 @@ def enabled():
     return _STATE["on"]
 
 
-@triton.jit(do_not_specialize=["row0", "chunk", "first", "c0", "vc", "n_lab"])
+@triton.jit(do_not_specialize=["row0", "chunk", "acc_mode", "first", "c0", "vc", "n_lab"])
 def head_i8_chunk_kernel(
     l32_ptr, stride_l, row0,  # int32 (block rows, vc): this chunk's logits for rows row0 + i
     pq_ptr, stride_pq,  # int8 (n_lab, vc): P quantized, labelled rows
@@ -141,6 +143,9 @@ def head_i8_chunk_kernel(
     cmax_ptr, cidx_ptr, stride_c, chunk,  # fp32, int32 (n_lab, chunks): each chunk's max (the rescoring)
     sec_ptr, sec_idx_ptr,  # fp32, int32 (n_lab,): the runner-up inside the chunk that holds the running top
     alpha_ptr, sp_ptr,  # fp32 (n_lab,): exp(m_old - m_new) and P's scale for this chunk
+    acc_ptr, stride_acc, g_ptr, stride_g,  # fp32 acc (n_lab, D); int32 G (n_lab, D) of the previous chunk
+    alpha_prev_ptr, sp_prev_ptr,  # fp32 (n_lab,): the previous chunk's alpha and P scale
+    acc_mode,  # 0: no previous chunk; 1: acc = G * sp; 2: acc = acc * alpha + G * sp (head_i8_acc_kernel's)
     q_ptr, stride_q,  # int8 (vc, D): the chunk of Q on the GPU
     wt_ptr, stride_wt,  # half (n_lab, D): W_q[target], written by the chunk that holds the target
     first, c0, vc, n_lab, D,  # first: 1 for the vocabulary's first chunk (a runtime flag: one compile)
@@ -192,6 +197,20 @@ def head_i8_chunk_kernel(
     tl.store(idx_ptr + row, best_idx)
     tl.store(xt_ptr + row, x_t)
     if row < n_lab:
+        # the previous chunk's backward GEMM output into acc (here rather than in a launch of its own:
+        # every Triton launch costs ~50 us of CPU on the training path, fused_proj.py's notes)
+        if acc_mode > 0:
+            a_prev = tl.load(alpha_prev_ptr + row)
+            s_prev = tl.load(sp_prev_ptr + row)
+            acc_row = acc_ptr + row.to(tl.int64) * stride_acc
+            g_row = g_ptr + row.to(tl.int64) * stride_g
+            for d0 in range(0, D, BLOCK_D):
+                od = d0 + tl.arange(0, BLOCK_D)
+                md = od < D
+                gv = tl.load(g_row + od, mask=md, other=0).to(tl.float32) * s_prev
+                if acc_mode == 2:
+                    gv = tl.load(acc_row + od, mask=md, other=0.0) * a_prev + gv
+                tl.store(acc_row + od, gv, mask=md)
         u = p * sv  # s_v on the contraction axis of the backward GEMM goes into P
         u_max = tl.max(u, axis=0)
         inv = tl.where(u_max > 0.0, 127.0 / u_max, 0.0)
@@ -545,48 +564,60 @@ class HeadInt8:
         sec_v, sec_i = second[0], second[1].view(torch.int32)
         lab = max(n_lab, 1)
         wt = torch.empty(lab, d, dtype=hidden16.dtype, device=dev)
-        alpha_sp = torch.empty(2, -(-lab // 4) * 4, dtype=torch.float32, device=dev)
-        alpha, sp = alpha_sp[0], alpha_sp[1]
+        # alpha and P's scale, by the chunk's parity: chunk c's kernel accumulates chunk c - 1's G with them
+        alpha_sp = torch.empty(2, 2, -(-lab // 4) * 4, dtype=torch.float32, device=dev)
         rows, vocab = self.rows, self.vocab
         # the int32 logits of a chunk, then (as int8) the chunk's transpose for the backward GEMM
+        # (not in place over the slot: the next chunk's kernel reads this chunk's G, not its Q)
         l_rows = max(_pad_rows(nb) for _, nb in blocks)
         l32 = torch.empty(max(l_rows * rows, -(-d * rows // 4)), dtype=torch.int32, device=dev)
         lab_pad = _pad_rows(n_lab)
         g32 = torch.empty(lab_pad, d, dtype=torch.int32, device=dev) if n_lab else None
         pq_buf = torch.empty(lab_pad * rows, dtype=torch.int8, device=dev)
         q_t = l32.view(torch.int8)
-        views = {}  # chunk rows -> (int32 logits, P_q): two sizes at most
+        g_arg = g32 if n_lab else l32
+        runner_up = _rescoring()
+        views = {}  # chunk rows -> (int32 logits, P_q, the transpose's buffer): two sizes at most
+        slots = {}  # (ring slot, chunk rows) -> (Q_c, Q_c^T view, s_v): views made once per head
         for c in range(self.n_chunks):
             c0 = c * rows
             vc = min(rows, vocab - c0)
-            slot = st._acquire(c, compute)
-            q = slot[:vc * d].view(torch.int8).view(vc, d)
-            sv = slot[vc * d:vc * (d + 4)].view(torch.float32)
+            raw = st._acquire(c, compute)
+            key = (c % st.slots, vc)
+            slot = slots.get(key)
+            if slot is None:
+                q = raw[:vc * d].view(torch.int8).view(vc, d)
+                slot = slots[key] = (q, q.t(), raw[vc * d:vc * (d + 4)].view(torch.float32))
+            q, q_tv, sv = slot
             chunk = views.get(vc)
             if chunk is None:
-                chunk = views[vc] = ([(h_q[b0:b0 + _pad_rows(nb)], l32[:_pad_rows(nb) * vc].view(-1, vc))
-                                      for b0, nb in blocks], pq_buf[:lab_pad * vc].view(lab_pad, vc))
-            gemms, p_q = chunk
-            for (b0, nb), (h_b, logits) in zip(blocks, gemms):
-                torch._int_mm(h_b, q.t(), out=logits)
-                head_i8_chunk_kernel[(nb,)](
+                q_cols = q_t[:d * vc].view(d, vc)
+                chunk = views[vc] = ([(b0, nb, (nb,), h_q[b0:b0 + _pad_rows(nb)], l32[:_pad_rows(nb) * vc].view(-1, vc))
+                                      for b0, nb in blocks], pq_buf[:lab_pad * vc].view(lab_pad, vc), q_cols,
+                                     q_cols.t(), (triton.cdiv(vc, T_TILE), triton.cdiv(d, T_TILE)))
+            gemms, p_q, q_cols, q_cols_t, t_grid = chunk
+            new, old = alpha_sp[c % 2], alpha_sp[(c - 1) % 2]
+            acc_mode = 0 if c == 0 or not n_lab else (1 if c == 1 else 2)
+            for b0, nb, grid, h_b, logits in gemms:
+                torch._int_mm(h_b, q_tv, out=logits)
+                head_i8_chunk_kernel[grid](
                     logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, cmax, cidx, stride_c, c,
-                    sec_v, sec_i, alpha, sp,
+                    sec_v, sec_i, new[0], new[1], acc, acc.stride(0), g_arg, d, old[0], old[1], acc_mode,
                     q, d, wt, wt.stride(0), int(c == 0), c0, vc, n_lab, d,
-                    IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
+                    IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, RUNNER_UP=runner_up,
                     num_warps=self.num_warps,
                 )
             if n_lab:
-                q_cols = q_t[:d * vc].view(d, vc)
-                int8_transpose_kernel[(triton.cdiv(vc, T_TILE), triton.cdiv(d, T_TILE))](
-                    q, q_cols, vc, d, T=T_TILE, num_warps=T_WARPS)
+                int8_transpose_kernel[t_grid](q, q_cols, vc, d, T=T_TILE, num_warps=T_WARPS)
                 st._release(c, compute)  # the slot is read no more: its next chunk may come
-                torch._int_mm(p_q, q_cols.t(), out=g32)
-                head_i8_acc_kernel[(n_lab, triton.cdiv(d, ACC_BLOCK))](
-                    acc, acc.stride(0), g32, g32.stride(0), alpha, sp, int(c == 0), d,
-                    BLOCK=ACC_BLOCK, num_warps=4)
+                torch._int_mm(p_q, q_cols_t, out=g32)
             else:
                 st._release(c, compute)
+        if n_lab:  # the last chunk's G
+            last = alpha_sp[(self.n_chunks - 1) % 2]
+            head_i8_acc_kernel[(n_lab, triton.cdiv(d, ACC_BLOCK))](
+                acc, acc.stride(0), g32, g32.stride(0), last[0], last[1], int(self.n_chunks == 1), d,
+                BLOCK=ACC_BLOCK, num_warps=4)
         head_finish_kernel[(n,)](
             targets, m, s, e, x_t, idx, loss, entropy, correct,
             acc, acc.stride(0), wt, wt.stride(0), grad_scale, n_lab, d,
@@ -642,7 +673,8 @@ def warm_kernels(obj=None):
     # row0, first, c0, vc, n_lab not specialized
     stride_c = triton.next_power_of_2(obj.n_chunks if obj is not None else 38)
     timed("chunk", head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
-          f32, i32, stride_c, 3, f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
+          f32, i32, stride_c, 3, f32, i32, f32, f32, f32, hidden, i32, hidden, f32, f32, 2,
+          i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
           IGNORE=IGNORE_INDEX, BLOCK=triton.next_power_of_2(rows), BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
           num_warps=warps)
     timed("acc", head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK, num_warps=4)
