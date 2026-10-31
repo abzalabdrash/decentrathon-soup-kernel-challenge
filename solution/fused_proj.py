@@ -1385,8 +1385,8 @@ def _accumulate(result, a, b):
     return torch.addmm(result, a, b, out_dtype=torch.float32)
 
 
-# SOUP_SOLUTION_EARLY_RELEASE (see _MLP.backward's int8 path): off by default until measured
-_EARLY_RELEASE = {"on": os.environ.get("SOUP_SOLUTION_EARLY_RELEASE", "0").strip().lower()
+# SOUP_SOLUTION_EARLY_RELEASE (see _MLP.backward's int8 path): on by default (soup-b4-full 10/10); =0 turns it off
+_EARLY_RELEASE = {"on": os.environ.get("SOUP_SOLUTION_EARLY_RELEASE", "1").strip().lower()
                   not in ("0", "false", "no", "")}
 
 

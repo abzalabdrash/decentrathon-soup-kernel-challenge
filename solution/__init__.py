@@ -46,6 +46,9 @@ SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
 SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache),
 SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; on by default, answer 29),
+SOUP_SOLUTION_EARLY_RELEASE=0 (the int8 MLP backward releases each 4-bit slot right after its last read;
+on by default), SOUP_SOLUTION_INT8_FUSED_QUANT=0 (its gradient quantization and step-7 scaling as own
+kernels, bit-for-bit torch's ops; on by default),
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 

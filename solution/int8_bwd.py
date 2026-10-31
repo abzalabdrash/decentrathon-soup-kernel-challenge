@@ -194,7 +194,7 @@ def quant_t_int8_kernel(src_ptr, pmax_ptr, amax_ptr, q_ptr, n_rows, tokens,
 # own kernel each (quant_rows_t_kernel, scale_rows_cols_kernel) instead of ~9 and 3 torch launches per
 # layer (soup-m10-prof: the clamp / floor / add / reduce / binary launches of the step); the same fp32
 # operations in the same order, compiled without FMA contraction, so the same int8 values and scales
-_FUSED_QUANT = {"on": os.environ.get("SOUP_SOLUTION_INT8_FUSED_QUANT", "0").strip().lower()
+_FUSED_QUANT = {"on": os.environ.get("SOUP_SOLUTION_INT8_FUSED_QUANT", "1").strip().lower()
                 not in ("0", "false", "no", "")}
 QR_ROWS = 4  # token rows per program of quant_rows_t_kernel
 # torch's fp32 reciprocal of 127 (div_true_kernel_cuda divides by a scalar as a multiply by 1 / b in fp32)
