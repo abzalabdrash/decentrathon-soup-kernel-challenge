@@ -1,6 +1,6 @@
-"""The MLP's (gate|up) crosses PCIe as int8 (task P1, SOUP_SOLUTION_OFFLOAD_INT8, on by default in the
-`soup train` process only, like int8_bwd.py; =1 also under pytest, =0 off everywhere). Organizers'
-answer 43: a tensor saved only for the backward may be kept in int8 with a scale (lossy) when the
+"""The MLP's (gate|up) crosses PCIe as int8 (task P1, SOUP_SOLUTION_OFFLOAD_INT8, on by default in every
+process like int8_bwd.py, =0 off; solution/conftest.py switches it off for the bitwise tests of the half
+path, test_offload_int8.py switches it on). Organizers' answer 43: a tensor saved only for the backward may be kept in int8 with a scale (lossy) when the
 forward, the loss and the metrics do not change and all 10 checks pass.
 
 offload.py sends every layer's (gate|up) (2I, M) half, 36 KB per token, to pinned host memory in the
@@ -38,10 +38,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .int8_bwd import _soup_train_process
-
-_STATE = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8", "1" if _soup_train_process() else "0")
-          .strip().lower() not in ("0", "false", "no", ""), "thread": None, "calls": 0, "backwards": 0}
+_STATE = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8", "1").strip().lower()
+          not in ("0", "false", "no", ""), "thread": None, "calls": 0, "backwards": 0}
 # seven steps of 28 layers: soup-p1-abba-jury3 switched at step 4 and waited 0.4 s there for the thread
 START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "196"))
 # MLP backwards before the compile thread starts: not during the first step (soup-p1-abba-pub2: a
