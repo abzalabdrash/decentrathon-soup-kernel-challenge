@@ -97,3 +97,19 @@ def test_takeover_after_start_calls(int8_on, monkeypatch):
     finally:
         if ready:
             int8_on._READY.set()
+
+
+def test_decode_pair_matches_two_decodes(int8_on, monkeypatch):
+    """nf4_int8_t2_kernel (W_gate^T | W_up^T in one launch, from fused_proj's cached operands) writes
+    what two nf4_int8_t_kernel launches write, bit for bit."""
+    gate, up = _linear4bit(1536, 8960, seed=11), _linear4bit(1536, 8960, seed=12)
+    w16 = torch.cat([int8_on.nf4.dequantize_nf4(m.weight, m.weight.quant_state, torch.float16)
+                     for m in (gate, up)])
+    inv = int8_on._inverse(w16.abs().amax(0).float())
+    pair = torch.empty((1536, 2 * 8960), dtype=torch.int8, device="cuda")
+    int8_on._decode_t_pair(gate, up, inv, pair, 2 * 8960, torch.float16)
+    monkeypatch.setitem(int8_on._PAIR, "on", False)
+    two = torch.empty_like(pair)
+    int8_on._decode_t(gate, inv, two, 2 * 8960, 0)
+    int8_on._decode_t(up, inv, two, 2 * 8960, 8960)
+    assert torch.equal(pair, two)

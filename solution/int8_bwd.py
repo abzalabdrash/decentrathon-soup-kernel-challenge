@@ -55,6 +55,10 @@ START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_START_CALLS", "112"))
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
+# SOUP_SOLUTION_INT8_PAIR (CPU diet): W_gate^T and W_up^T decoded in one launch (nf4_int8_t2_kernel),
+# and every decode from fused_proj's cached NF4 operands (no Params4bit attribute reads); =0: as before
+_PAIR = {"on": os.environ.get("SOUP_SOLUTION_INT8_PAIR", "1").strip().lower()
+         not in ("0", "false", "no", "")}
 # SwiGLU backward: (features, tokens) tile and feature groups. bench_int8_mlp.py on the T4: 0.44 ms
 # per layer at 832 tokens and 0.83 ms at 1440 with (32, 64, 10); (32, 32, 10) 0.51 / 0.89; (16, 64,
 # 20) 0.61 / 1.10; (8, 128, *) 1.1-1.8
@@ -69,7 +73,33 @@ def nf4_int8_t_kernel(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr
     # W (n_rows, n_cols) NF4 -> out[col, row_offset + row] = round(W[row, col] * inv[col]) in int8.
     # Program (r, c): rows [r*ROWS, +ROWS) of the c-th 64-column block, i.e. one absmax block per
     # row, read as 8 int32 words of packed codes each (nf4.py's decode), stored transposed
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    _decode_t_block(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr, inv_ptr,
+                    out_ptr, blocks_per_row, out_stride, row_offset, tl.program_id(0),
+                    ROWS=ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
+
+
+@triton.jit
+def nf4_int8_t2_kernel(w0, qa0, c0, s0, o0, l0, w1, qa1, c1, s1, o1, l1, inv_ptr, out_ptr,
+                       blocks_per_row, out_stride, row_programs, ROWS: tl.constexpr,
+                       QBLOCK: tl.constexpr, ABLOCK: tl.constexpr):
+    # two weights of the same shape in one launch: programs [0, row_programs) decode the first
+    # into columns [0, n_rows) of out, the next row_programs the second into [n_rows, 2 n_rows)
+    # (W_gate^T | W_up^T of the MLP backward), with nf4_int8_t_kernel's body
+    pid = tl.program_id(0)
+    if pid < row_programs:
+        _decode_t_block(w0, qa0, c0, s0, o0, l0, inv_ptr, out_ptr, blocks_per_row, out_stride, 0,
+                        pid, ROWS=ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
+    else:
+        _decode_t_block(w1, qa1, c1, s1, o1, l1, inv_ptr, out_ptr, blocks_per_row, out_stride,
+                        row_programs * ROWS, pid - row_programs, ROWS=ROWS, QBLOCK=QBLOCK,
+                        ABLOCK=ABLOCK)
+
+
+@triton.jit
+def _decode_t_block(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr, inv_ptr,
+                    out_ptr, blocks_per_row, out_stride, row_offset, program, ROWS: tl.constexpr,
+                    QBLOCK: tl.constexpr, ABLOCK: tl.constexpr):
+    rows = program * ROWS + tl.arange(0, ROWS)
     cblk = tl.program_id(1)
     blk = rows * blocks_per_row + cblk
     q = tl.load(qabsmax_ptr + blk).to(tl.int32)
@@ -217,7 +247,37 @@ def _inverse(colmax):
     return torch.where(colmax > 0, 127.0 / colmax.clamp_min(1e-30), torch.zeros_like(colmax))
 
 
-def _decode_t(base, inv, out_i8, out_stride, row_offset):
+def _ops(base, half):
+    """fused_proj's cached NF4 operands of a 4-bit layer (packed words, absmax codes, state2.code,
+    state2.absmax, offset, NF4 levels: no Params4bit attribute read per call), or None."""
+    from .fused_proj import _nf4_args
+
+    found = _nf4_args(base, half)
+    return None if found is None else found[1][:6]
+
+
+def _decode_t_pair(gate, up, inv, out_i8, out_stride, half):
+    """_decode_t of gate into columns [0, I) and of up into [I, 2I) of out_i8 in one launch
+    (SOUP_SOLUTION_INT8_PAIR, on by default; two launches when the cached operands are missing)."""
+    ops = (_ops(gate, half), _ops(up, half)) if _PAIR["on"] else (None, None)
+    if None in ops or gate.out_features != up.out_features or gate.in_features != up.in_features:
+        _decode_t(gate, inv, out_i8, out_stride, 0, half)
+        _decode_t(up, inv, out_i8, out_stride, gate.out_features, half)
+        return
+    n_rows, n_cols = gate.out_features, gate.in_features
+    nf4_int8_t2_kernel[(2 * (n_rows // W_ROWS), n_cols // QBLOCK)](
+        *ops[0], *ops[1], inv, out_i8, n_cols // QBLOCK, out_stride, n_rows // W_ROWS,
+        ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
+
+
+def _decode_t(base, inv, out_i8, out_stride, row_offset, half=None):
+    ops = _ops(base, half) if half is not None and _PAIR["on"] else None
+    if ops is not None:
+        n_rows, n_cols = base.out_features, base.in_features
+        nf4_int8_t_kernel[(n_rows // W_ROWS, n_cols // QBLOCK)](
+            *ops, inv, out_i8, n_cols // QBLOCK, out_stride, row_offset,
+            ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
+        return
     weight = base.weight
     state = weight.quant_state
     state2 = state.state2
@@ -315,7 +375,7 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None, padded=None):
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
-    _decode_t(plan.down, inv_d, w_down_t, d, 0)
+    _decode_t(plan.down, inv_d, w_down_t, d, 0, plan.half)
     if done is not None:  # W_down's last read is queued (weight_stream: its slot may load the next)
         done(plan.down)
     acc_h = torch._int_mm(w_down_t, g_q.t())
@@ -347,8 +407,7 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None, padded=None):
         scale_gu = torch.maximum(scale_g, scale_u)
         inv_gu = _inverse(scale_gu * 127.0)
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
-    _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
-    _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
+    _decode_t_pair(plan.gate, plan.up, inv_gu, w_gu_t, 2 * inter, plan.half)
     if done is not None:
         done(plan.gate)
         done(plan.up)
@@ -378,6 +437,11 @@ def _warm():
                    INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M, QGROUP=1, INT8_IN=False)
     compile_kernel(quant_t_int8_kernel, half, f32, f32, i8, 2 * INTERMEDIATE, tokens, GROUPS=GROUPS,
                    TR=TQ_R, TM=TQ_M)
+    if _PAIR["on"]:
+        compile_kernel(nf4_int8_t2_kernel, i32, u8, f32, f32, f32, f32, i32, u8, f32, f32, f32, f32,
+                       f32, i8, HIDDEN // QBLOCK, 2 * INTERMEDIATE, INTERMEDIATE // W_ROWS,
+                       ROWS=W_ROWS, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4,
+                       enable_fp_fusion=False)
     int8_glue.warm(half, HIDDEN)
     return None
 
