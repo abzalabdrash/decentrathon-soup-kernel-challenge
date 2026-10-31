@@ -183,6 +183,31 @@ def prepin(megabytes):
     return thread
 
 
+def release_host_memory():
+    """Training is over (exit_release.py): the pinned slabs, spare and used, go back to the driver
+    (cudaFreeHost through torch's host allocator, whose cache holds them once unreferenced). An
+    offload that runs again pins new slabs on demand. Slabs still holding a live slot stay. Call it
+    with the device synchronized. Returns the bytes released."""
+    with _SPARE_LOCK:
+        if _PREPINNING[0]:
+            return 0  # a prepin thread is still pinning: leave everything as it is
+        spares = list(_SPARE)
+        _SPARE.clear()
+    released = sum(slab.numel() for slab in spares)
+    del spares
+    offloader = _ACTIVE["offloader"]
+    if offloader is not None:
+        with offloader.lock:
+            host = offloader.host
+            if host.live() == 0:
+                released += host.nbytes
+                host.released = (host.nbytes, len(host.slabs))  # for the summary
+                host.slabs, host.slots, host.nbytes = [], [], 0
+    if released:
+        torch._C._host_emptyCache()
+    return released
+
+
 # ----------------------------------------------------------------------------------------------
 # offload
 
@@ -204,6 +229,7 @@ class _HostStack:
         self.limit = limit_bytes
         self.nbytes = 0
         self.prepinned = 0  # slabs taken from prepin()
+        self.released = None  # (bytes, slabs) handed back by release_host_memory()
 
     def push(self, nbytes):
         """(slot, pinned uint8 view of nbytes <= SLAB_BYTES), or (None, None) at the cap."""
@@ -440,8 +466,9 @@ class Offloader:
                 f"{self.max_inflight} in flight, {self.prefetch} prefetched); back: "
                 f"{s['prefetch_hits']} prefetched, {s['fetched']} on demand, "
                 f"{s['still_on_gpu']} still on GPU; {s['waited']} dropped behind a stream wait; "
-                f"pinned stack {self.host.nbytes >> 20} MiB in {len(self.host.slabs)} slabs "
-                f"({self.host.prepinned} prepinned); kept on GPU over the cap {s['kept']}; "
+                f"pinned stack {(self.host.released or (self.host.nbytes,))[0] >> 20} MiB in "
+                f"{(self.host.released or (0, len(self.host.slabs)))[1]} slabs ({self.host.prepinned} prepinned"
+                f"{'; released after the last step' if self.host.released else ''}); kept on GPU over the cap {s['kept']}; "
                 f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
                 f"started early {s['early']}")
 
