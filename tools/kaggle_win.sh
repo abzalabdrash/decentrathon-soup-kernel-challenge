@@ -23,6 +23,8 @@ case "$acct" in
   2) tok="$TOKDIR/kaggle2.token"; user=peagverr ;;
   3) tok="$TOKDIR/kaggle3.token"; user=slerfas ;;
   4) tok="$TOKDIR/kaggle4.token"; user=shyraylym ;;
+  5) tok="$TOKDIR/kaggle5.token"; user=zhemishan ;;
+  6) tok="$TOKDIR/kaggle6.token"; user=zhemisha ;;
   *) echo "first argument: account 1 (namedesign), 2 (peagverr), 3 (slerfas) or 4 (shyraylym)"; exit 2 ;;
 esac
 [ -r "$tok" ] || { echo "token file $tok not found"; exit 2; }
