@@ -75,27 +75,26 @@ def zero_grads(net, x):
             t.grad.zero_()
 
 
-def run(net, x, grad, mode):
+def run(net, x, grad, mode, cuda_bytes):
     """One forward + backward in `mode`: output, [x.grad, *param grads], peak MiB, offloader."""
     from solution.bench_offload import mode_context, step
 
     zero_grads(net, x)
-    torch.cuda.synchronize()
-    base = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
+    cuda_bytes.reset_peak()
+    base = cuda_bytes.now()
     with mode_context(net, mode) as offloader:
         out = step(net, x, grad)
     torch.cuda.synchronize()
-    peak = (torch.cuda.max_memory_allocated() - base) / 2**20
+    peak = (cuda_bytes.peak() - base) / 2**20
     grads = [x.grad.clone()] + [p.grad.clone() for p in net.parameters()]
     return out.detach().clone(), grads, peak, offloader
 
 
 @pytest.mark.parametrize("mode", ["offload", "recompute"])
-def test_mode_matches_plain_and_lowers_peak(net, inputs, mode):
+def test_mode_matches_plain_and_lowers_peak(net, inputs, mode, cuda_bytes):
     x, grad = inputs
-    ref_out, ref_grads, ref_peak, _ = run(net, x, grad, "none")
-    out, grads, peak, offloader = run(net, x, grad, mode)
+    ref_out, ref_grads, ref_peak, _ = run(net, x, grad, "none", cuda_bytes)
+    out, grads, peak, offloader = run(net, x, grad, mode, cuda_bytes)
     diffs = [close(out, ref_out)] + [close(g, r) for g, r in zip(grads, ref_grads)]
     print(f"\n{mode}: peak {peak:.1f} MiB vs {ref_peak:.1f} MiB without, max diff {max(diffs):.3g}")
     if offloader is not None:
@@ -107,7 +106,7 @@ def test_mode_matches_plain_and_lowers_peak(net, inputs, mode):
 
 
 @pytest.mark.parametrize("mode", ["offload", "recompute"])
-def test_five_steps_no_leak(net, inputs, mode):
+def test_five_steps_no_leak(net, inputs, mode, cuda_bytes):
     from solution.bench_offload import mode_context, step
 
     x, grad = inputs
@@ -115,13 +114,12 @@ def test_five_steps_no_leak(net, inputs, mode):
     with mode_context(net, mode) as offloader:
         for _ in range(5):
             zero_grads(net, x)
-            torch.cuda.synchronize()
-            base = torch.cuda.memory_allocated()
-            torch.cuda.reset_peak_memory_stats()
+            cuda_bytes.reset_peak()
+            base = cuda_bytes.now()
             step(net, x, grad)
             torch.cuda.synchronize()
-            peaks.append(torch.cuda.max_memory_allocated() - base)
-            after.append(torch.cuda.memory_allocated() - base)
+            peaks.append(cuda_bytes.peak() - base)
+            after.append(cuda_bytes.now() - base)
             if offloader is not None:
                 assert offloader.host.live() == 0 and not offloader.inflight
                 pinned.append((offloader.host.nbytes, len(offloader.host.slabs)))
@@ -278,8 +276,12 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     wait (the CPU keeps running ahead of the GPU). The values still come back exactly."""
     import threading
 
+    from solution import offload
     from solution.offload import Offloader
 
+    # marks left by earlier tests' forwards without a graph would be taken by these packs (an
+    # offload_saved_tensors context clears them; this test builds its Offloader by hand)
+    monkeypatch.setitem(offload._RESIDUAL, "marked", {})
     calls = []
     me = threading.get_ident()  # the patches are process-wide: a warm-up thread may sync its events
     original_sync, original_record = torch.cuda.Event.synchronize, torch.Tensor.record_stream
@@ -301,6 +303,11 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     torch.cuda.synchronize()
     monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
     monkeypatch.setattr(torch.cuda.Event, "synchronize", synchronize)
+    # the GPU behind the CPU from the start, as in training: every D2H (ordered after this stream)
+    # is still queued at the next pack, so each one past the window is dropped behind a stream wait.
+    # Without the sleep, a copy may already be done at the next pack (a slow CPU, a busy GIL) and is
+    # dropped without a wait: 0 waits on a T4 in a full pytest run
+    torch.cuda._sleep(SLEEP)
     with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
         ys = []
         for x, v in zip(xs, values):
@@ -316,9 +323,8 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     off.close()
     torch.cuda.synchronize()
     s = off.stats
-    # how many copies are still queued at the next pack depends on the card's timing (the T4 shows
-    # 2-5 of 5): at least one stream wait, never a CPU one (calls above)
-    assert s["offloaded"] == k and 1 <= s["waited"] <= k - 1 and s["prefetch_hits"] == k - 1, \
+    # every copy past the window of one waited for on the stream, never on the CPU (calls above)
+    assert s["offloaded"] == k and s["waited"] == k - 1 and s["prefetch_hits"] == k - 1, \
         off.summary()
     for x, v in zip(xs, values):
         assert torch.equal(x.grad, v)
