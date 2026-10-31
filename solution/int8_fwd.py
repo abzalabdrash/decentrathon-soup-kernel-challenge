@@ -428,7 +428,7 @@ def quantize_tokens(x2, n, padded, pos=None):
 def observe(mlp, x2):
     """Before the switch (fp16 forwards): the running max |x| per input channel of this MLP, kept
     on the module (one fp32 (D,) tensor, GPU ops only, no sync)."""
-    peak = torch.linalg.vector_norm(x2, ord=float("inf"), dim=0)
+    peak = torch.linalg.vector_norm(x2.detach(), ord=float("inf"), dim=0)
     if peak.dtype != torch.float32:
         peak = peak.float()
     prev = mlp.__dict__.get("_soup_int8_peak")

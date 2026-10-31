@@ -292,3 +292,24 @@ def test_drain_after_first_product(int8_on, monkeypatch):
     with torch.autocast("cuda", dtype=torch.float16):
         mlp(x)
     assert seen == [True] and len(calls) == 2
+
+
+def test_channels_from_the_fp16_forwards(int8_on, monkeypatch):
+    """Before the switch the training forwards (input with requires_grad) collect max |x| per input
+    channel; the first int8 forward fixes the top-k channels from it, for the rest of the run."""
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=25).cuda().train()
+    monkeypatch.setattr(int8_on, "START_CALLS", 2)
+    monkeypatch.setitem(int8_on._STATE, "calls", 0)
+    xs = [torch.randn(1, 832, 1536, device="cuda") for _ in range(3)]
+    xs[0][0, :, 7] *= 50  # channel 7 large in the first forward, channel 9 in the second
+    xs[1][0, :, 9] *= 40
+    for x in xs:
+        with torch.autocast("cuda", dtype=torch.float16):
+            mlp(x.requires_grad_(True)).sum().backward()
+    pos, idx = mlp.__dict__["_soup_int8_topk"]
+    assert int8_on._STATE["calls"] == 3 and "_soup_int8_peak" not in mlp.__dict__
+    peak = torch.maximum(xs[0].detach().abs().amax((0, 1)), xs[1].detach().abs().amax((0, 1)))
+    assert set(idx.tolist()) == set(peak.topk(int8_on.TOPK).indices.tolist())
+    assert {7, 9} <= set(idx.tolist()) and int(pos[7]) >= 0 and int(pos[9]) >= 0
