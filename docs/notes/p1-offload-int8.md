@@ -176,4 +176,22 @@ pins it off together with the int8 backward for the bitwise tests of the half pa
 switches it on). a00105a: locally test_fused_proj, test_int8_bwd, test_jury_offload_marks, test_offload,
 test_offload_int8, test_xoffload 86 passed; Soup's 79 with SOUP_APPLY_SOLUTION=1 passed.
 
-**Jury, a00105a** (seed 157, train 42000:42256, eval 51800:52056): TODO
+**Jury, a00105a** (soup-p1-jury, slerfas; seed 157, train 42000:42256, eval 51800:52056; `--eval-rows
+52000:52256` from the brief runs past the dataset's 52,201 rows): **all 10 checks**; base 88.73 / 89.94 s,
+ours **49.94 / 49.45 s** (s = 1.80), peak **453 MiB** (m = 31.7; the int8-off variant of the same rows had
+453 too in soup-p1-abba-jury3, so this is main's peak on these rows, not the change's), eval +0.016 %,
+loss curve 0.00 % first / 0.06 % mean, entropy 0.16-0.20 %, accuracy 0.27-0.30 %, rewind 0.18 %, own
+kernels 19.9 %.
+
+## 7. State and what is left
+
+Branch `claude/p1-offload-int8-8429f6`, merged with main 0100e3a. Switches: `SOUP_SOLUTION_OFFLOAD_INT8`
+(default 1, every process; conftest pins it off for the bitwise tests), `SOUP_SOLUTION_OFFLOAD_INT8_FUSED`
+(default 1), experiment knobs `_GROUP` (128), `_TILE_M` (128), `_WARPS` (8), `_START_CALLS` (196),
+`_COMPILE_AFTER` (28). solution/__init__.py does not list them yet (the orchestrator's file).
+
+Not done: the T4 tile sweep of the SwiGLU-fused quantization kernel (128 x 8 chosen from the
+quantization-only sweep; locally +0.10 / +0.17 ms over the example SwiGLU at 832 / 2,048 tokens); copy
+order by nearest consumer; a prefetch window of two with int8 (the half-precision pf2 gave -1.8 s on
+2,048-token rows at +140 MiB; with int8 the extra buffer halves, but it would still lift the jury-row
+peak above 450).
