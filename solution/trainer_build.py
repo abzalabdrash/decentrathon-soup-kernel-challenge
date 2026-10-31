@@ -16,8 +16,12 @@ returns None at once: the value Soup computes, without the first render (one of 
 and tokenizations of each row). Every ids list then goes through `_coerce_int_list` (loss_mask.py:48),
 which checks and converts each token in a Python loop; a list whose items are all exactly `int` is
 returned as a copy (what the loop returns for it: `index(x)` and `int(x)` of an int are x), anything
-else takes the loop. The rows are the same (test_trainer_build.py; on the 256 training rows, input
-ids and labels compared one by one); datasets' fingerprint of the map changes, because the functions
+else takes the loop. And Soup's incremental fallback tokenizes the whole conversation twice per row
+(first as `full_ids`, loss_mask.py:336, then as the last cumulative prefix, :347, which for a
+user/assistant row is the same list of messages): `_tokenize_only` remembers its last MEMO_CALLS
+calls (the tokenizer, its chat template, a copy of the messages) and answers a call with equal
+messages from them, so each row has two renders and tokenizations instead of four. The rows are the same
+(test_trainer_build.py; on the 256 training rows, input ids and labels compared one by one); datasets' fingerprint of the map changes, because the functions
 it hashes through the module's globals are these two (a fingerprint only names cache files of
 datasets backed by files, and this one is built in memory; the organizers allow even a random one).
 
@@ -118,6 +122,36 @@ def _fast_mask(original):
 
     _apply_template_with_mask._soup_original = original
     return _apply_template_with_mask
+
+
+MEMO_CALLS = 8  # _tokenize_only calls remembered: a row's prefixes come between its two full renders
+
+
+def _fast_tokenize_only(original):
+    recent = []  # [(tokenizer, chat template, copy of the messages, ids)], newest last
+
+    def _tokenize_only(tokenizer, messages, *args, **kwargs):
+        if args or kwargs or not isinstance(messages, (list, tuple)):
+            return original(tokenizer, messages, *args, **kwargs)
+        template = getattr(tokenizer, "chat_template", None)
+        try:
+            for cached_tok, cached_template, cached, ids in reversed(recent):
+                if (cached_tok is tokenizer and cached_template is template and len(cached) == len(messages)
+                        and all(a == b for a, b in zip(cached, messages))):
+                    return list(ids)
+        except Exception:  # noqa: BLE001
+            recent.clear()
+        ids = original(tokenizer, messages)
+        try:
+            recent.append((tokenizer, template, [dict(m) if isinstance(m, dict) else m for m in messages],
+                           list(ids)))
+            del recent[:-MEMO_CALLS]
+        except Exception:  # noqa: BLE001
+            recent.clear()
+        return ids
+
+    _tokenize_only._soup_original = original
+    return _tokenize_only
 
 
 def _fast_int_list(original):
@@ -535,6 +569,7 @@ def _replacements():
 
             out.append((loss_mask, "_apply_template_with_mask", _fast_mask))
             out.append((loss_mask, "_coerce_int_list", _fast_int_list))
+            out.append((loss_mask, "_tokenize_only", _fast_tokenize_only))
         except Exception:  # noqa: BLE001
             pass
     if _flag("SOUP_SOLUTION_FAST_FINGERPRINT"):

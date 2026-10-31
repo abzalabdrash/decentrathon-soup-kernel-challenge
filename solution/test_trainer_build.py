@@ -54,12 +54,27 @@ def _labels(tok, max_length=512):
 
 
 def test_fast_rows_same_labels(tokenizer, monkeypatch):
-    expected = _labels(tokenizer) + _labels(tokenizer, max_length=7)
+    calls = []
+    original = loss_mask._tokenize_only
+    monkeypatch.setattr(loss_mask, "_tokenize_only", lambda t, m: calls.append(len(m)) or original(t, m))
+    expected = _labels(tokenizer)
+    plain_calls = len(calls)
+    expected_short = _labels(tokenizer, max_length=7)
+    calls.clear()
     monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
     undo = trainer_build.install()
     try:
         assert getattr(loss_mask._apply_template_with_mask, "_soup_original", None) is not None
-        assert _labels(tokenizer) + _labels(tokenizer, max_length=7) == expected
+        assert _labels(tokenizer) == expected
+        # the whole conversation is tokenized once per row, not twice
+        assert len(calls) == plain_calls - len(ROWS)
+        # the same rows again: equal answers (from the memo or not)
+        assert _labels(tokenizer, max_length=7) == expected_short
+        # a changed message is not answered from the memo
+        changed = [dict(m) for m in ROWS[0]]
+        first = loss_mask._tokenize_only(tokenizer, changed)
+        changed[1]["content"] = "the lazy dog"
+        assert loss_mask._tokenize_only(tokenizer, changed) != first
     finally:
         undo()
     assert getattr(loss_mask._apply_template_with_mask, "_soup_original", None) is None
