@@ -218,6 +218,51 @@ ours **49.94 / 49.45 s** (s = 1.80), peak **453 MiB** (m = 31.7; the int8-off va
 loss curve 0.00 % first / 0.06 % mean, entropy 0.16-0.20 %, accuracy 0.27-0.30 %, rewind 0.18 %, own
 kernels 19.9 %.
 
+**Accuracy round (orchestrator's tightened criteria: |delta eval| <= 0.2 %, mean curves <= 0.5 %, first-step
+loss ~0.01 %), all on the merged head 9ded812:**
+
+| run | delta eval | loss first | loss mean | entropy | accuracy | rewind row loss | wall / peak |
+|---|---|---|---|---|---|---|---|
+| full (soup-p1-full2) | -0.000 % | 0.01 % | 0.07 % | (not printed in full mode) | | | 45.4 s vs 80.1 / 395 MiB, 10 of 10 |
+| jury seed 157 (soup-p1-jury, a00105a = same code), solution_1 | +0.016 % | 0.001 % | 0.059 % | 0.160 % | 0.266 % | 0.182 % | 49.94 s / 453 MiB, 10 of 10 |
+| solution_2 | | 0.001 % | 0.057 % | 0.198 % | 0.297 % | 0.187 % | 49.45 s |
+| base_2 against base_1 (the base's own spread) | | 0.000 % | 0.009 % | 0.006 % | 0.086 % | 0.026 % | |
+| jury seed 163 (soup-p1-jury163; train 44000:44256, eval 51400:51656), solution_1 | +0.010 % | 0.001 % | 0.049 % | 0.145 % | 0.364 % | 0.169 % | 49.15 s / 413 MiB, 10 of 10 |
+| solution_2 | | 0.001 % | 0.048 % | 0.172 % | 0.298 % | 0.162 % | 49.75 s |
+| base_2 against base_1 | | 0.000 % | 0.008 % | 0.009 % | 0.120 % | 0.026 % | |
+
+| jury seed 163, same rows, `SOUP_SOLUTION_OFFLOAD_INT8=0` (soup-p1-jury163off: main's path), solution_1 | -0.003 % | 0.001 % | 0.049 % | 0.177 % | 0.329 % | 0.165 % | 50.34 s / 415 MiB, 10 of 10 |
+| solution_2 | | 0.001 % | 0.049 % | 0.161 % | 0.291 % | 0.174 % | 51.35 s |
+| base_2 against base_1 | | 0.000 % | 0.008 % | 0.010 % | 0.111 % | 0.029 % | |
+
+Every line is inside the tightened limits (largest: accuracy 0.364 % against 0.5 %), and on the same
+rows and seed the int8 offload does not move them: off 0.049 / 0.049 % loss mean, 0.177 / 0.161 %
+entropy, 0.329 / 0.291 % accuracy, 0.165 / 0.174 % rewind; on 0.049 / 0.048, 0.145 / 0.172, 0.364 /
+0.298, 0.169 / 0.162. The accuracy and entropy gaps (~0.3 % and ~0.16 % against the base's own 0.1 % and
+0.01 %) are the solution's level with or without P1.
+
+**Allocation snapshot and waits (diag, public rows, step 10 snapshot, steps 10-11 traced, int8 from step
+7; soup-p1-diag-on on slerfas, soup-p1-diag-off = `SOUP_SOLUTION_OFFLOAD_INT8=0` on peagverr; 10da017):**
+- Allocations of step 10 with int8 on, by site: the forward's (gate|up) GEMM output (fused_proj.py:1535,
+  25.2 MiB x 28: the int8 form is written into it, it is the copy's source); the backward's prefetches
+  (offload.py:507) bring back the int8 form, ~13 MiB each, plus the layer inputs; the half rebuild
+  (offload_int8.py:155) runs once per step, 25.2 MiB, for the last layer only (still on the GPU at the
+  backward's start). The int8 backward writes dgate|dup over its int32 product: no half (gate|up)
+  buffer in the backward otherwise.
+- Dependency waits of the compute stream (gaps whose next kernel was launched before the gap began,
+  tools/trace_waits.py): 71.8 ms off, 32.4 ms on over the two traced steps; before the MLP backward's
+  first kernel after the unpack 45.4 -> 20.1 ms, before one of the fp16 GEMMs 15.7 -> 2.4 ms. Copies
+  over the two steps: H2D 4,848 -> 4,240 MiB, D2H 1,525 -> 894 MiB. (The traced steps run under the
+  profiler, CPU-bound: 5.1-5.2 s of CPU-side gaps, so the absolute waits are smaller than unprofiled.)
+- Kernel times across the two sessions are not comparable (the cuBLAS GEMMs ran ~20 % slower on the
+  'on' card), but per replaced kernel: int8_swiglu_bwd 17.8 ms (int8 form) against 19.8 (half),
+  quant_t 9.6 (il) against 11.4, and the forward's SwiGLU 0.42 ms per call with the int8 form against
+  0.15 for the example kernel: the fused kernel runs at ~120 GB/s at its 128 x 8 tile (chosen from the
+  quantization-only sweep), so its tile is the next fix (soup-p1-bench3).
+- A second compressed prefetch slot: not added. The jury-row peaks are 413-453 MiB already (main's own
+  peak on those rows), so an extra 18 KB/token slot (up to 35 MiB at 2,048 tokens) would cross 450 on the
+  longest rows; the waits it would hide are the 20 ms left in two steps above.
+
 ## 7. State and what is left
 
 Branch `claude/p1-offload-int8-8429f6`, merged with main 0100e3a. Switches: `SOUP_SOLUTION_OFFLOAD_INT8`
