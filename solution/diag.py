@@ -30,6 +30,10 @@ import torch
 
 SNAP_STEP = int(os.environ.get("SOUP_SOLUTION_DIAG_SNAP_STEP", "6"))
 TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9").split(","))
+# SOUP_SOLUTION_DIAG_TRACE_CPU=0: the trace records the CUDA activity only (kernels, copies and the CUDA
+# runtime calls with their correlation ids); with the CPU activity the traced steps run CPU-bound under
+# the profiler and the GPU's waits for copies hide behind it
+TRACE_CPU = os.environ.get("SOUP_SOLUTION_DIAG_TRACE_CPU", "1") not in ("0", "false", "no", "")
 MAX_ENTRIES = 1_000_000
 MIB = 2 ** 20
 
@@ -107,8 +111,9 @@ class _Trace:
     def start(self):
         from torch.profiler import ProfilerActivity, profile
 
-        self.prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                            record_shapes=False, with_stack=False, profile_memory=False)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA] if TRACE_CPU else [ProfilerActivity.CUDA]
+        self.prof = profile(activities=activities, record_shapes=False, with_stack=False,
+                            profile_memory=False)
         self.prof.start()
         log(f"trace started at step {TRACE_STEPS[0]}")
 

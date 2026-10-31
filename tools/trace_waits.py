@@ -47,15 +47,33 @@ def main():
             continue
         waits, cpu_gaps = collections.Counter(), 0.0
         count = collections.Counter()
+        by_copy, by_copy_n = collections.Counter(), collections.Counter()
+        ends = sorted((c["ts"] + c["dur"], c) for c in copies if lo - 1e5 <= c["ts"] < hi)
         for prev, nxt in zip(ks, ks[1:]):
-            gap = nxt["ts"] - (prev["ts"] + prev["dur"])
+            g0 = prev["ts"] + prev["dur"]
+            gap = nxt["ts"] - g0
             if gap < args.min_us:
                 continue
             launched = launches.get(nxt["args"].get("correlation"))
-            if launched is not None and launched < prev["ts"] + prev["dur"]:
+            if launched is not None and launched < g0:
                 name = nxt["name"][:60]
                 waits[name] += gap
                 count[name] += 1
+                # the copy that ended last before the compute stream resumed, inside the gap
+                last = None
+                for end, c in ends:
+                    if end > nxt["ts"] + 2:
+                        break
+                    if end >= g0 - 2:
+                        last = c
+                if last is None:
+                    key = "no copy ended in the gap (another stream's kernel or event)"
+                else:
+                    mib = last["args"].get("bytes", 0) / 2**20
+                    kind = "H2D" if "HtoD" in last["name"] else "D2H" if "DtoH" in last["name"] else "copy"
+                    key = f"{kind} {mib:7.2f} MiB"
+                by_copy[key] += gap
+                by_copy_n[key] += 1
             else:
                 cpu_gaps += gap
         span = ks[-1]["ts"] + ks[-1]["dur"] - ks[0]["ts"]
@@ -69,6 +87,9 @@ def main():
               f"{sum(c['dur'] for c in d2h) / 1e3:.1f} ms ({sum(c['args'].get('bytes', 0) for c in d2h) / 2**20:.0f} MiB)")
         for name, us in waits.most_common(args.top):
             print(f"    {us / 1e3:7.2f} ms in {count[name]:3d} waits before {name}")
+        print("  by the copy that ended last inside the wait (direction, size):")
+        for key, us in by_copy.most_common(args.top):
+            print(f"    {us / 1e3:7.2f} ms in {by_copy_n[key]:3d} waits, {key}")
 
 
 if __name__ == "__main__":
