@@ -52,6 +52,11 @@ runs, the first call per (type, CUDA device, block size) is the original one and
 result; later calls return a `clone()` of that copy: the same float32 values, a new tensor for each
 weight's quant state as before, one device copy queued on the current stream instead of a wait.
 Other devices, and anything outside these loads, take the original function.
+
+SOUP_SOLUTION_LOAD_PREAD=1: load_pinned.py's thread reads each tensor's bytes from its file with
+`preadv` instead of copying them out of the safetensors mmap (see there); here the files Soup's setup
+opens with `safe_open` are noted and, for a load handled here, the slices of its state_dict are
+mapped to their byte ranges (`_FileRanges`).
 """
 
 import functools
@@ -62,7 +67,8 @@ import time
 
 import torch
 
-_STATE = {"depth": 0, "layers": False, "only": None, "embedding": False}
+_STATE = {"depth": 0, "layers": False, "only": None, "embedding": False,
+          "opened": []}  # (path, handle) of the safetensors files opened in Soup's setup (LOAD_PREAD)
 _ACTIVE = {"load": None}  # the load in progress, when it is one this module handles
 LAST = {"load": None}  # the last load handled (counters, for the log and the tests)
 
@@ -126,7 +132,7 @@ class _Pinner:
 class _Load:
     """One `convert_and_load_state_dict_in_model` call this module takes part in."""
 
-    def __init__(self, model, device):
+    def __init__(self, model, device, locate=None):
         from .weight_stream import find_decoder_layers
 
         self.model, self.device = model, device
@@ -148,12 +154,13 @@ class _Load:
         self.failed = self.embedding_done = False
         self.layers_moved = self.layer_bytes = self.embedding_bytes = 0
         self.layer_seconds = self.embedding_seconds = 0.0  # spent here (copies to the host, pinning)
+        self.locate = locate  # LOAD_PREAD: slice -> its byte range in the file
         self.embedding_pinned = None  # the embedding's pinned buffer once its job took it
         self.embedding_fill = None  # EMBED_ASYNC: (thread, host view, slice, outcome)
         self.pinner = _Pinner(self._requests(), device)
         from .load_pinned import new_copier
 
-        self.copier = new_copier(device)  # load_pinned.py (SOUP_SOLUTION_LOAD_PINNED=1), else None
+        self.copier = new_copier(device, locate=locate)  # load_pinned.py (SOUP_SOLUTION_LOAD_PINNED=1), else None
 
     def _requests(self):
         """The pinned buffers this load will need, in the order it needs them."""
@@ -204,10 +211,24 @@ class _Load:
         host = pinned.buffer[:nbytes].view(dtype).view(shape)
         outcome = {"error": None, "seconds": None, "waited": 0.0}
 
+        where = None
+        if self.locate is not None:
+            try:
+                found = self.locate(source)
+                src_dtype = _SAFETENSORS_DTYPES.get(found[3]) if found is not None else None
+                if (src_dtype is not None and found[3] == source.get_dtype() and tuple(found[4]) == shape
+                        and found[2] == torch.Size(shape).numel() * src_dtype.itemsize and len(shape) == 2):
+                    where = (found[0], found[1], src_dtype)
+            except Exception:  # noqa: BLE001 - from the slice
+                where = None
+
         def fill():
             started = time.perf_counter()
             try:
-                host.copy_(source[...])
+                if where is not None:
+                    _cast_from_file(host, *where)
+                else:
+                    host.copy_(source[...])
             except BaseException as exc:  # noqa: BLE001 - the join fills it in the main thread
                 outcome["error"] = exc
             outcome["seconds"] = time.perf_counter() - started
@@ -316,6 +337,27 @@ def _handled(model, hf_quantizer, device_values):
     return _single_cuda_device(list(device_values))
 
 
+_SAFETENSORS_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
+FILL_CHUNK_BYTES = 32 << 20  # LOAD_PREAD's scratch for the embedding fill
+
+
+def _cast_from_file(host, fd, offset, src_dtype):
+    """The 2-D `host` filled from the file range at `offset` holding the same shape in `src_dtype`:
+    read in chunks of rows into one scratch tensor (preadv), each cast into `host` with `copy_`,
+    the kernel `.to()` runs (no overlapping copies)."""
+    from .load_pinned import _read_into
+
+    rows, cols = host.shape
+    row_bytes = cols * src_dtype.itemsize
+    step = max(1, FILL_CHUNK_BYTES // row_bytes)
+    scratch = torch.empty(min(step, rows) * cols, dtype=src_dtype)
+    raw = scratch.view(torch.uint8)
+    for first in range(0, rows, step):
+        count = min(step, rows - first)
+        _read_into(fd, offset + first * row_bytes, raw, count * row_bytes)
+        host[first:first + count].copy_(scratch[:count * cols].view(count, cols))
+
+
 def _code_table(original):
     """bitsandbytes' get_4bit_type for SOUP_SOLUTION_LOAD_CODE_TABLE (see the module docstring)."""
     tables = {}
@@ -340,6 +382,58 @@ def _code_table(original):
 
     get_4bit_type._soup_original = original
     return get_4bit_type
+
+
+class _FileRanges:
+    """SOUP_SOLUTION_LOAD_PREAD (load_pinned.py): where each checkpoint slice of a load lies in its
+    file. `state_dict` maps the checkpoint's keys to their slices (transformers' loader), `opened`
+    the files Soup's setup opened with safetensors' safe_open; each file's header (an 8-byte little
+    endian length, then JSON with dtype, shape and data offsets per key) gives the byte range."""
+
+    def __init__(self, state_dict, opened):
+        self.key_of = {id(value): key for key, value in state_dict.items()}
+        self.path_of = {}
+        for path, handle in opened:
+            for key in handle.keys():
+                self.path_of.setdefault(key, path)
+        self.files = {}  # path -> (fd, data start, header)
+
+    def _file(self, path):
+        import json
+        import struct
+
+        found = self.files.get(path)
+        if found is None:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                size = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+                header = json.loads(os.pread(fd, size, 8))
+            except Exception:
+                os.close(fd)
+                raise
+            found = self.files[path] = (fd, 8 + size, header)
+        return found
+
+    def __call__(self, source):
+        """(fd, offset, nbytes, dtype name, shape) of the slice `source`, or None."""
+        key = self.key_of.get(id(source))
+        path = self.path_of.get(key) if key is not None else None
+        if path is None:
+            return None
+        fd, start, header = self._file(path)
+        info = header.get(key)
+        if not isinstance(info, dict):
+            return None
+        first, last = info["data_offsets"]
+        return fd, start + first, last - first, info["dtype"], info["shape"]
+
+    def close(self):
+        for fd, _, _ in self.files.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.files.clear()
 
 
 def _bind(fn, args, kwargs):
@@ -368,6 +462,8 @@ def _scoped_setup(original):
             return original(self, *args, **kwargs)
         finally:
             _STATE["depth"] -= 1
+            if _STATE["depth"] <= 0:
+                _STATE["opened"] = []  # files of loads this module did not handle
 
     return _setup_transformers
 
@@ -392,8 +488,15 @@ def _loader(original):
             if model is not None and device_map else None
         if device is None or _ACTIVE["load"] is not None:
             return original(*args, **kwargs)
+        ranges = None
+        opened, _STATE["opened"] = _STATE["opened"], []
+        if _flag("SOUP_SOLUTION_LOAD_PREAD") and isinstance(bound.get("state_dict"), dict) and opened:
+            try:
+                ranges = _FileRanges(bound["state_dict"], opened)
+            except Exception:  # noqa: BLE001 - staged from the slices
+                ranges = None
         try:
-            load = _Load(model, device)
+            load = _Load(model, device, locate=ranges)
         except Exception as exc:  # noqa: BLE001 - load as usual
             print(f"[solution] load streaming skipped: {exc!r}")
             return original(*args, **kwargs)
@@ -421,6 +524,8 @@ def _loader(original):
             if load.copier is not None:
                 load.copier.close()
             load.pinner.close()
+            if ranges is not None:
+                ranges.close()
             if load.layer_bytes + load.embedding_bytes:
                 print(f"[solution] load streaming: {load.layers_moved} layers' 4-bit weights "
                       f"({load.layer_bytes / 2**20:.0f} MiB, {load.layer_seconds:.2f} s) and the embedding "
@@ -470,6 +575,20 @@ def _setter(original):
     return set_param_for_module
 
 
+def _opener(original):
+    @functools.wraps(original)
+    def safe_open(filename, *args, **kwargs):
+        handle = original(filename, *args, **kwargs)
+        if _STATE["depth"] > 0:
+            try:
+                _STATE["opened"].append((os.fspath(filename), handle))
+            except TypeError:
+                pass
+        return handle
+
+    return safe_open
+
+
 def _spawner(original):
     @functools.wraps(original)
     def spawn_materialize(*args, **kwargs):
@@ -504,6 +623,8 @@ def patch_loader(layers=None, only=None, embedding=None):
     _wrap(core_model_loading, "set_param_for_module", _setter)
     from .load_pinned import enabled as load_pinned_enabled
 
+    if _flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(modeling_utils, "safe_open"):
+        _wrap(modeling_utils, "safe_open", _opener)
     if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC")) and hasattr(core_model_loading,
                                                                                  "spawn_materialize"):
         _wrap(core_model_loading, "spawn_materialize", _spawner)
