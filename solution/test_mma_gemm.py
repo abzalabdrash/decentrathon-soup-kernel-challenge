@@ -92,3 +92,38 @@ def test_mlp_backward_same_with_and_without_mma(monkeypatch):
         out.backward(grad.to(out.dtype))
         grads.append(xg.grad)
     assert torch.equal(grads[0], grads[1])
+
+
+@cuda
+@pytest.mark.parametrize("n", [830, 1440])
+def test_int8_forward_same_with_and_without_mma(monkeypatch, n):
+    """int8_fwd.py MODE "gu" with SOUP_SOLUTION_MMA_INT8_FWD on and off: the same MLP output and the
+    same saved (gate|up) bit for bit (on a T4 the tensor-core kernel runs; elsewhere both runs take
+    the chunked path)."""
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    from solution import int8_bwd, int8_fwd
+    from solution.test_fused_proj import _config, _quantize_mlp
+
+    monkeypatch.setitem(int8_bwd._STATE, "on", False)
+    monkeypatch.setattr(int8_fwd, "MODE", "gu")
+    monkeypatch.setitem(int8_fwd._STATE, "on", True)
+    # the fused path is chosen on the T4 only; elsewhere tl.dot takes Triton's own MMA and the same
+    # kernel runs, so the switch is tested on any GPU
+    real = torch.cuda.get_device_capability
+    monkeypatch.setattr(int8_fwd, "_mma_fwd", lambda *a: int8_fwd.MMA_FWD and int8_fwd.MODE == "gu"
+                        and mma_gemm.int8_gate_up_usable(*a) and real() >= (7, 5))
+    int8_fwd.compile_now()
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=23).cuda().train()
+    gen = torch.Generator("cuda").manual_seed(n)
+    x = torch.randn(1, n, 1536, device="cuda", generator=gen)
+    grad = (torch.randn(1, n, 1536, device="cuda", generator=gen) * 1e-2).half()
+    results = []
+    for mma in (False, True):
+        monkeypatch.setattr(int8_fwd, "MMA_FWD", mma)
+        xg = x.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = mlp(xg)
+        out.backward(grad.to(out.dtype))
+        results.append((out.detach(), xg.grad))
+    assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
