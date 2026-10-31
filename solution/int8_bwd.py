@@ -281,7 +281,7 @@ def usable(plan, tokens):
     return _READY.is_set()
 
 
-def mlp_backward(plan, gate_up, grad16, buffer):
+def mlp_backward(plan, gate_up, grad16, buffer, done=None):
     """The fused MLP's backward from dL/dout (tokens, D) half and the saved (gate|up) (2I, tokens):
     returns dL/dx (tokens, D) fp32; (gate|up) is overwritten with its gradient. `buffer` is
     fused_proj's flat half buffer for one (I, D) weight (taken as int8 bytes). A uint8 `gate_up` is
@@ -311,6 +311,8 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
     _decode_t(plan.down, inv_d, w_down_t, d, 0)
+    if done is not None:  # W_down's last read is queued (weight_stream: its slot may load the next)
+        done(plan.down)
     acc_h = torch._int_mm(w_down_t, g_q.t())
     # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group (from the
     # int8 form: over the int32 product, interleaved, no new buffer)
@@ -342,6 +344,9 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     w_gu_t = i8[:d * 2 * inter].view(d, 2 * inter)
     _decode_t(plan.gate, inv_gu, w_gu_t, 2 * inter, 0)
     _decode_t(plan.up, inv_gu, w_gu_t, 2 * inter, inter)
+    if done is not None:
+        done(plan.gate)
+        done(plan.up)
     # 7. dL/dx (tokens, D) through the int32 product and the two scale vectors (torch ops)
     acc_x = torch._int_mm(dgu_q, w_gu_t.t())
     if int8_glue.ON:

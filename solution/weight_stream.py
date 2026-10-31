@@ -98,6 +98,15 @@ def _env_on(name, default):
 # waits are timed as well, and so are head_stream.py's chunks; off by default since the CPU-side
 # task C1 (two pairs of events per layer and pass and per head chunk, read back with queries: CPU
 # time on every step for numbers only the logs show)
+# SOUP_SOLUTION_RING_EARLY_RELEASE=1: the int8 MLP backward (int8_bwd.mlp_backward) releases each matrix's
+# slot right after its decode, not after the whole backward, so the next layer's copy starts earlier
+EARLY_RELEASE = _env_on("SOUP_SOLUTION_RING_EARLY_RELEASE", "1")
+# SOUP_SOLUTION_RING_SLOTS_GATE / _UP / _DOWN (1 or 2): slots of that MLP matrix type in the type ring.
+# With two, layer j's matrix sits in slot j % 2 and the release of layer i loads layer i + 2*step
+# into the slot it frees: the copy starts a whole layer earlier, and the forward ends with the
+# last two layers' matrices resident for the backward (+6.8 MiB per slot on Qwen2.5-1.5B)
+MLP_SLOTS = {name: max(1, min(2, int(os.environ.get(f"SOUP_SOLUTION_RING_SLOTS_{name.upper()}", "1") or 1)))
+             for name in ("gate", "up", "down")}
 _RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),
          "stream_timing": _env_on("SOUP_SOLUTION_STREAM_TIMING", "0")}
 
@@ -555,7 +564,8 @@ class WeightStreamer:
             groups = [_Group("layer", slots, [(0, size) for size in sizes])]
         else:
             groups = [_Group("attn", slots, layout[0][0])] + [
-                _Group(name.split("_")[0], 1, layout[0][g]) for g, name in enumerate(_TYPE_GROUPS) if g]
+                _Group(name.split("_")[0], MLP_SLOTS[name.split("_")[0]], layout[0][g])
+                for g, name in enumerate(_TYPE_GROUPS) if g]
         first = 0
         for group in groups:
             group.first, first = first, first + group.count
@@ -615,7 +625,7 @@ class WeightStreamer:
         if layout is not None:
             for j, modules in enumerate(layout[2]):
                 for g, module in modules.items():
-                    self._matrices[module] = (g, j, groups[g].first)
+                    self._matrices[module] = (g, j, groups[g].first + j % groups[g].count)
         self._matrix_groups = tuple(range(1, len(groups)))
         self.matrix_timing = _RING["timing"]
         self.timing = _RING["stream_timing"] if timing is None else bool(timing)
@@ -774,7 +784,7 @@ class WeightStreamer:
         i in their slots (loaded on the spot when needed) and the compute stream waiting for them;
         `keep`: again when the layer's backward starts."""
         for g in self._matrix_groups:
-            s = self._groups[g].first
+            s = self._groups[g].first + i % self._groups[g].count
             if self._owner[s] != i:
                 self._load(i, g)
                 self.late_loads += 1
@@ -798,13 +808,13 @@ class WeightStreamer:
 
     def release(self, module, step):
         """Type ring: the last read of `module` in this pass is queued (its dequantization; the
-        GEMMs read the dequantized copy): the copy of the same matrix of the next layer in the pass
-        (i + step) starts behind it."""
+        GEMMs read the dequantized copy): the copy of the same matrix of the layer that uses this slot
+        next in the pass (i + step, or i + 2*step with two slots of the type) starts behind it."""
         entry = self._matrices.get(module)
         if entry is None or not self.active:
             return
         g, i, s = entry
-        j = i + step
+        j = i + step * self._groups[g].count
         if 0 <= j < self.n and self._owner[s] == i:
             self._load(j, g)
 

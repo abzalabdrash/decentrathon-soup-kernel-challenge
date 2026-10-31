@@ -116,6 +116,10 @@ _RESIDUAL = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_RESIDUAL", "1").strip()
 # norm's half branch (rmsnorm.py, split sum) are marked and go to host memory with the rest
 ATTN = os.environ.get("SOUP_SOLUTION_OFFLOAD_ATTN", "0").strip().lower() not in ("0", "false", "no", "")
 MARKED_MIN_BYTES = 64 << 10  # a marked tensor below this stays on the GPU
+# SOUP_SOLUTION_OFFLOAD_TIMING=1: the compute stream's waits for the offload's copies are timed with CUDA
+# events (the backward's for each (gate|up) and layer input, the forward's for the D2H window), summed
+# in the summary line; off by default (two events per wait)
+TIMING = os.environ.get("SOUP_SOLUTION_OFFLOAD_TIMING", "0").strip().lower() not in ("0", "false", "no", "")
 
 
 def mark_offload(tensor, keep=False):
@@ -349,6 +353,32 @@ class Offloader:
         self.count = 0
         self.lock = threading.Lock()
         self.stats = collections.Counter()
+        self.spans = collections.deque()  # (kind, begin, end) of timed waits not read yet
+        self.wait_ms = collections.Counter()
+        self.wait_n = collections.Counter()
+
+    def _wait(self, stream, event, kind):
+        """stream waits for event; timed as `kind` with SOUP_SOLUTION_OFFLOAD_TIMING."""
+        if not TIMING:
+            stream.wait_event(event)
+            return
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        begin.record(stream)
+        stream.wait_event(event)
+        end.record(stream)
+        self.spans.append((kind, begin, end))
+        self._harvest()
+
+    def _harvest(self, block=False):
+        while self.spans:
+            kind, begin, end = self.spans[0]
+            if block:
+                end.synchronize()
+            elif not end.query():
+                break
+            self.wait_ms[kind] += begin.elapsed_time(end)
+            self.wait_n[kind] += 1
+            self.spans.popleft()
 
     def pack(self, tensor):
         if self.early:
@@ -448,7 +478,7 @@ class Offloader:
         inflight.append(saved)
         while len(inflight) > self.max_inflight:
             oldest = inflight.popleft()
-            oldest.home.wait_event(oldest.copied)  # on the GPU: the CPU goes on
+            self._wait(oldest.home, oldest.copied, "forward window")  # on the GPU: the CPU goes on
             oldest.gpu = None
             self.stats["waited"] += 1
         self.stats["offloaded"] += 1
@@ -464,20 +494,21 @@ class Offloader:
             tensor = saved.gpu
             if saved.unpacked:  # a kept residual, unpacked before in this backward
                 return tensor
+            kind = "layer input" if saved.keep else "gate|up"
             if tensor is None:
-                current.wait_event(saved.copied)
+                self._wait(current, saved.copied, kind + " fetched")
                 tensor = torch.empty(saved.host.shape, dtype=saved.host.dtype, device=saved.device)
                 tensor.copy_(saved.host, non_blocking=True)
                 self.reads.append(current.record_event())
                 self.stats["fetched"] += 1
             elif saved.ready is not None:
-                current.wait_event(saved.ready)
+                self._wait(current, saved.ready, kind + " prefetched")
                 if saved.home != current:
                     tensor.record_stream(current)
                 saved.gpu = saved.ready = None
                 self.stats["prefetch_hits"] += 1
             else:
-                saved.home.wait_event(saved.copied)  # the D2H may still be reading it
+                self._wait(saved.home, saved.copied, kind + " still on GPU")  # the D2H may read it
                 if saved.home != current:
                     for part in tensor if type(tensor) is tuple else (tensor,):
                         part.record_stream(current)
@@ -522,6 +553,8 @@ class Offloader:
                 oldest.copied.synchronize()
                 oldest.gpu = None
         self.stream.synchronize()
+        if self.spans:
+            self._harvest(block=True)
 
     def summary(self):
         s = self.stats
@@ -533,7 +566,10 @@ class Offloader:
                 f"{(self.host.released or (0, len(self.host.slabs)))[1]} slabs ({self.host.prepinned} prepinned"
                 f"{'; released after the last step' if self.host.released else ''}); kept on GPU over the cap {s['kept']}; "
                 f"of them layer inputs {s['residuals']}, other marked {s['marked']}; "
-                f"started early {s['early']}, of them int8 {s['int8']}")
+                f"started early {s['early']}, of them int8 {s['int8']}"
+                + ("; compute waits " + ", ".join(f"{k} {ms:.1f} ms in {self.wait_n[k]}"
+                                                  for k, ms in sorted(self.wait_ms.items()))
+                   if TIMING else ""))
 
 
 _ACTIVE = {"offloader": None}  # the Offloader of the running offload_saved_tensors, if any
@@ -638,7 +674,7 @@ def drain_inflight():
         offloader.early.clear()  # any handle not packed by now is stale
         while offloader.inflight:
             oldest = offloader.inflight.popleft()
-            oldest.home.wait_event(oldest.copied)
+            offloader._wait(oldest.home, oldest.copied, "forward drain")
             oldest.gpu = None
             offloader.stats["drained"] += 1
 

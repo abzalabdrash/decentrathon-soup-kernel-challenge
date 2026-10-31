@@ -29,7 +29,13 @@ from pathlib import Path
 import torch
 
 SNAP_STEP = int(os.environ.get("SOUP_SOLUTION_DIAG_SNAP_STEP", "6"))
-TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9").split(","))
+# "8,9" or a range "10-13" (the variants runner splits its environment on commas)
+TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9")
+                    .replace("-", ",").split(","))
+# SOUP_SOLUTION_DIAG_TRACE_CPU=0: the trace records the CUDA activity only (kernels, copies and the CUDA
+# runtime calls with their correlation ids); with the CPU activity the traced steps run CPU-bound under
+# the profiler and the GPU's waits for copies hide behind it
+TRACE_CPU = os.environ.get("SOUP_SOLUTION_DIAG_TRACE_CPU", "1") not in ("0", "false", "no", "")
 # SOUP_SOLUTION_DIAG_STACK=1: the trace with Python stacks, and diag_stacks.log: the call stacks of the
 # torch ops behind the small elementwise launches (copies, casts, binary ops), counted (task H2)
 STACK = os.environ.get("SOUP_SOLUTION_DIAG_STACK", "0") not in ("0", "false", "no", "")
@@ -115,8 +121,9 @@ class _Trace:
     def start(self):
         from torch.profiler import ProfilerActivity, profile
 
-        self.prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-                            record_shapes=STACK, with_stack=STACK, profile_memory=False)
+        activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA] if TRACE_CPU else [ProfilerActivity.CUDA]
+        self.prof = profile(activities=activities, record_shapes=STACK, with_stack=STACK and TRACE_CPU,
+                            profile_memory=False)
         self.prof.start()
         log(f"trace started at step {TRACE_STEPS[0]}")
 
