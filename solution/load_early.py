@@ -191,6 +191,38 @@ def _read(files, device):
             for chunk in entry.chunks:
                 chunk.ready.set()  # nobody waits for a chunk that will not come (failed: not used)
         _STATE["seconds"] = round(time.perf_counter() - started, 3)
+    _prepin(files)
+
+
+EMBEDDING_KEY = "model.embed_tokens.weight"
+
+
+def _prepin(files):
+    """SOUP_SOLUTION_LOAD_PREPIN: the embedding's pinned buffer (load_stream.py's first request: the
+    loop's first tensor, 445 MiB in half precision) made here, after the read and still during the
+    imports, instead of by load_stream.py's pinner thread when the load begins (the loop waited 0.2 s
+    for it on the T4, soup-l2-p0). The size is the one load_stream.py asks for: the embedding's
+    elements times 2 bytes (the run loads it in half precision); the pinner takes it only for a request
+    of exactly that size."""
+    if os.environ.get("SOUP_SOLUTION_LOAD_PREPIN", "0").strip().lower() in ("0", "false", "no", ""):
+        return
+    try:
+        from .weight_stream import PinnedBuffer
+
+        for entry in files:
+            info = entry.tensors.get(EMBEDDING_KEY)
+            if info is not None and len(info[1]) == 2:
+                nbytes = info[1][0] * info[1][1] * 2
+                _STATE.setdefault("prepinned", {})[nbytes] = PinnedBuffer(nbytes)
+                return
+    except Exception as exc:  # noqa: BLE001 - the pinner makes it then
+        _STATE["error"] = _STATE["error"] or f"prepin: {exc!r}"
+
+
+def take_prepinned(nbytes):
+    """The buffer made ahead for a request of exactly `nbytes`, once (None otherwise)."""
+    pool = _STATE.get("prepinned")
+    return pool.pop(nbytes, None) if pool else None
 
 
 def start(argv=None):
@@ -269,11 +301,14 @@ def release(log=print):
         _STATE["released"] = True
         _STATE.setdefault("covered", {}).clear()
         files = list(_STATE["files"].values())
+        leftovers = list(_STATE.pop("prepinned", {}).values())  # LOAD_PREPIN buffers nobody took
     thread = _STATE["thread"]
 
     def run():
         if thread is not None:
             thread.join()
+        for buffer in leftovers:
+            buffer.unpin()
         cudart = torch.cuda.cudart()
         for entry in files:
             if entry.buffer is None:

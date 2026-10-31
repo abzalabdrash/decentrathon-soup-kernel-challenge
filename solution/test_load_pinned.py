@@ -1183,3 +1183,24 @@ def test_spec_quantize_4bit_equals_bitsandbytes():
             (s_ref.shape, s_ref.dtype, s_ref.blocksize, s_ref.quant_type, s_ref.nested)
         assert torch.equal(s.state2.absmax, s_ref.state2.absmax) and torch.equal(s.state2.code, s_ref.state2.code)
         assert s.state2.blocksize == s_ref.state2.blocksize and s.code is not code
+
+
+@cuda
+def test_tiny_load_early_prepinned_embedding(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_PREPIN=1: the embedding's pinned buffer made by load_early.py's thread is the one
+    the load uses; the load is the plain one bit for bit."""
+    from solution import load_early
+
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_early)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREPIN", "1")
+    state = _early_read(monkeypatch, tiny_dir)
+    state["thread"].join()
+    made = state.get("prepinned", {}).get(VOCAB * HIDDEN * 2)
+    assert made is not None and made.buffer is not None
+    ours = _load_in_setup(patched, tiny_dir, _with_early)
+    assert not state.get("prepinned")  # taken by the load's pinner
+    _compare(ours["result"][0], without["result"][0])
+    assert load_early._STATE is state

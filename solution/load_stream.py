@@ -114,7 +114,9 @@ class _Pinner:
                     if self._stop:
                         break
                     try:
-                        self._made[key] = PinnedBuffer(nbytes)
+                        from .load_early import take_prepinned
+
+                        self._made[key] = take_prepinned(nbytes) or PinnedBuffer(nbytes)  # LOAD_PREPIN
                     except Exception:  # noqa: BLE001 - the consumer pins it itself
                         self._made[key] = None
                     self._ready[key].set()
