@@ -812,7 +812,7 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
                 f"in pinned host memory since the load: {loaded.host_bytes / 2**20:.0f} MiB; head in chunks "
                 f"of {loaded.rows} rows through {loaded.slots} GPU slots, first chunks copied from the "
                 f"{loaded.prefetch_at}")
-            _maybe_pack(loaded, log)
+            _maybe_pack(loaded, log, "prepare")
             return loaded
         before = torch.cuda.memory_allocated()
         streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, prefetch_at=prefetch_at,
@@ -828,7 +828,7 @@ def stream_before_prepare(model, rows=None, slots=None, log=print):
         f"{streamer.slots} GPU slots ({streamer.slots * streamer.rows * streamer.hidden * 2 / 2**20:.0f} "
         f"MiB), first chunks copied from the {streamer.prefetch_at}")
     atexit.register(_report, weakref.ref(streamer), log)
-    _maybe_pack(streamer, log)
+    _maybe_pack(streamer, log, "prepare")
     return streamer
 
 
@@ -836,10 +836,14 @@ def _pack_on():
     return os.environ.get("SOUP_SOLUTION_HEAD_PACK", "0").strip().lower() not in ("0", "false", "no", "")
 
 
-def _maybe_pack(streamer, log):
+def _maybe_pack(streamer, log, point):
     """SOUP_SOLUTION_HEAD_PACK=1: the 12-bit packed form for the PCIe transfer, built in a thread
-    while Soup builds the trainer (head_pack.py)."""
-    if _pack_on():
+    (head_pack.py) started at SOUP_SOLUTION_HEAD_PACK_AT: "setup" (default: the end of Soup's
+    setup, so the build's pinning and GPU work run under the trainer build, CPU work) or "prepare"
+    (peft's kbit preparation; on the T4 its pinning held up the rest of the setup's CUDA calls:
+    first step +0.3..0.45 s, soup-e1-packv2)."""
+    at = os.environ.get("SOUP_SOLUTION_HEAD_PACK_AT", "setup").strip().lower()
+    if _pack_on() and point == (at if at in ("prepare", "setup") else "setup"):
         streamer.start_pack(log)
 
 
@@ -868,6 +872,7 @@ def finish_setup(model, log=print):
             reason = str(exc)
         if reason is None:
             active = streamer
+            _maybe_pack(streamer, log, "setup")
             continue
         streamer.restore()
         log(f"[solution] head streaming undone ({reason}): the weight is back on the GPU")
