@@ -563,6 +563,10 @@ def _prefetch_hook(streamer_ref, module, args):
         return
     param = streamer.param_ref()
     if param is not None and streamer.owns(param):
+        from .offload import DRAIN_HEAD, drain_inflight
+
+        if DRAIN_HEAD:
+            drain_inflight()  # the last layer's (gate|up) leaves before the head's ring is made
         streamer.prefetch()
 
 

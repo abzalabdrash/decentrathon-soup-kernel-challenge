@@ -440,6 +440,12 @@ DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().low
     "0", "false", "no", "")
 
 
+# SOUP_SOLUTION_OFFLOAD_DRAIN_HEAD=1: at the final norm (head_stream.py's prefetch hook, before the
+# head's ring and logits buffer are allocated: the run's peak on the T4 after EARLY, soup-night-wdiag)
+# the copies in flight finish on the GPU and the last layer's (gate|up) (47 MiB at ~1,400 tokens)
+# leaves; its backward fetches it back on demand
+DRAIN_HEAD = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_HEAD", "0").strip().lower() not in (
+    "0", "false", "no", "")
 # SOUP_SOLUTION_OFFLOAD_EARLY=1: the fused MLP starts the copy of its (gate|up) to the host right after
 # the gate|up GEMM (offload_early) instead of when autograd packs it after the MLP's forward (after
 # SwiGLU and the down GEMM), and every MLP forward first lets the copies in flight finish
