@@ -406,3 +406,59 @@ def test_first_call_cold_and_warm(tmp_path):
     assert out.returncode == 0, out.stderr[-3000:]
     times = dict(re.findall(r"(\w+_s)=([0-9.]+)", out.stdout))
     assert float(times["warm_first_s"]) < float(times["cold_first_s"]) / 2
+
+
+def test_start_deferred_to_soup_setup(fresh, monkeypatch):
+    """SOUP_SOLUTION_WARMUP_START=setup: apply()'s final call queues the registrations without a
+    thread; Soup's model setup starts it; train waits for it as before."""
+    from soup_cli.trainer import sft as soup_sft
+
+    cls = soup_sft.SFTTrainerWrapper
+    order = []
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP_START", "setup")
+    monkeypatch.setattr(cls, "_soup_warmup", False, raising=False)
+    monkeypatch.setattr(cls, "_setup_transformers", lambda self: order.append("setup"))
+    monkeypatch.setattr(cls, "train", lambda self: order.append("train"))
+
+    @fresh.register(name="slow")
+    def slow():
+        time.sleep(0.3)
+        order.append("warmed")
+
+    fresh.patch_soup_warmup(start_in_setup=False)
+    assert fresh.start_background_warmup(log=False) is None
+    assert not fresh.warmup_report()["started"] and fresh._STATE.get("deferred")
+    wrapper = object.__new__(cls)
+    wrapper._setup_transformers()
+    assert fresh.warmup_report()["started"] and not fresh._STATE.get("deferred")
+    wrapper.train()
+    assert order == ["setup", "warmed", "train"]
+
+
+def test_audit_counts_training_launches_per_variant(fresh, monkeypatch, capsys):
+    """SOUP_SOLUTION_WARMUP_AUDIT=1: every variant the warm-up compiled is reported with the number of
+    launches that looked it up after `_audit_begin` (the warm-up's own compiles launch nothing)."""
+    from solution.bench_warmup import swiglu_call
+
+    monkeypatch.setattr(fresh, "_AUDIT", {"on": True, "compiled": [], "counters": []})
+    monkeypatch.setattr(fresh, "training_half_dtype", lambda: torch.float16)
+    for name, fn in fresh.BUILTIN:
+        if name in ("example_swiglu_fwd_kernel", "example_swiglu_bwd_kernel"):
+            fresh.register(fn, name=name)
+    fresh.watch_compiles(log=False)
+    _forget_compiled()
+    fresh.start_background_warmup(log=False)
+    assert fresh.wait_for_warmup(300)
+    assert {r["kernel"] for _, _, r in fresh._AUDIT["compiled"]} == {"example_swiglu_fwd_kernel",
+                                                                    "example_swiglu_bwd_kernel"}
+    fresh._audit_begin()
+    for tokens in (826, 77):
+        swiglu_call(tokens)
+    capsys.readouterr()
+    fresh._audit_report()
+    lines = [line for line in capsys.readouterr().out.splitlines() if "warmup audit:" in line]
+    assert len(lines) == 2 and all("compiled in the warm-up" in line for line in lines), lines
+    counts = {line.split("warmup audit: ")[1].split(" ")[0]: int(line.split("launched ")[1].split(" ")[0])
+              for line in lines}
+    assert counts["example_swiglu_fwd_kernel"] >= 2 and counts["example_swiglu_bwd_kernel"] >= 2, counts
+    _forget_compiled()  # the counting caches stay with this test

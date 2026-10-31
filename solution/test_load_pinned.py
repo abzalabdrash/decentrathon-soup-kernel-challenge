@@ -611,6 +611,153 @@ def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window, ca
         assert ours["peak"] <= without["peak"] + window * (-(-largest // 512) * 512)
 
 
+def _with_fill(model):
+    """_snapshot of the model and what load_stream.py's EMBED_ASYNC did in its load."""
+    from solution import load_stream
+
+    load = load_stream.LAST["load"]
+    fill = load.embedding_fill if load is not None else None
+    outcome = dict(fill[3]) if fill else None
+    return _snapshot(model), outcome
+
+
+@cuda
+@pytest.mark.parametrize("copies", ["1", "0"])
+def test_tiny_load_embedding_fill_bit_equal(patched, tiny_dir, monkeypatch, copies):
+    """SOUP_SOLUTION_EMBED_ASYNC=1 (load_stream.py): the embedding cast into its pinned buffer by a
+    thread gives the load without it bit for bit (and transformers' own load), with and without the
+    pinned copies of the other tensors, and no higher GPU peak."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", copies)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_fill)  # first: the process's first load peaks higher
+    assert without["result"][1] is None
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
+    ours = _load_in_setup(patched, tiny_dir, _with_fill)
+    snapshot, outcome = ours["result"]
+    assert outcome is not None and outcome["error"] is None and outcome["seconds"] is not None
+    _compare(snapshot, without["result"][0])
+    plain = _load(tiny_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    _compare(snapshot, theirs)
+    assert ours["peak"] <= without["peak"]
+
+
+def _codes(model):
+    """_snapshot and the identities of the 4-bit quant states' code tables."""
+    import bitsandbytes as bnb
+
+    ids = [id(m.weight.quant_state.code) for m in model.modules() if isinstance(m, bnb.nn.Linear4bit)]
+    return _snapshot(model), ids
+
+
+@cuda
+def test_tiny_load_code_table_bit_equal(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_CODE_TABLE=1 (load_stream.py): every quant state gets the same code values
+    as bitsandbytes' own get_4bit_type gives it, in a tensor of its own; the function is bitsandbytes'
+    own again after the load."""
+    import bitsandbytes.functional as functional
+
+    plain = functional.get_4bit_type
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_CODE_TABLE", "0")
+    without = _load_in_setup(patched, tiny_dir, _codes)  # first: the process's first load peaks higher
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_CODE_TABLE", "1")
+    ours = _load_in_setup(patched, tiny_dir, _codes)
+    assert functional.get_4bit_type is plain
+    snapshot, ids = ours["result"]
+    assert len(ids) == LAYERS * 7 and len(set(ids)) == len(ids)
+    _compare(snapshot, without["result"][0])
+    assert ours["peak"] <= without["peak"] + 512  # the kept table: 16 floats in one 512-byte block
+
+
+def _with_reads(model):
+    """_snapshot of the model and how many tensors load_pinned.py's thread read from the file."""
+    from solution import load_pinned
+
+    copier = load_pinned.LAST["copier"]
+    return _snapshot(model), (copier.read_from_file, copier.planned, copier.copied, copier.reason)
+
+
+def _pread_on(monkeypatch):
+    from transformers import modeling_utils
+
+    from solution import load_stream
+
+    monkeypatch.setattr(modeling_utils, "safe_open", modeling_utils.safe_open)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "1")
+    load_stream.patch_loader()  # the safe_open hook (installed when the switch is on)
+    assert getattr(modeling_utils.safe_open, "_soup_load_stream", False)
+
+
+@cuda
+def test_tiny_load_pread_bit_equal(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_PREAD=1: every planned tensor staged with preadv from its file; the load is
+    the one with the mmap copies and transformers' own, bit for bit."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_reads)
+    assert without["result"][1][0] == 0
+    _pread_on(monkeypatch)
+    ours = _load_in_setup(patched, tiny_dir, _with_reads)
+    snapshot, (read, planned, copied, reason) = ours["result"]
+    assert reason is None and planned == copied == read == LAYERS * 12 + 1
+    _compare(snapshot, without["result"][0])
+    plain = _load(tiny_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    _compare(snapshot, theirs)
+    assert ours["peak"] <= without["peak"]
+
+
+@cuda
+def test_tiny_load_pread_not_for_the_cpu_cast(patched, tiny_dir, monkeypatch):
+    """With the CPU cast the thread converts from the slice: nothing is read from the file."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "cpu")
+    _pread_on(monkeypatch)
+    ours = _load_in_setup(patched, tiny_dir, _with_reads)
+    assert ours["result"][1][0] == 0 and ours["result"][1][3] is None
+
+
+@cuda
+def test_tiny_load_embedding_fill_thread_fails(patched, tiny_dir, monkeypatch):
+    """A fill thread that fails: the join fills the buffer in the main thread, the same bytes."""
+    from solution import load_stream
+
+    original = load_stream._Load.embedding_job
+
+    class Flaky:
+        def __init__(self, inner):
+            self.inner, self.calls = inner, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __getitem__(self, key):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("fill failed on purpose")
+            return self.inner[key]
+
+    def embedding_job(self, job, spawn, args, kwargs):
+        made = original(self, job, spawn, args, kwargs)
+        if made is None:
+            return None
+        made_job, source, shape, dtype = made.args
+        return type(made)(made.func, made_job, Flaky(source), shape, dtype)
+
+    monkeypatch.setattr(load_stream._Load, "embedding_job", embedding_job)
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
+    ours = _load_in_setup(patched, tiny_dir, _with_fill)
+    snapshot, outcome = ours["result"]
+    assert outcome is not None and outcome["error"] is None  # cleared by the main thread's fill
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_fill)
+    _compare(snapshot, without["result"][0])
+
+
 @cuda
 @pytest.mark.parametrize("cast", ["cpu", "gpu"])
 def test_tiny_training_step_is_the_same(patched, tiny_train_dir, monkeypatch, cast):
@@ -772,6 +919,24 @@ def test_real_checkpoint_tensor_by_tensor(real_dir, cast):
     assert not differ, differ[:10]
     assert len(keys) == 338 and copier.planned == copier.copied == 337 and copier.fallbacks == 0
     assert copier.reason is None and copier.slot_bytes == 8960 * 1536 * 2
+
+
+@cuda
+def test_real_load_pread_bit_equal(patched, real_dir, monkeypatch):
+    """The real model with SOUP_SOLUTION_LOAD_PREAD=1 (and the embedding filled by a thread):
+    all 337 GPU tensors read from the file, the load bit for bit transformers' own."""
+    _pread_on(monkeypatch)
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
+    ours = _load_in_setup(patched, real_dir, _with_reads)
+    snapshot, (read, planned, copied, reason) = ours["result"]
+    assert reason is None and read == planned == copied == 337
+    plain = _load(real_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    torch.cuda.empty_cache()
+    _compare(snapshot, theirs)
+    print(f"real load with preadv {ours['seconds']:.2f} s (GPU peak {ours['peak'] / 2**20:.0f} MiB)")
 
 
 @cuda
