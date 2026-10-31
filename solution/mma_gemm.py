@@ -255,8 +255,10 @@ def tc_int8_swiglu_bwd_kernel(w_ptr, g_ptr, w_scale_ptr, g_scale_ptr, gate_up_pt
     tl.store(pmax_ptr + pid_i * tokens + rt, tl.max(peak, axis=0), mask=live)
 
 
-# (BLOCK_I, BLOCK_T, BLOCK_K, num_warps, GROUP_I) of tc_int8_swiglu_bwd_kernel
-SWIGLU_BWD_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_BWD_CFG", "64x128x64x4x8")))
+# (BLOCK_I, BLOCK_T, BLOCK_K, num_warps, GROUP_I) of tc_int8_swiglu_bwd_kernel; T4 (soup-b3-bench4, us against
+# _int_mm + int8_swiglu_bwd_kernel at 512 / 832 / 1440 / 2048 tokens): (64, 64, 128, 4) 861 / 718 / 1666 /
+# 2479 against 726 / 921 / 1618 / 2220; (64, 128, 64, 4) 940 / 1192 / 1901 / 2484; 128-wide tiles 2-4x slower
+SWIGLU_BWD_CFG = tuple(int(v) for v in re.split(r"[,x]", os.environ.get("SOUP_SOLUTION_MMA_BWD_CFG", "64x64x128x4x8")))
 
 
 def int8_swiglu_bwd(w_down_t, g_q, w_scale, g_scale, gate_up, cfg=SWIGLU_BWD_CFG):
