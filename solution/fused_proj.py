@@ -83,7 +83,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import int8_bwd, nf4, rope, weight_stream
+from . import int8_bwd, int8_fwd, nf4, rope, weight_stream
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -1395,7 +1395,8 @@ def set_mlp_recompute(on):
 
 
 class _MLPPlan:
-    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early", "ring")
+    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early", "ring", "int8",
+                 "drain")
 
 
 def _mlp_plan(mlp, x):
@@ -1434,6 +1435,8 @@ def _mlp_plan(mlp, x):
     plan.recompute = _MLP_MEMORY["recompute"]
     plan.early = False  # set by the patched forward (offload.EARLY)
     plan.ring = ring  # weight_stream.py's type ring holding the three matrices, or None
+    plan.int8 = None  # int8_fwd.py's operands of the three weights when the forward runs int8
+    plan.drain = False  # the int8 forward lets the copies in flight finish (offload.drain_inflight)
     return plan
 
 
@@ -1511,6 +1514,94 @@ def _recompute_backward(plan, x16, grad_hidden, padded):
     return _accumulate(result, gate_up[inter:].t(), w)
 
 
+def _int8_forward_ops(plan, x, mlp):
+    """SOUP_SOLUTION_INT8_FWD: (operands of gate, up, down for nf4.py's layout, the layer's top-k
+    input channels or None) when int8_fwd.py takes this training forward, else None. Every such
+    forward is counted by int8_fwd.usable, which fixes the switch point; the layers of
+    int8_fwd.FP16_LAYERS are counted and stay fp16; before the switch the forward records the
+    layer's max |x| per input channel (int8_fwd.observe). The caller has checked that autograd is
+    on; (gate|up) must be what the backward keeps."""
+    if not int8_fwd._STATE["on"] or plan.recompute:
+        return None
+    gate, up, down = plan.gate, plan.up, plan.down
+    if not int8_fwd.shapes_ok(gate.in_features, gate.out_features, down.out_features):
+        return None
+    ops = tuple(_nf4_args(base, plan.half) for base in (gate, up, down))
+    if None in ops:
+        return None
+    hidden = x.shape[-1]
+    n = x.numel() // hidden
+    take = int8_fwd.usable(-(-n // 8) * 8)
+    if int8_fwd.FP16_LAYERS:
+        index = mlp.__dict__.get("_soup_layer_idx")  # None: no rmsnorm decoder patch, as listed
+        if index is None or index in int8_fwd.FP16_LAYERS:
+            return None
+    if not take:
+        if int8_fwd.observing():
+            int8_fwd.observe(mlp, x.reshape(n, hidden))
+        return None
+    return (*(found[1] for found in ops), int8_fwd.channels(mlp, x.reshape(n, hidden)))
+
+
+def _int8_forward(plan, x2, n, padded):
+    """((gate|up) (2I, padded), output (padded, D)) in half on int8 tensor cores (int8_fwd.py); the
+    int8 weights go through the shared buffer, the type ring's slots are held around each decode."""
+    half, d, inter = plan.half, x2.shape[1], plan.gate.out_features
+    gate_ops, up_ops, down_ops, topk = plan.int8
+    buffer = _buffer(x2.device, half, plan.down.out_features * plan.down.in_features)
+    ring = plan.ring
+    hooks_gu = hooks_d = (None, None)
+    if ring is not None:
+        hooks_gu = (lambda: (ring.acquire(plan.gate, 1), ring.acquire(plan.up, 1)),
+                    lambda: (ring.release(plan.gate, 1), ring.release(plan.up, 1)))
+        hooks_d = (lambda: ring.acquire(plan.down, 1), lambda: ring.release(plan.down, 1))
+    gu_only = int8_fwd.MODE == "gu"  # down stays the fp16 GEMM on the epilogue's SwiGLU output
+    pos, idx = topk if topk is not None else (None, None)
+    x_q, s_x, x_k = int8_fwd.quantize_tokens(x2, n, padded, pos)
+    drain = None
+    if plan.drain:
+        # the previous layer's (gate|up) copy to the host gets the decode and the first int8 product
+        # of this layer as well before the compute stream waits for it (fp16: the wait comes first)
+        from .offload import drain_inflight as drain
+    wire_for = None
+    if plan.early and gu_only:
+        from . import offload_int8
+        from .offload import reserve_int8
+
+        def wire_for(gate_up):
+            # offload_int8.py: the epilogue writes the int8 form of (gate|up) that crosses PCIe
+            # straight from the int32 product (no half values, no quantization pass): the int16 view
+            # of the gate half and the scales, as offload_int8.swiglu_quant makes them
+            if not reserve_int8(gate_up):
+                return None
+            group = offload_int8.GROUP
+            if (inter // int8_fwd.CHUNKS) % group:
+                raise RuntimeError("int8 forward: offload_int8.GROUP does not divide the chunks")
+            scales = torch.empty((2 * inter // group, padded), dtype=torch.float32,
+                                 device=gate_up.device)
+            return gate_up[:inter].view(torch.int16), scales
+
+    made = int8_fwd.gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, *hooks_gu,
+                                    hidden=gu_only, idx=idx, x_k=x_k, before_alloc=drain,
+                                    wire_for=wire_for)
+    gate_up, pmax = made[0], made[1]
+    del x_q, s_x, x_k
+    if plan.early:
+        from .offload import offload_early
+
+        # its copy to the host runs under the down GEMM: the int8 form, or the half tensor (decided:
+        # reserve_int8 said no, or MODE "all", whose epilogue writes no int8 form)
+        if len(made) == 3:
+            offload_early(gate_up, wire=made[2])
+        else:
+            offload_early(gate_up, decided=True)
+    if gu_only:
+        w = _ring_weights(plan, (plan.down,), x2.device, 1)
+        return gate_up, torch.mm(pmax.t(), _t(w))
+    out = int8_fwd.down_forward(gate_up, pmax, down_ops, buffer, half, d, *hooks_d)
+    return gate_up, out
+
+
 def _padded_half(t, n, padded, half):
     """t (n, D) in `half` with zero rows appended up to `padded` rows (t itself, cast if needed, when
     n == padded). Every GEMM of the MLP then runs on a multiple of 8 tokens: with n % 8 != 0 cuBLAS
@@ -1530,20 +1621,32 @@ class _MLP(torch.autograd.Function):
         d, inter = x.shape[-1], plan.gate.out_features
         n = x.numel() // d
         padded = -(-n // 8) * 8
-        # zero padding rows: their gate|up, SwiGLU and output rows are zeros, cut off below
-        x16 = _padded_half(x.reshape(n, d), n, padded, half)
-        gate_up = torch.empty((2 * inter, padded), dtype=half, device=x.device)
-        _gate_up_matmul(plan, None, x16.t(), gate_up)
-        if plan.early:
-            from .offload import offload_early
+        if plan.int8 is not None:  # SOUP_SOLUTION_INT8_FWD: gate|up on int8 tensor cores
+            gate_up, out = _int8_forward(plan, x.reshape(n, d), n, padded)
+            x16 = None
+        else:
+            # zero padding rows: their gate|up, SwiGLU and output rows are zeros, cut off below
+            x16 = _padded_half(x.reshape(n, d), n, padded, half)
+            gate_up = torch.empty((2 * inter, padded), dtype=half, device=x.device)
+            _gate_up_matmul(plan, None, x16.t(), gate_up)
+            int8 = False
+            if plan.early:
+                from .offload import offload_early
 
-            offload_early(gate_up)  # its copy to the host runs under SwiGLU and the down GEMM
-        hidden = torch.empty((inter, padded), dtype=half, device=x.device)
-        count = inter * padded
-        example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
-            gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
-        w = _ring_weights(plan, (plan.down,), x.device, 1)
-        out = torch.mm(hidden.t(), _t(w))  # (padded, D)
+                # its copy to the host runs under SwiGLU and the down GEMM; int8 (offload_int8.py):
+                # the SwiGLU below writes the int8 form over it, and that copy starts right after
+                int8 = offload_early(gate_up) == "int8"
+            hidden = torch.empty((inter, padded), dtype=half, device=x.device)
+            count = inter * padded
+            if int8:
+                from .offload_int8 import swiglu_quant
+
+                offload_early(gate_up, wire=swiglu_quant(gate_up, hidden))
+            else:
+                example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
+                    gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
+            w = _ring_weights(plan, (plan.down,), x.device, 1)
+            out = torch.mm(hidden.t(), _t(w))  # (padded, D)
         # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
         # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
         ctx.source = (norm_source(x) if plan.recompute and n == padded and _ATTN["rebuild_x16"]
@@ -1555,12 +1658,16 @@ class _MLP(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
+        from .offload_int8 import raw
+
         plan, n, padded = ctx.plan, ctx.n, ctx.padded
+        int8 = not plan.recompute and int8_bwd.usable(plan, padded)
+        with raw(int8):  # an int8-offloaded (gate|up) comes back as is for int8_bwd to read
+            saved = ctx.saved_tensors[0] if ctx.source is None else rebuild(ctx.source, ctx.plan.half)
         half = plan.half
         inter = plan.gate.out_features
         grad16 = _padded_half(grad.reshape(n, grad.shape[-1]), n, padded, half)
-        if not plan.recompute and int8_bwd.usable(plan, padded):
+        if int8:
             # SOUP_SOLUTION_INT8_BWD=1: both input-gradient GEMMs on int8 tensor cores, the int8
             # weights in the shared buffer, (gate|up) overwritten with its gradient
             buffer = _buffer(grad.device, half, plan.down.out_features * plan.down.in_features)
@@ -1648,6 +1755,7 @@ def patch_qwen2_mlp_fused():
     from transformers.models.qwen2 import modeling_qwen2 as mq
 
     cls = mq.Qwen2MLP
+    int8_fwd.compile_early()  # SOUP_SOLUTION_INT8_COMPILE=apply: the int8 kernels from now on
     if getattr(cls, "_soup_fused_proj", False):
         return
     previous = cls.forward
@@ -1661,8 +1769,12 @@ def patch_qwen2_mlp_fused():
 
         if torch.is_grad_enabled():
             plan.early = EARLY and not plan.recompute and x.requires_grad
+            plan.int8 = _int8_forward_ops(plan, x, self)
             if plan.early or (DRAIN_LAST and self is _CTX["last_mlp"]):
-                drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
+                if plan.int8 is not None:  # later, right before its (gate|up) is allocated
+                    plan.drain = True
+                else:
+                    drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 
     forward._soup_weight_ring = True  # weight_stream.py: the matrices' reads go through acquire()

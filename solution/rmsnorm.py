@@ -630,7 +630,10 @@ def patch_qwen2_decoder_layer():
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        mlp = self.mlp
+        if "_soup_layer_idx" not in mlp.__dict__:  # int8_fwd.py's list of fp16 layers reads it
+            mlp.__dict__["_soup_layer_idx"] = getattr(self.self_attn, "layer_idx", None)
+        hidden_states = mlp(hidden_states)
         if _soup_carry and _addable(residual, hidden_states):
             return hidden_states, residual
         hidden_states = residual + hidden_states
