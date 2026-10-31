@@ -310,7 +310,8 @@ def build_steps(args, variants):
 
     nb = build_notebook(args.repo, args.commit, args.mode, None, args.repeats,
                         [tuple(e.split("=", 1)) for e in args.env], variants, args.bench,
-                        args.skip_pytest, args.abba, args.warm_run, (args.jury_data, args.jury_seed))
+                        args.skip_pytest, args.abba, args.warm_run, (args.jury_data, args.jury_seed),
+                        args.variant_data)
     steps, env = [], {}
     for cell in nb["cells"]:
         text = "".join(cell["source"])
@@ -462,6 +463,9 @@ def main():
     parser.add_argument("--jury-data", default="--train-rows 10000:10256 --eval-rows 50000:50256",
                         help="--mode jury: arguments of tools/jury_data.py (which rows train and eval)")
     parser.add_argument("--jury-seed", type=int, default=7, help="--mode jury: run_task.py --seed")
+    parser.add_argument("--variant-data", default="", metavar="ARGS",
+                        help="--mode variants: train every run on tools/jury_data.py ARGS (pass with '=') "
+                             "with --jury-seed, as kaggle_run.py")
     parser.add_argument("--variant", action="append", default=[], metavar="LABEL:K=V,K=V",
                         help="--mode variants: one solution-only run per variant and round (repeatable)")
     parser.add_argument("--repeats", type=int, default=1,
