@@ -120,13 +120,16 @@ def test_type_ring_matches_layer_ring(layer_shaped_qwen_dir, night, monkeypatch,
     assert compare(resident, step())  # restored
 
 
-def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night):
+@pytest.mark.parametrize("timing", [True, False])
+def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night, monkeypatch, timing):
     """Every layer's MLP matrices (weight, absmax, second-level absmax) point into their type's one
     slot for good, its attention projections into slot j % 2; per step each MLP matrix is copied
-    once per pass and waited for once per pass, nothing is loaded late, and the copies and the
-    waits are timed."""
+    once per pass and waited for once per pass, nothing is loaded late; the copies and the waits of
+    the attention group are timed, those of the MLP matrices with SOUP_SOLUTION_WEIGHT_RING_TIMING."""
+    from solution import weight_stream
     from solution.weight_stream import find_decoder_layers, stream_model_weights
 
+    monkeypatch.setitem(weight_stream._RING, "timing", timing)
     model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
     layers = find_decoder_layers(model)
     streamer = stream_model_weights(model, slots=2, ring="type")
@@ -164,10 +167,16 @@ def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night):
         assert streamer.late_loads == 0
         assert stats["group_loads"] == {"attn": 2 + 2 * 2 * (n - 2), "gate": 1 + 2 * 2 * (n - 1),
                                         "up": 1 + 2 * 2 * (n - 1), "down": 1 + 2 * 2 * (n - 1)}
-        assert stats["copies_timed"] == stats["loads"] - 5
-        # per step and pass: one wait per layer for its attention, one per MLP matrix
-        assert stats["waits_forward"] == stats["waits_backward"] == 2 * 4 * n
-        assert stats["matrix_waits_forward"] == stats["matrix_waits_backward"] == 2 * 3 * n
+        assert stats["matrix_timing"] is timing
+        if timing:
+            assert stats["copies_timed"] == stats["loads"] - 5
+            # per step and pass: one wait per layer for its attention, one per MLP matrix
+            assert stats["waits_forward"] == stats["waits_backward"] == 2 * 4 * n
+            assert stats["matrix_waits_forward"] == stats["matrix_waits_backward"] == 2 * 3 * n
+        else:  # the attention group's copies and waits only
+            assert stats["copies_timed"] == stats["group_loads"]["attn"] - 2
+            assert stats["waits_forward"] == stats["waits_backward"] == 2 * n
+            assert stats["matrix_waits_forward"] == stats["matrix_waits_backward"] == 0
         assert stats["copy_gbps"] > 0.5
         print(f"\ntype ring {streamer.ring_bytes / 2**20:.1f} MiB; copies at {stats['copy_gbps']:.1f} "
               f"GB/s; waits {stats['wait_forward_ms']:.2f} ms forward (matrices "
@@ -321,13 +330,15 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
 
 
 @pytest.mark.parametrize("sleep", [0, SLEEP_CYCLES])
-def test_type_ring_unmanaged_mlp(sleep):
+def test_type_ring_unmanaged_mlp(sleep, monkeypatch):
     """A layer whose MLP reads its matrices without acquire() (test_weight_stream's Block has no
     fused_proj MLP): the type ring loads the three matrices at the layer's forward and again when
     its backward starts; bit for bit, also with the GPU far behind the CPU."""
+    from solution import weight_stream
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
 
+    monkeypatch.setitem(weight_stream._RING, "timing", True)  # counts the matrix waits
     patch_bnb_matmul4bit()
     blocks = make_stack(sleep=sleep)
     x, weight = _inputs()

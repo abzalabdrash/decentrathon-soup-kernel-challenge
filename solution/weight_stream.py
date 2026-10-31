@@ -50,7 +50,9 @@ backward) starts on the copy stream behind that point. Each of gate, up and down
 per pass (forward: gate, up, down; backward: down, gate, up; the recompute mode holds up across its
 two reads), so one slot per type costs no copy more than the layer ring. An MLP that runs without
 acquire() (its forward is not fused_proj's, or the fused path declines the call) gets its three
-matrices loaded before it runs, and again when its layer's backward starts (the hook above).
+matrices loaded before it runs, and again when its layer's backward starts (the hook above). The
+matrices' copies and waits are timed only with SOUP_SOLUTION_WEIGHT_RING_TIMING=1 (six more pairs of
+CUDA events per layer and pass cost CPU time); the attention group's are, as in the layer ring.
 """
 
 import atexit
@@ -83,6 +85,12 @@ def ring_from_env():
     `layer`."""
     value = os.environ.get("SOUP_SOLUTION_WEIGHT_RING", "layer").strip().lower()
     return value if value in RINGS else "layer"
+
+
+# SOUP_SOLUTION_WEIGHT_RING_TIMING=1: the type ring also times its MLP matrices' copies and waits
+# (CUDA events, as for the attention group; 6 matrix spans per layer and pass cost CPU time, so off)
+_RING = {"timing": os.environ.get("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0").strip().lower()
+         not in ("0", "false", "no", "")}
 
 
 class StreamSkip(Exception):
@@ -483,8 +491,14 @@ class WeightStreamer:
         if layout is not None:
             for j, modules in enumerate(layout[2]):
                 for g, module in modules.items():
-                    self._matrices[module] = (g, j)
+                    self._matrices[module] = (g, j, groups[g].first)
         self._matrix_groups = tuple(range(1, len(groups)))
+        self.matrix_timing = _RING["timing"]
+        # every copy's destination (its slot's first bytes) and source (the part of the layer's
+        # pinned buffer), made once: views cost CPU time on every copy
+        self._copies = [[(self._slots[group.first + j % group.count][:nbytes],
+                          self._hosts[j][start:start + nbytes])
+                         for j, (start, nbytes) in enumerate(group.ranges)] for group in groups]
         self._mlps = [getattr(layer, "mlp", None) for layer in layers]
         self._held = set()
         for g, group in enumerate(groups):
@@ -500,7 +514,7 @@ class WeightStreamer:
             self._handles.append(layer.register_forward_pre_hook(functools.partial(self._before, i)))
             self._handles.append(layer.register_forward_hook(functools.partial(self._after, i)))
             _STREAMERS[layer] = self
-        for module, (g, j) in self._matrices.items():
+        for module, (g, j, _) in self._matrices.items():
             _MATRICES[module] = (self, g, j)
         self.active = True
         torch.cuda.empty_cache()
@@ -557,7 +571,8 @@ class WeightStreamer:
             "wait_backward_ms": self.wait_ms[-1] + self.wait_ms[-2],
             "waits_forward": self.waits[1] + self.waits[2],
             "waits_backward": self.waits[-1] + self.waits[-2],
-            # of them, the waits for MLP matrices (type ring)
+            # of them, the waits for MLP matrices (type ring, timed with SOUP_SOLUTION_WEIGHT_RING_TIMING)
+            "matrix_timing": self.matrix_timing,
             "matrix_wait_forward_ms": self.wait_ms[2], "matrix_wait_backward_ms": self.wait_ms[-2],
             "matrix_waits_forward": self.waits[2], "matrix_waits_backward": self.waits[-2],
         }
@@ -568,23 +583,31 @@ class WeightStreamer:
         slot's previous layer)."""
         group = self._groups[g]
         s = group.first + j % group.count
-        start, nbytes = group.ranges[j]
+        dst, src = self._copies[g][j]
+        timed = g == 0 or self.matrix_timing
         self._free[s].record(torch.cuda.current_stream(self.device))
-        begin, end = self._event(), self._event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
-            begin.record(self._copy_stream)
-            self._slots[s][:nbytes].copy_(self._host_layer(j)[start:start + nbytes], non_blocking=True)
-            end.record(self._copy_stream)
+            if timed:
+                begin, end = self._event(), self._event()
+                begin.record(self._copy_stream)
+            dst.copy_(src, non_blocking=True)
+            if timed:
+                end.record(self._copy_stream)
             self._ready[s].record(self._copy_stream)
-        self._spans.append(("copy", begin, end, nbytes))
+        if timed:
+            self._spans.append(("copy", begin, end, dst.numel()))
         self._owner[s] = j
         self.loads += 1
         self.group_loads[g] += 1
 
     def _wait(self, s, kind):
-        """The compute stream waits for the last copy into slot s (timed as `kind`)."""
+        """The compute stream waits for the last copy into slot s (timed as `kind`; an MLP matrix's
+        wait, kind +-2, only with SOUP_SOLUTION_WEIGHT_RING_TIMING=1)."""
         compute = torch.cuda.current_stream(self.device)
+        if kind in (2, -2) and not self.matrix_timing:
+            compute.wait_event(self._ready[s])
+            return
         begin, end = self._event(), self._event()
         begin.record(compute)
         compute.wait_event(self._ready[s])
@@ -639,8 +662,7 @@ class WeightStreamer:
         entry = self._matrices.get(module)
         if entry is None or not self.active:
             return
-        g, i = entry
-        s = self._groups[g].first
+        g, i, s = entry
         if self._owner[s] != i:
             self._load(i, g)
             self.late_loads += 1
@@ -653,9 +675,9 @@ class WeightStreamer:
         entry = self._matrices.get(module)
         if entry is None or not self.active:
             return
-        g, i = entry
+        g, i, s = entry
         j = i + step
-        if 0 <= j < self.n and self._owner[self._groups[g].first] == i:
+        if 0 <= j < self.n and self._owner[s] == i:
             self._load(j, g)
 
     def _before(self, index, module, args):
@@ -696,7 +718,7 @@ class WeightStreamer:
         for module in self._matrices:
             _MATRICES.pop(module, None)
         self._matrices, self._held = {}, set()
-        self._slots = []
+        self._slots, self._copies = [], []
         if self._unpin is not None:
             self._unpin()
         for host in self._adopted_hosts:
@@ -817,12 +839,17 @@ def _report(ref, log):
             if s["copies_timed"] and s["copy_gbps"] else "no timed copies")
     if streamer.ring == "type":
         loads = ", ".join(f"{name} {n}" for name, n in s["group_loads"].items())
+        if s["matrix_timing"]:
+            fwd = f" (MLP matrices {s['matrix_wait_forward_ms']:.1f} ms in {s['matrix_waits_forward']})"
+            bwd = f" (MLP matrices {s['matrix_wait_backward_ms']:.1f} ms in {s['matrix_waits_backward']})"
+            timed = ""
+        else:
+            fwd = bwd = ""
+            timed = " (attention group only: SOUP_SOLUTION_WEIGHT_RING_TIMING=1 times the MLP matrices)"
         log(f"[solution] weight streaming (type ring): {s['loads']} copies ({loads}), "
             f"{s['late_loads']} of them not prefetched; {copy}; compute stream waited for copies "
-            f"{s['wait_forward_ms']:.1f} ms in {s['waits_forward']} forward waits (MLP matrices "
-            f"{s['matrix_wait_forward_ms']:.1f} ms in {s['matrix_waits_forward']}), "
-            f"{s['wait_backward_ms']:.1f} ms in {s['waits_backward']} backward ones (MLP matrices "
-            f"{s['matrix_wait_backward_ms']:.1f} ms in {s['matrix_waits_backward']})")
+            f"{s['wait_forward_ms']:.1f} ms in {s['waits_forward']} forward waits{fwd}, "
+            f"{s['wait_backward_ms']:.1f} ms in {s['waits_backward']} backward ones{bwd}{timed}")
         return
     log(f"[solution] weight streaming: {s['loads']} layer copies, {s['late_loads']} of them not "
         f"prefetched; {copy}; compute stream waited for copies {s['wait_forward_ms']:.1f} ms in "
