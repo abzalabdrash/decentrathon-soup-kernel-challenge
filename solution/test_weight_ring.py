@@ -287,7 +287,7 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
     from solution import fused_proj, weight_stream
     from solution.weight_stream import find_decoder_layers, ring_from_env, stream_model_weights
 
-    for value, expected in [(None, "layer"), ("layer", "layer"), ("type", "type"), (" Type ", "type"),
+    for value, expected in [(None, "type"), ("layer", "layer"), ("type", "type"), (" Type ", "type"),
                             ("matrix", "layer"), ("", "layer")]:
         if value is None:
             monkeypatch.delenv("SOUP_SOLUTION_WEIGHT_RING", raising=False)
@@ -298,7 +298,7 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
     layers = find_decoder_layers(model)
     x = torch.randn(1, 200, HIDDEN, device="cuda")
 
-    monkeypatch.delenv("SOUP_SOLUTION_WEIGHT_RING", raising=False)
+    monkeypatch.setenv("SOUP_SOLUTION_WEIGHT_RING", "layer")  # the type ring is the default
     streamer = stream_model_weights(model, slots=2)
     try:
         assert streamer.ring == "layer" and streamer.ring_note is None

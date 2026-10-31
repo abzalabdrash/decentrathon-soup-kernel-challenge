@@ -80,10 +80,11 @@ _TYPE_GROUPS = ("attn", "gate_proj", "up_proj", "down_proj")
 
 
 def ring_from_env():
-    """SOUP_SOLUTION_WEIGHT_RING: `layer` (the default: the ring of whole layers) or `type` (the
-    attention projections in a ring of layers, one slot per MLP matrix type); anything else is
+    """SOUP_SOLUTION_WEIGHT_RING: `type` (the default since the night integration: the attention
+    projections in a ring of layers, one slot per MLP matrix type; T4, soup-night-wring: nvidia-smi
+    421 -> 401 MiB, time unchanged) or `layer` (the ring of whole layers); anything else is
     `layer`."""
-    value = os.environ.get("SOUP_SOLUTION_WEIGHT_RING", "layer").strip().lower()
+    value = os.environ.get("SOUP_SOLUTION_WEIGHT_RING", "type").strip().lower()
     return value if value in RINGS else "layer"
 
 
