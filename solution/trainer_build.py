@@ -415,7 +415,8 @@ def _replacements():
                 out.append((TokenizersBackend, "_encode_plus", _held_encode_plus))
         except Exception:  # noqa: BLE001
             pass
-    if _flag("SOUP_SOLUTION_FAST_ROWS", "1"):  # on by default since the night integration
+    if _flag("SOUP_SOLUTION_FAST_ROWS", "0"):  # OFF: it changes the fingerprint of Soup's map (dill walks the replaced
+        # functions' globals); answers 9 and 53 require datasets' fingerprint untouched
         try:
             from soup_cli.data import loss_mask
 
