@@ -29,7 +29,9 @@ from pathlib import Path
 import torch
 
 SNAP_STEP = int(os.environ.get("SOUP_SOLUTION_DIAG_SNAP_STEP", "6"))
-TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9").split(","))
+# "8,9" or a range "10-13" (the variants runner splits its environment on commas)
+TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9")
+                    .replace("-", ",").split(","))
 # SOUP_SOLUTION_DIAG_TRACE_CPU=0: the trace records the CUDA activity only (kernels, copies and the CUDA
 # runtime calls with their correlation ids); with the CPU activity the traced steps run CPU-bound under
 # the profiler and the GPU's waits for copies hide behind it
