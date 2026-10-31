@@ -59,3 +59,38 @@ soup-s1-v3 (094a774, first step / wall / model setup / trainer build / warm-up e
 - filelock's audit hook: 39k audit events in apply at ~0.27 us = 11 ms.
 - Meta-device init of the model skeleton: 0.02 s locally. `get_device` in the loop: 6 ms locally.
 - TRITON_DISABLE_LINE_INFO: ~10 % of ptxas only.
+
+## State at the hand-off (31 Oct ~11:05 Astana, branch head below)
+
+All S1 switches are still OFF by default; nothing is flipped yet. Decide from the two sessions in
+flight, then flip with the scratchpad recipe (the `_flag(..., "1")` defaults in load_stream.py,
+startup.py, warmup.py `install_light_triton_key`) and run `--mode full`.
+
+In flight on Kaggle (re-join with `wsl -d Ubuntu -- bash tools/kaggle_wsl.sh <acct> --attach --slug <slug> --mode variants`):
+- peagverr (2) `soup-s1-v4`, commit 836ec72: base / embed (EMBED_ASYNC) / tk (TRITON_KEY=light) /
+  ep (ENTRY_POINTS) / etk (the three) / etkp (etk + EARLY_PROBES=p2p + LOAD_CODE_TABLE) / etks (etk +
+  WARMUP_SKIP=step_ops). Shows each switch alone and the combination.
+- namedesign (1) `soup-s1-v5`, commit dfe0d65: base / etk / pread (LOAD_PREAD) / etkr (etk + pread) /
+  etkrc (+ code table + p2p) / etkrs (+ skip step_ops). Shows LOAD_PREAD alone and on top of etk.
+- Parse: per-run phases from `apply begin` in runs_var/*/solution_1/train.log (apply end,
+  setup_transformers begin/end, train begin, first step begin, "warmup done in", "waited", "tensor
+  loop", "pinned load copies ... read from the file with preadv").
+
+Expected / to decide: EMBED_ASYNC is a measured win (v3: first step -0.16 s, model setup -0.25 s);
+TRITON_KEY=light should cut apply (1.4 CPU-s less next to the imports); ENTRY_POINTS ~-0.1 s;
+LOAD_PREAD should shorten the tensor loop (local: 1.6-3.0 s -> 0.77 s) and remove the loop's
+staging wait. With EMBED_ASYNC the warm-up became the critical path (v3: warm-up end 9.28 s vs
+train 9.24 s): after the load and apply cuts, WARMUP_START=setup (Soup CLI 0.68 -> 0.38 s in v3)
+may become a win again: measure etkr vs etkr + SOUP_SOLUTION_WARMUP_START=setup. Keep HELD_ENCODE,
+LAUNCHERS_EARLY off (losses in v3); LOAD_CODE_TABLE neutral in v3.
+
+Also in this commit: warmup.py step_ops warm-up creates its tensors with explicit fp32 (B1's
+traces: under an fp16 default dtype it failed with "Attempting to unscale FP16 gradients" and the
+optimizer kernels stayed cold for step 0). A test under `torch.set_default_dtype(torch.float16)` is
+still to add.
+
+Left: decide defaults from v4/v5; one ABBA session of new defaults vs old; `--mode full` with the
+10 checks; merge main (B1's step boundary defaults change the first-step duration); README lines for
+the switches that stay on (embedding cast in a thread, preadv staging, light triton key, shared
+entry points); tests for these switches pass locally (targeted), the full `pytest solution` goes to
+Kaggle/Modal (Modal runner: tools/modal_run.py on main, profile tripleacodex for this task).
