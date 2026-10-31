@@ -238,3 +238,15 @@ Why so little: the bench's -0.27 ms of host time per layer applies only where th
 bottleneck, the forward of the ~12 short steps (prof_1: the GPU 0.6-3 ms behind there); the
 backward of short steps and every pass of the longer steps are GPU-bound. The CPU side of the step
 has about this much left on the public rows; further CPU cuts are worth < 0.1 s each.
+
+### 6. GPU glue from R3: k/v expanded once in the recompute (`SOUP_SOLUTION_EXPAND_KV_ONCE`, off)
+
+`_AttnRecompute._rebuild` expands k and v to the 12 q heads once and hands the same tensors to its
+attention forward and to the attention backward (which expanded the compact ones a second time); the
+three backward sites expand only compact k/v and take the kv head count from q's heads / groups.
+Bitwise in all three node layouts and with the recompute's own check (`test_attention_expand_kv_once_is_bitwise`;
+also 2,047, 2,048 and 1,999 + 49 tokens on the laptop). T4 (peagverr, soup-c1-kv1, d1c252d, ABBA 2
+rounds + warm run, no pytest): c1 wall 41.53 / 42.53 s, steps 3+ 23.75 / 24.20; kv1 41.63 / 41.82,
+steps 3+ 24.00 / 24.04; **alloc peak 225.5 -> 224.1 MiB but reserved 250 -> 270, nvidia-smi 371 ->
+391** (the expanded k/v live from the rebuild to the attention backward and fragment the pool). No
+time gained, a 20 MiB page lost: **stays off**.
