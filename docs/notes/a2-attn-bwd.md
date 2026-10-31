@@ -144,8 +144,22 @@ NORM_HALF in soup-e1-tail1 (variant `half`, positions 3 and 4 of the ABBA): step
 against base 23.44 / 26.87 and once (no step change at all) 24.63 / 27.18: the session's drift
 (+3.4 s from the first to the last base run, concave) is 10-30x the expected effect, so the wall says
 nothing; peak 371 MiB, reserved 250, allocated 225.5 as base; rms_norm_rows_fwd_half launched in both
-half runs (check 3). Per-norm cost on the T4 instead: `solution.bench_norm_half` (account 3,
-soup-e1-nhb1, d79ad23, in flight; fetch with `bash tools/kaggle_win.sh 3 --attach --slug soup-e1-nhb1
---mode bench`): norm + cast against the half-writing norm at 400-2,048 tokens, bitwise checked, and
-the step total for 1 plain + 55 fused-add norms. Laptop: 1.1 / 1.2 / 2.6 / 2.4 / 3.0 / 4.0 ms per step
-at 400 / 600 / 830 / 1,100 / 1,440 / 2,048 tokens (~0.15 s per run of GPU time).
+half runs (check 3).
+
+Per-norm cost on the T4 (`solution.bench_norm_half 300`, peagverr soup-e1-nhb1, d79ad23; medians of
+300 CUDA-event timings; every call bitwise: y, rstd and the half copy equal to rms_norm_rows_fwd plus
+the cast):
+
+| tokens | plain: norm + cast / half-writing norm, us | fused add: norm + cast / half-writing, us | per step (1 plain + 55 add), ms |
+|---:|---|---|---:|
+| 400 | 77.8 / 65.5 | 90.1 / 84.0 | 0.35 |
+| 600 | 92.1 / 79.7 | 122.7 / 106.7 | 0.90 |
+| 830 | 115.2 / 93.8 | 149.9 / 129.2 | 1.16 |
+| 1,100 | 142.3 / 113.9 | 188.4 / 158.7 | 1.66 |
+| 1,440 | 217.1 / 137.1 | 235.9 / 196.3 | 2.26 |
+| 2,048 | 231.3 / 178.4 | 317.7 / 265.6 | 2.92 |
+
+Over the 64 steps of the task's data (simulated batches, mean 826 tokens): 76 ms of GPU time per run,
+the upper bound of the wall gain (the power-limited T4 returns only part of removed GPU work), plus
+56 cast launches less per step on the CPU. **Below the merge rule (0.1 s): NORM_HALF stays off**; the
+code (rmsnorm.py's second kernel and `half_of`, two lines in fused_proj.py) is in the branch only.
