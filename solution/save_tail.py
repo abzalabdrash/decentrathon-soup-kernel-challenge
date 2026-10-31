@@ -29,7 +29,7 @@ import time
 import weakref
 
 _STATE = {"patched": False, "entry": None, "written": 0, "replayed": 0, "write_s": 0.0,
-          "replay_s": 0.0, "reported": False}
+          "replay_s": 0.0, "reported": False, "adapter": [0, 0.0]}
 CONFIG_SUFFIX = "tokenizer_config.json"
 
 
@@ -177,9 +177,34 @@ def unpatch_tokenizer_save():
 
 def _report():
     if _STATE["written"] or _STATE["replayed"]:
+        calls, seconds = _STATE["adapter"]
         print(f"[solution] save tail: tokenizer written {_STATE['written']}x in "
               f"{_STATE['write_s'] * 1e3:.0f} ms, replayed {_STATE['replayed']}x in "
-              f"{_STATE['replay_s'] * 1e3:.0f} ms", flush=True)
+              f"{_STATE['replay_s'] * 1e3:.0f} ms; adapter saved {calls}x in {seconds * 1e3:.0f} ms",
+              flush=True)
+
+
+def _time_adapter_saves():
+    """PeftModel.save_pretrained timed for the exit line (the same call, nothing else changes)."""
+    try:
+        from peft import PeftModel
+    except ImportError:
+        return
+    if getattr(PeftModel, "_soup_save_timed", False):
+        return
+    original = PeftModel.save_pretrained
+
+    def save_pretrained(self, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _STATE["adapter"][0] += 1
+            _STATE["adapter"][1] += time.perf_counter() - started
+
+    save_pretrained.__doc__ = original.__doc__
+    PeftModel.save_pretrained = save_pretrained
+    PeftModel._soup_save_timed = True
 
 
 def patch_soup_save_tail():
@@ -188,3 +213,4 @@ def patch_soup_save_tail():
 
     if _soup_train_process():
         patch_tokenizer_save()
+        _time_adapter_saves()
