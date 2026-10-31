@@ -339,6 +339,23 @@ def test_int8_head_on_real_hidden_states(monkeypatch):
         assert value < limit, (name, value, gaps)
 
 
+def test_build_allocates_nothing_on_its_stream(streamed):
+    """The build's buffers come from the training stream's pool: no segment of another stream's pool is
+    left behind (it would stay reserved and add a page to the nvidia-smi peak)."""
+    from solution.head_int8 import HeadInt8
+
+    _, streamer, _ = streamed
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    default = torch.cuda.current_stream().cuda_stream
+    other = HeadInt8(streamer, smooth=torch.rand(D) + 0.5).start()
+    other.join()
+    assert other.ready, other.error
+    streams = {seg["stream"] for seg in torch.cuda.memory_snapshot()}
+    other.stop()
+    assert streams <= {default, 0}, streams
+
+
 def test_eval_logits_stay_fp16(streamed):
     """eval and generation (the lm_head override) read the fp16 host copy, not the int8 one."""
     weight, streamer, _ = streamed

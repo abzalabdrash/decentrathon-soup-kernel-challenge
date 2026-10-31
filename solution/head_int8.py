@@ -314,6 +314,20 @@ def quant_rows(x, out, col, scales=None):
     return torch.div(amax, 127.0, out=scales)
 
 
+def _quant_rows_into(x, q, col, xf, tmp, amax, inv, scales):
+    """quant_rows into given buffers only (out= and in-place ops: nothing allocated on the stream it runs
+    on). A zero row: 127 / 1e-30 times zeros, so int8 zeros and scale 0."""
+    torch.mul(x, col, out=xf)
+    torch.abs(xf, out=tmp)
+    torch.amax(tmp, dim=1, out=amax)
+    torch.clamp(amax, min=1e-30, out=inv)
+    torch.reciprocal(inv, out=inv)
+    inv.mul_(127.0)
+    xf.mul_(inv[:, None]).add_(0.5).floor_().clamp_(-127, 127)
+    q.copy_(xf)
+    torch.div(amax, 127.0, out=scales)
+
+
 class HeadSkipInt8(Exception):
     """This streamer's weight does not get an int8 copy."""
 
@@ -425,11 +439,14 @@ class HeadInt8:
         self.times["pin"] = time.perf_counter() - began
         began = time.perf_counter()
         dev, d, r = self.device, self.hidden, QUANT_ROWS
-        # allocated on the training's stream (its pool takes them back) and freed only after the build
-        # stream is synchronized, so no record_stream is needed
+        # every buffer of the build allocated here, on the training's stream (its pool takes them back),
+        # and freed only after the build stream is synchronized (no record_stream): an allocation on the
+        # build stream itself would get a pool of its own that training never reuses (+22 MiB reserved
+        # and nvidia-smi peak with quant_rows' temporaries there, Modal h1-abba6)
         w = torch.empty(r, d, dtype=self._source.dtype, device=dev)
         q = torch.empty(r, d, dtype=torch.int8, device=dev)
-        sc = torch.empty(r, dtype=torch.float32, device=dev)
+        xf = torch.empty(2, r, d, dtype=torch.float32, device=dev)
+        vec = torch.empty(3, r, dtype=torch.float32, device=dev)
         stream = torch.cuda.Stream(device=dev)
         stream.wait_stream(torch.cuda.current_stream(dev))
         with torch.cuda.stream(stream), torch.no_grad():
@@ -442,9 +459,10 @@ class HeadInt8:
                 for r0 in range(0, vc, r):
                     n = min(r, vc - r0)
                     w[:n].copy_(self._source[c0 + r0:c0 + r0 + n], non_blocking=True)
-                    quant_rows(w[:n], q, self.col, sc[:n])
+                    _quant_rows_into(w[:n], q[:n], self.col, xf[0, :n], xf[1, :n], vec[0, :n], vec[1, :n],
+                                     vec[2, :n])
                     q_host[r0:r0 + n].copy_(q[:n], non_blocking=True)
-                    s_host[r0:r0 + n].copy_(sc[:n], non_blocking=True)
+                    s_host[r0:r0 + n].copy_(vec[2, :n], non_blocking=True)
             stream.synchronize()
         if self._stop.is_set():
             unpin()

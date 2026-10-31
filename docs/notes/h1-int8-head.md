@@ -167,6 +167,14 @@ copy itself. The first five heads (steps 0-4) are the fp16 head while the copy i
 fifth kernel adds compile time): the first step's loss is the fp16 head's. Organizers' answer 12 (wave 2): an int8
 copy of lm_head quantized at load and kept in pinned memory next to the fp16 copy is allowed.
 
+Cost (Modal T4 on PCIe x8, h1-prof2, 7b67a32, per head): head_i8_rescore_kernel 0.77 ms at 830 / 504 labelled
+and 1.31 ms at 1440 / 861; the chunk kernel 5.6 ms (with the runner-up). soup-h1-abba4 (7b67a32, Kaggle, ABBA 2
+rounds): fp16 47.20 s / steps 3+ 25.84, int8 47.30 / 25.71: no wall gain; per step (fp16 / int8, s) 0: 0.505 /
+0.601, 1: 0.312 / 0.426, 2: 0.412 / 0.497, 3: 0.475 / 0.607, 4: 0.546 / 0.581, then int8 ahead: steps 0-5 +0.46 s,
+steps 6+ -0.38 s (-6.6 ms per step; soup-h1-abba3: +0.28 / -0.91 s, -15.6 ms per step). Steps 0-4 run the fp16
+head in both: their loss is the build thread's (compilation of five kernels, 2.2 s, takes the GIL from the main
+thread's launches). 73796c4 drops int8_rows_kernel (torch ops on the build's own stream are cheap enough).
+
 Tests: test_head_int8.py 21 (the int8 pass against fp64 int8 math with rescoring and correction off; rescoring
 against the fp16 head: equal correctness, loss error halved at least; real hidden states: 3 steps, loss < 0.2 %,
 entropy < 0.5 %, accuracy < 0.3 %, rewind < 0.3 %, skipped without the cached checkpoint).
