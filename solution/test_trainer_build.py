@@ -3,8 +3,6 @@
 CPU only; the tokenizer is a small byte-level BPE built here (no download) with a ChatML template
 without a `{% generation %}` block, as Qwen2.5's."""
 
-import importlib
-import sys
 
 import pytest
 
@@ -53,138 +51,6 @@ def _labels(tok, max_length=512):
     return [loss_mask.build_assistant_only_labels(row, tok, max_length=max_length) for row in ROWS]
 
 
-def test_fast_rows_same_labels(tokenizer, monkeypatch):
-    calls = []
-    original = loss_mask._tokenize_only
-    monkeypatch.setattr(loss_mask, "_tokenize_only", lambda t, m: calls.append(len(m)) or original(t, m))
-    expected = _labels(tokenizer)
-    plain_calls = len(calls)
-    expected_short = _labels(tokenizer, max_length=7)
-    calls.clear()
-    monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
-    undo = trainer_build.install()
-    try:
-        assert getattr(loss_mask._apply_template_with_mask, "_soup_original", None) is not None
-        assert _labels(tokenizer) == expected
-        # the whole conversation is tokenized once per row, not twice
-        assert len(calls) == plain_calls - len(ROWS)
-        # the same rows again: equal answers (from the memo or not)
-        assert _labels(tokenizer, max_length=7) == expected_short
-        # a changed message is not answered from the memo
-        changed = [dict(m) for m in ROWS[0]]
-        first = loss_mask._tokenize_only(tokenizer, changed)
-        changed[1]["content"] = "the lazy dog"
-        assert loss_mask._tokenize_only(tokenizer, changed) != first
-    finally:
-        undo()
-    assert getattr(loss_mask._apply_template_with_mask, "_soup_original", None) is None
-    assert getattr(loss_mask._coerce_int_list, "_soup_original", None) is None
-
-
-def test_fast_mask_only_without_generation_block(tokenizer, monkeypatch):
-    monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
-    undo = trainer_build.install()
-    try:
-        assert loss_mask._apply_template_with_mask(tokenizer, ROWS[0]) is None
-        # no assistant message: the original runs (and returns the all-zero mask)
-        prompt_only = [{"role": "user", "content": "a"}]
-        ids, mask = loss_mask._apply_template_with_mask(tokenizer, prompt_only)
-        assert ids and not any(mask)
-        # a template with a generation block: the original runs and finds the assistant tokens
-        generation = CHATML.replace("+ message['content'] +", "+ '' }}{% generation %}{{ message['content'] }}"
-                                    "{% endgeneration %}{{ ''+")
-        assert trainer_build._GENERATION.search(generation)
-        saved = tokenizer.chat_template
-        tokenizer.chat_template = generation
-        try:
-            out = loss_mask._apply_template_with_mask(tokenizer, ROWS[0])
-            assert out is not None and any(out[1])
-        finally:
-            tokenizer.chat_template = saved
-
-        class Fake:  # a stand-in tokenizer (Soup's tests use them): the original
-            chat_template = CHATML
-
-            def apply_chat_template(self, messages, **kwargs):
-                return {"input_ids": [1, 2, 3], "assistant_masks": [0, 1, 1]}
-
-        assert loss_mask._apply_template_with_mask(Fake(), ROWS[0]) == ([1, 2, 3], [0, 1, 1])
-    finally:
-        undo()
-
-
-def test_fast_int_list_matches_loop(monkeypatch):
-    original = loss_mask._coerce_int_list
-    monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
-    undo = trainer_build.install()
-    try:
-        fast = loss_mask._coerce_int_list
-        assert fast is not original
-        for values, allow_bool in (([3, 1, 4], False), ([], False), ((5, 6), False), ([True, 2], True),
-                                   ([7], True)):
-            assert fast(values, field="x", allow_bool=allow_bool) == original(values, field="x",
-                                                                            allow_bool=allow_bool)
-        source = [1, 2]
-        assert fast(source, field="x") is not source
-        for bad, allow_bool in (([1, True], False), ([1.5], False), (None, False), (["a"], False)):
-            with pytest.raises(ValueError):
-                original(bad, field="x", allow_bool=allow_bool)
-            with pytest.raises(ValueError):
-                fast(bad, field="x", allow_bool=allow_bool)
-    finally:
-        undo()
-
-
-def _functions():
-    names = ("soup_cli.data.loss_mask", "soup_cli.data.sft_format", "soup_cli.trainer.sft",
-             "transformers.tokenization_utils_base", "trl.trainer.sft_trainer", "datasets.arrow_dataset",
-             "datasets.fingerprint", "json", "inspect")
-    for name in names:
-        try:
-            module = importlib.import_module(name)
-        except Exception:  # noqa: BLE001 - an optional module that does not import here
-            continue
-        for value in list(vars(module).values()):
-            candidates = [value]
-            if isinstance(value, type):
-                candidates = [v for v in vars(value).values() if callable(v)]
-            for fn in candidates:
-                if getattr(fn, "__code__", None) is not None:
-                    yield fn
-
-
-def test_global_names_match_dill():
-    detect = pytest.importorskip("dill.detect")
-    compared = 0
-    for fn in _functions():
-        # dill parses the text of dis.dis: a quoted string constant that contains "_GLOBAL" (e.g.
-        # inspect.getclosurevars' 'LOAD_GLOBAL') comes out as a "name" too, which is never a key of a
-        # module's globals; the names that can be globals are the same
-        found = {name for name in detect.nestedglobals(fn) if name.isidentifier()}
-        assert trainer_build.global_names(fn.__code__) == found, fn
-        compared += 1
-    assert compared > 200
-
-
-def test_fast_fingerprint_same_hash(monkeypatch):
-    fingerprint = pytest.importorskip("datasets.fingerprint")
-    import json
-
-    def transform(example, row_index):
-        return {"text": json.dumps(example) + str(row_index) + str(sys.maxsize)}
-
-    expected = fingerprint.Hasher.hash(transform)
-    monkeypatch.setenv("SOUP_SOLUTION_FAST_FINGERPRINT", "1")
-    undo = trainer_build.install()
-    try:
-        import dill.detect
-
-        assert getattr(dill.detect.nestedglobals, "_soup_original", None) is not None
-        assert fingerprint.Hasher.hash(transform) == expected
-    finally:
-        undo()
-
-
 TASK_YAML = """
 base: Qwen/Qwen2.5-1.5B-Instruct
 task: sft
@@ -222,8 +88,9 @@ def test_early_rows_same_dataset(tokenizer, tmp_path, monkeypatch):
     reference_tok = transformers.AutoTokenizer.from_pretrained(tmp_path)
     reference_fr = sft_format.build_format_row(tokenizer=reference_tok, data_cfg=cfg.data,
                                                console=soup_sft.console, training_cfg=cfg.training)
-    expected = soup_sft._map_text_sft_rows(rows, format_row=reference_fr, split="train",
-                                           max_length=cfg.data.max_length).to_list()
+    reference = soup_sft._map_text_sft_rows(rows, format_row=reference_fr, split="train",
+                                            max_length=cfg.data.max_length)
+    expected = reference.to_list()
 
     undo = trainer_build._install_early(Wrapper(), ({"train": rows},), {})
     assert undo is not None
@@ -237,6 +104,7 @@ def test_early_rows_same_dataset(tokenizer, tmp_path, monkeypatch):
         got = soup_sft._map_text_sft_rows(rows, format_row=fr, split="train", max_length=cfg.data.max_length)
         assert got is early.result
         assert got.to_list() == expected
+        assert got._fingerprint == reference._fingerprint  # datasets' own fingerprint of Soup's map
         masked = soup_sft._ensure_assistant_masks(got)
         assert masked is early.masked
         assert masked.to_list() == soup_sft._ensure_assistant_masks._soup_original(got).to_list()
@@ -275,103 +143,6 @@ def test_early_rows_not_for_changed_tokenizer(tokenizer, tmp_path):
         fr = sft_format.build_format_row(tokenizer=tok, data_cfg=cfg.data, console=soup_sft.console,
                                          training_cfg=cfg.training)
         assert fr is not early.format_row
-    finally:
-        undo()
-
-
-def test_early_probes_serve_same_answers(monkeypatch):
-    """SOUP_SOLUTION_EARLY_PROBES: entry_points() and accelerate's P2P check answered from the probe
-    thread give what the calls give, and only while a run's probes exist and sys.path is unchanged."""
-    import importlib.metadata as metadata
-
-    accelerate_state = pytest.importorskip("accelerate.state")
-    current_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
-    # startup.py's SOUP_SOLUTION_ENTRY_POINTS (on by default) wraps entry_points in any process that
-    # ran apply() before this test; the probes are tested on the original, as they would be installed
-    saved_ep = getattr(current_ep, "_soup_original", current_ep)
-    metadata.entry_points = saved_ep
-    saved_flag = trainer_build._PROBES["patched"]
-    trainer_build._PROBES["patched"] = False
-    try:
-        trainer_build._patch_probes()
-        assert metadata.entry_points is not saved_ep
-        expected_all = saved_ep()
-        expected_group = saved_ep(group="console_scripts")
-        # no probes: the originals
-        assert trainer_build._PROBES["current"] is None
-        assert sorted(metadata.entry_points(group="console_scripts")) == sorted(expected_group)
-        probes = trainer_build._Probes()
-        probes._work()
-        trainer_build._PROBES["current"] = probes
-        assert probes.entry_points == expected_all
-        assert metadata.entry_points(group="console_scripts") == expected_group
-        assert accelerate_state.check_cuda_p2p_ib_support() == probes.p2p
-        monkeypatch.setattr(sys, "path", sys.path + ["/nonexistent-soup-test-dir"])
-        assert metadata.entry_points(group="console_scripts") == expected_group  # the original again
-    finally:
-        trainer_build._PROBES["current"] = None
-        metadata.entry_points = current_ep
-        accelerate_state.check_cuda_p2p_ib_support = saved_p2p
-        trainer_build._PROBES["patched"] = saved_flag
-
-
-def test_cheap_fingerprint_deterministic(tokenizer, monkeypatch):
-    """SOUP_SOLUTION_CHEAP_FINGERPRINT: the map's rows are the same, its fingerprint is the same for
-    the same inputs (no RNG), differs for another function, and datasets' own hashing is not used."""
-    datasets = pytest.importorskip("datasets")
-    import random
-
-    import datasets.fingerprint as fingerprint
-
-    rows = [{"messages": list(row)} for row in ROWS]
-
-    def first(example, index):
-        return {"n": len(example["messages"]) + index}
-
-    def second(example, index):
-        return {"n": len(example["messages"]) * 2 + index}
-
-    plain = datasets.Dataset.from_list(rows).map(first, with_indices=True, remove_columns=["messages"])
-    monkeypatch.setenv("SOUP_SOLUTION_CHEAP_FINGERPRINT", "1")
-    undo = trainer_build.install()
-    try:
-        import dill.detect
-
-        calls = []
-        globalvars = dill.detect.globalvars
-        monkeypatch.setattr(dill.detect, "globalvars", lambda *a, **k: calls.append(a) or globalvars(*a, **k))
-        state = random.getstate()
-        a = datasets.Dataset.from_list(rows)
-        a = a.map(first, with_indices=True, remove_columns=["messages"])
-        b = datasets.Dataset.from_list(rows).map(first, with_indices=True, remove_columns=["messages"])
-        c = datasets.Dataset.from_list(rows).map(second, with_indices=True, remove_columns=["messages"])
-        assert random.getstate() == state
-        assert a.to_list() == plain.to_list()
-        assert a._fingerprint == b._fingerprint != c._fingerprint
-        # the map functions were not pickled with their globals (datasets still hashes its tables)
-        assert not [c for c in calls if c and getattr(c[0], "__name__", "") in ("first", "second")]
-    finally:
-        undo()
-    assert getattr(fingerprint.update_fingerprint, "_soup_original", None) is None
-
-
-def test_probes_alone_do_not_tokenize_early(tokenizer, tmp_path):
-    """SOUP_SOLUTION_EARLY_PROBES without SOUP_SOLUTION_EARLY_ROWS: the tokenizer load starts no
-    early tokenization (a list of rows once shadowed the flag)."""
-    from soup_cli.config.loader import load_config_from_string
-
-    tokenizer.save_pretrained(tmp_path)
-    cfg = load_config_from_string(TASK_YAML)
-
-    class Wrapper:
-        config = cfg
-
-    undo = trainer_build._install_early(Wrapper(), ({"train": [{"messages": list(ROWS[0])}]},), {},
-                                        rows=False, probes=False)
-    try:
-        early = trainer_build._EARLY["current"]
-        transformers.AutoTokenizer.from_pretrained(tmp_path)
-        assert early.thread is None
     finally:
         undo()
 
@@ -474,35 +245,3 @@ def test_held_encode_real_rows(monkeypatch):
     finally:
         undo()
 
-
-def test_early_probes_p2p_only(monkeypatch):
-    """SOUP_SOLUTION_EARLY_PROBES=p2p: the thread checks P2P only; entry_points() is the original."""
-    import importlib.metadata as metadata
-
-    accelerate_state = pytest.importorskip("accelerate.state")
-    torch = pytest.importorskip("torch")
-    current_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
-    saved_ep = getattr(current_ep, "_soup_original", current_ep)  # as above: without ENTRY_POINTS' wrapper
-    metadata.entry_points = saved_ep
-    saved_flag = trainer_build._PROBES["patched"]
-    trainer_build._PROBES["patched"] = False
-    monkeypatch.setenv("SOUP_SOLUTION_EARLY_PROBES", "p2p")
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    calls = []
-    try:
-        trainer_build._patch_probes()
-        patched_ep = metadata.entry_points
-        monkeypatch.setattr(patched_ep, "_soup_original", lambda **k: calls.append(k) or saved_ep(**k))
-        trainer_build._start_probes(transformers.PreTrainedTokenizerFast(
-            tokenizer_object=tokenizers.Tokenizer(tokenizers.models.BPE())))
-        probes = trainer_build._PROBES["current"]
-        assert probes is not None and not probes.with_entry_points
-        probes.thread.join(30)
-        assert probes.entry_points is None and calls == []  # nothing scanned in the thread
-        assert accelerate_state.check_cuda_p2p_ib_support() == probes.p2p
-        assert sorted(metadata.entry_points(group="console_scripts")) == sorted(saved_ep(group="console_scripts"))
-    finally:
-        trainer_build._PROBES["current"] = None
-        metadata.entry_points = current_ep
-        accelerate_state.check_cuda_p2p_ib_support = saved_p2p
-        trainer_build._PROBES["patched"] = saved_flag

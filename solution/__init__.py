@@ -43,10 +43,9 @@ offload|recompute|none, SOUP_SOLUTION_WEIGHT_STREAM=0 (SOUP_SOLUTION_WEIGHT_SLOT
 SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARLEN_ATTN=0,
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
-SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
+SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
 SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache),
 SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; on by default, answer 29),
-SOUP_SOLUTION_CHEAP_FINGERPRINT=0 and SOUP_SOLUTION_DATASET_HASH=0 (off: datasets' fingerprint must stay the base's);
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
@@ -128,12 +127,9 @@ def apply():
         from .exit_release import patch_soup_exit_release
 
         patch_soup_exit_release()  # off by default: pinned host memory released at the last step's end
-    from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
-                          patch_soup_startup_profile)
+    from .startup import patch_soup_first_step_mark, patch_soup_startup_profile
 
     patch_soup_first_step_mark()
-    if os.environ.get("SOUP_SOLUTION_DATASET_HASH", "0") not in ("0", "false", "no", ""):  # OFF: answer 13 (fingerprint)
-        patch_soup_dataset_hashing()  # datasets hashes the tokenizer in 0.09 s instead of 1 s
     if os.environ.get("SOUP_SOLUTION_PROFILE_STARTUP", "0") not in ("0", "false", "no", ""):
         patch_soup_startup_profile()  # off by default: cProfile of the trainer build, see startup.py
     if os.environ.get("SOUP_SOLUTION_DIAG", "0") not in ("0", "false", "no", ""):

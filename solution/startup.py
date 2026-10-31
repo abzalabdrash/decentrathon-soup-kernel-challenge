@@ -70,30 +70,6 @@ is installed during a run (the rules forbid it; the harness compares `pip freeze
 are the ones the calls would compute; the organizers allow the same for packages_distributions().
 This replacement stays for the whole run.
 
-The objects of all these imports live as long as the process. `freeze_imported_objects` (the end
-of apply()) moves them out of the garbage collector's reach with `gc.freeze()`, CPython's API for
-exactly that: the full collections that come later (accelerate's `free_memory` runs `gc.collect()`
-when training starts, 0.28 s on Kaggle, and Python's own) no longer walk the ~0.5 M objects
-(0.13 s per collection after apply() on the RTX 3050 Ti box, 0.00 s once frozen). Frozen objects
-are still freed by reference counting; only a reference cycle among them would never be collected,
-and at the end of apply() no model, tensor or dataset exists yet to be caught in one.
-
-The trainer build (`patch_soup_dataset_hashing`)
-------------------------------------------------
-Soup tokenizes the training rows with `Dataset.from_list(rows).map(checked_format_row, ...)`
-(soup_cli/trainer/sft.py:143-178), and datasets fingerprints every map: it pickles the transform
-with its closure to hash it (datasets/fingerprint.py:253, `Hasher.hash`). The closure holds the
-tokenizer, and the tokenizer keeps Python copies of its vocabulary and merges (`_vocab`, 151,643
-entries; `_merges`, 151,387 pairs), which datasets' pickler, dill in pure Python, walks one object
-at a time: 0.9-1.0 s on the RTX 3050 Ti box, the largest part of the 3.1 s between the model
-setup and `train` on Kaggle (cProfile there: 8.0 of 9.4 s in that pickling). While Soup's `setup`
-runs, the reducer datasets uses for the tokenizer's type gets the tokenizer with those two
-containers already pickled by the C pickler (the same content, so the fingerprint still changes
-with any change of the vocabulary or merges, and is the same in every run): 0.09 s. datasets'
-pickler only ever feeds the hasher (datasets/fingerprint.py:214, builder.py:475); nothing it
-writes is unpickled. The fingerprint differs from the one datasets would compute; it names cache
-files only for datasets backed by files, and this one is built in memory.
-
 Diagnostics (off by default)
 ----------------------------
 SOUP_SOLUTION_PROFILE_STARTUP=1: cProfile of Soup's model setup (SFTTrainerWrapper.
@@ -228,18 +204,16 @@ def _import(name, seconds):
     seconds[name] = round(time.perf_counter() - start, 3)
 
 
-def freeze_imported_objects():
-    """gc.freeze() (see the module docstring). Returns the number of objects frozen."""
-    import gc
-
-    gc.freeze()
-    return gc.get_freeze_count()
-
-
 def prepare_imports(log=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
     Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
     seconds = {}
+    try:
+        from .load_early import start as start_early_read
+
+        start_early_read()  # SOUP_SOLUTION_LOAD_EARLY: the checkpoint read into pinned memory during the imports
+    except Exception:  # noqa: BLE001 - the loader stages as before
+        pass
     if _flag("SOUP_SOLUTION_ENTRY_POINTS", "1"):
         try:
             share_entry_points()  # before bitsandbytes and fsspec read them
@@ -276,101 +250,6 @@ def prepare_imports(log=True):
 
     profile_mark("imports done")  # SOUP_SOLUTION_STARTUP_PROFILE=1 only
     return seconds
-
-
-# ---------------------------------------------------------------- the trainer build
-
-_BULKY = ("_vocab", "_merges")  # TokenizersBackend's Python copies of the vocabulary and merges
-
-
-def _fast_tokenizer_reducer(original):
-    """datasets' reducer `original` given a copy of the tokenizer whose bulky containers are
-    already C-pickled bytes (see the module docstring)."""
-    import pickle
-
-    def save(pickler, obj):
-        try:
-            state = obj.__dict__
-            bulky = [key for key in _BULKY if isinstance(state.get(key), (dict, list))]
-            if not bulky:
-                return original(pickler, obj)
-            view = object.__new__(type(obj))  # no __init__: a plain carrier of the state
-            view.__dict__.update(state)
-            for key in bulky:
-                view.__dict__[key] = pickle.dumps(state[key], protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:  # noqa: BLE001 - datasets' own path then
-            return original(pickler, obj)
-        return original(pickler, view)
-
-    save._soup_fast_tokenizer = True
-    return save
-
-
-_REDUCERS = []  # (dispatch, type, previous entry or None): installed by install_fast_tokenizer_reducer
-
-
-def install_fast_tokenizer_reducer(tokenizer):
-    """datasets' pickler hashes `type(tokenizer)` with `_fast_tokenizer_reducer` until
-    `uninstall_fast_tokenizer_reducers()`. Also called by trainer_build.py when it tokenizes the rows
-    early (during the model load). A no-op when already installed or not a transformers tokenizer."""
-    try:
-        from datasets.utils import _dill
-        from transformers import PreTrainedTokenizerBase
-
-        if not isinstance(tokenizer, PreTrainedTokenizerBase):
-            return
-        original = getattr(_dill, "_save_transformersPreTrainedTokenizerBase", None)
-        dispatch = _dill.Pickler.dispatch
-        kind = type(tokenizer)
-        previous = dispatch.get(kind)
-        if original is None or getattr(previous, "_soup_fast_tokenizer", False):
-            return
-        if previous is not None and previous is not original:
-            return  # someone else's reducer for this type: leave it
-        dispatch[kind] = _fast_tokenizer_reducer(original)
-        _REDUCERS.append((dispatch, kind, previous))
-    except Exception:  # noqa: BLE001 - datasets' own hashing then
-        pass
-
-
-def uninstall_fast_tokenizer_reducers():
-    while _REDUCERS:
-        dispatch, kind, previous = _REDUCERS.pop()
-        if getattr(dispatch.get(kind), "_soup_fast_tokenizer", False):
-            if previous is None:
-                dispatch.pop(kind, None)
-            else:
-                dispatch[kind] = previous
-
-
-def patch_soup_dataset_hashing():
-    """SFTTrainerWrapper hooks: once `_setup_transformers` has loaded the tokenizer, datasets'
-    pickler hashes its type with `_fast_tokenizer_reducer`; when `setup` returns (or raises), the
-    previous entry is back."""
-    from soup_cli.trainer import sft as soup_sft
-
-    cls = soup_sft.SFTTrainerWrapper
-    if getattr(cls, "_soup_dataset_hashing", False):
-        return
-    original_setup = cls.setup
-    original_setup_transformers = cls._setup_transformers
-    install = install_fast_tokenizer_reducer
-    uninstall = uninstall_fast_tokenizer_reducers
-
-    def _setup_transformers(self, *args, **kwargs):
-        result = original_setup_transformers(self, *args, **kwargs)
-        install(getattr(self, "tokenizer", None))
-        return result
-
-    def setup(self, *args, **kwargs):
-        try:
-            return original_setup(self, *args, **kwargs)
-        finally:
-            uninstall()
-
-    cls._setup_transformers = _setup_transformers
-    cls.setup = setup
-    cls._soup_dataset_hashing = True
 
 
 # ---------------------------------------------------------------- diagnostics: profile of the setup
@@ -480,8 +359,12 @@ def patch_soup_first_step_mark():
 
     install_marks()  # SOUP_SOLUTION_STARTUP_PROFILE=1 only: marks inside the trainer build
     # apply() calls this function unconditionally, so the trainer-build switches hook in here
-    # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_FAST_FINGERPRINT, ...: all off by default)
+    # (SOUP_SOLUTION_EARLY_ROWS, SOUP_SOLUTION_HELD_ENCODE)
     patch_soup_trainer_build()
+    from .tracker_async import enabled as tracker_thread, patch_tracker
+
+    if tracker_thread():
+        patch_tracker()  # SOUP_SOLUTION_TRACKER_THREAD: Soup's per-log SQLite commits in a thread
     original_train = cls.train
 
     class FirstStepMark(transformers.TrainerCallback):

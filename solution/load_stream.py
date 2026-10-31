@@ -42,7 +42,9 @@ them to the GPU. If the thread fails, the main thread fills the buffer the same 
 only for the embedding of a load handled here (its key read to the CPU, a safetensors slice of the
 embedding's shape, a float dtype, no thread pool or sharding) when its pinned buffer is there.
 
-SOUP_SOLUTION_LOAD_CODE_TABLE=1: bitsandbytes' `quantize_4bit` (functional.py:936) asks
+SOUP_SOLUTION_LOAD_CODE_TABLE (on by default since soup-l1-v2/v4: with the warm-up shorter the main thread's
+load is on the way to the first step, -0.07..-0.27 s; =0 for bitsandbytes' own function): bitsandbytes'
+`quantize_4bit` (functional.py:936) asks
 `get_4bit_type` for the 16-value NF4 table of every weight it quantizes (196 here), and that builds
 it again each time: `torch.tensor(list, device=cuda)`, a copy from pageable memory that makes the
 CPU wait until the GPU has finished the weight's own copy and cast, then three small kernels
@@ -75,6 +77,13 @@ LAST = {"load": None}  # the last load handled (counters, for the log and the te
 
 def _flag(name, default="0"):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
+
+
+def _early_on():
+    """SOUP_SOLUTION_LOAD_EARLY (load_early.py) and its reading thread started."""
+    from . import load_early
+
+    return load_early.enabled() and load_early._STATE["thread"] is not None
 
 
 class _Pinner:
@@ -222,10 +231,22 @@ class _Load:
             except Exception:  # noqa: BLE001 - from the slice
                 where = None
 
+        early = None
+        if where is not None and _early_on():
+            path = getattr(self.locate, "fd_path", {}).get(where[0])
+            early = (path, where[1], torch.Size(shape).numel() * where[2].itemsize, where[2]) if path else None
+
         def fill():
             started = time.perf_counter()
             try:
-                if where is not None:
+                staged = None
+                if early is not None:
+                    from .load_early import view as early_view
+
+                    staged = early_view(*early[:3])  # LOAD_EARLY: waits for its chunk
+                if staged is not None:
+                    host.copy_(staged.view(early[3]).view(shape))  # the cast kernel of .to(), from pinned bytes
+                elif where is not None:
                     _cast_from_file(host, *where)
                 else:
                     host.copy_(source[...])
@@ -397,6 +418,7 @@ class _FileRanges:
             for key in handle.keys():
                 self.path_of.setdefault(key, path)
         self.files = {}  # path -> (fd, data start, header)
+        self.fd_path = {}  # fd -> path (LOAD_EARLY looks the bytes up by file)
 
     def _file(self, path):
         import json
@@ -412,6 +434,7 @@ class _FileRanges:
                 os.close(fd)
                 raise
             found = self.files[path] = (fd, 8 + size, header)
+            self.fd_path[fd] = path
         return found
 
     def __call__(self, source):
@@ -454,16 +477,78 @@ def _wrap(owner, name, make):
     setattr(owner, name, wrapper)
 
 
+_INIT_FUNCTIONS = ("uniform_", "normal_", "constant_", "ones_", "zeros_", "eye_", "dirac_", "xavier_uniform_",
+                   "xavier_normal_", "kaiming_uniform_", "kaiming_normal_", "trunc_normal_", "orthogonal_", "sparse_")
+_INIT_MODULES = ("torch.nn.init", "torch.nn.modules.activation", "torch.nn.modules.transformer",
+                 "torch.nn.modules.linear", "torch.nn.modules.loss", "torch.nn.modules.batchnorm",
+                 "torch.nn.modules.conv", "torch.nn.modules.normalization", "torch.nn.modules.rnn",
+                 "torch.nn.modules.sparse")  # transformers' TORCH_MODULES_TO_PATCH (initialization.py)
+LAST_META_INIT = {"skipped": 0}
+
+
+def _meta_skipping(fn):
+    """`fn` (a torch.nn.init function) that returns a meta tensor untouched (SOUP_SOLUTION_META_INIT)."""
+
+    @functools.wraps(fn)
+    def init_function(tensor, *args, **kwargs):
+        if isinstance(tensor, torch.Tensor) and tensor.is_meta:
+            LAST_META_INIT["skipped"] += 1
+            return tensor
+        return fn(tensor, *args, **kwargs)
+
+    init_function._soup_meta_init = fn
+    return init_function
+
+
+def _install_meta_init():
+    """SOUP_SOLUTION_META_INIT=1: while Soup's model setup runs, torch's init functions return a meta
+    tensor as it is. transformers builds the model skeleton under `torch.device("meta")` without
+    `no_init_weights` (modeling_utils.py get_init_context), so every nn.Linear's reset_parameters runs
+    kaiming_uniform_ / uniform_ on meta tensors, through the device context's __torch_function__:
+    0.3 s of the main thread on the T4 (soup-l1-p0 profile) for tensors that hold no values and draw no
+    random numbers (a meta tensor's uniform_ uses no generator). Any tensor that is not meta (peft's
+    LoRA init on the GPU, which draws from the generators) takes torch's function. Returns the undo."""
+    import sys
+
+    done = []
+    for module_name in _INIT_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        for name in _INIT_FUNCTIONS:
+            fn = getattr(module, name, None)
+            if fn is None or getattr(fn, "_soup_meta_init", None) is not None:
+                continue
+            wrapper = _meta_skipping(fn)
+            setattr(module, name, wrapper)
+            done.append((module, name, fn, wrapper))
+
+    def undo():
+        while done:
+            module, name, fn, wrapper = done.pop()
+            if getattr(module, name, None) is wrapper:
+                setattr(module, name, fn)
+
+    return undo
+
+
 def _scoped_setup(original):
     @functools.wraps(original)
     def _setup_transformers(self, *args, **kwargs):
         _STATE["depth"] += 1
+        undo_init = _install_meta_init() if _STATE["depth"] == 1 and _flag("SOUP_SOLUTION_META_INIT") else None
         try:
             return original(self, *args, **kwargs)
         finally:
+            if undo_init is not None:
+                undo_init()
             _STATE["depth"] -= 1
             if _STATE["depth"] <= 0:
                 _STATE["opened"] = []  # files of loads this module did not handle
+                if _early_on():
+                    from .load_early import release as release_early
+
+                    release_early()  # LOAD_EARLY: whatever the setup did not use is dropped here
 
     return _setup_transformers
 
@@ -490,8 +575,13 @@ def _loader(original):
             return original(*args, **kwargs)
         ranges = None
         opened, _STATE["opened"] = _STATE["opened"], []
-        if (_flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(os, "preadv") and isinstance(bound.get("state_dict"), dict)
-                and opened):
+        if _early_on():
+            from .load_early import covers, release as release_early
+
+            if not any(covers(path) for path, _ in opened):
+                release_early()  # LOAD_EARLY read other files than this load opens: drop them
+        if ((_flag("SOUP_SOLUTION_LOAD_PREAD") or _early_on()) and hasattr(os, "preadv")
+                and isinstance(bound.get("state_dict"), dict) and opened):
             try:
                 ranges = _FileRanges(bound["state_dict"], opened)
             except Exception:  # noqa: BLE001 - staged from the slices
@@ -504,7 +594,7 @@ def _loader(original):
         _ACTIVE["load"] = load
         started = time.perf_counter()
         functional = table = None
-        if _flag("SOUP_SOLUTION_LOAD_CODE_TABLE"):
+        if _flag("SOUP_SOLUTION_LOAD_CODE_TABLE", "1"):
             try:
                 import bitsandbytes.functional as functional
 
@@ -524,6 +614,10 @@ def _loader(original):
             load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on
             if load.copier is not None:
                 load.copier.close()
+            if _early_on():
+                from .load_early import release as release_early
+
+                release_early()  # LOAD_EARLY: after the copies out of it are done (copier.close synchronizes)
             load.pinner.close()
             if ranges is not None:
                 ranges.close()
@@ -624,7 +718,7 @@ def patch_loader(layers=None, only=None, embedding=None):
     _wrap(core_model_loading, "set_param_for_module", _setter)
     from .load_pinned import enabled as load_pinned_enabled
 
-    if _flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(modeling_utils, "safe_open"):
+    if (_flag("SOUP_SOLUTION_LOAD_PREAD") or _early_on()) and hasattr(modeling_utils, "safe_open"):
         _wrap(modeling_utils, "safe_open", _opener)
     if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC", "1")) and hasattr(core_model_loading,
                                                                                  "spawn_materialize"):
