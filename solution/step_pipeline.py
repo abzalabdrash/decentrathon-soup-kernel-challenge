@@ -34,7 +34,8 @@ off), for the real CUDA trainer only (anything else runs the original):
   (the same integer operations as unpad.pack_batch on the GPU), and copied to the GPU in one
   non-blocking copy next to the batch. The forward (fused_ce.py) and the head take them by the
   identity of the batch's GPU tensors; any other tensor takes the GPU path.
-- SOUP_SOLUTION_HOST_IDS=1 (task C1, with the host plan): the packed ids' CPU copy is recorded for
+- SOUP_SOLUTION_HOST_IDS=1 (task C1, with the host plan; off by default, in the noise on the T4 in
+  soup-c1-abba5 with fused_proj's two-node attention): the packed ids' CPU copy is recorded for
   their GPU view (`remember`), unpad.varlen_model_forward records the CPU copy of the ids with the
   alignment tail for its GPU tensor, and the embedding lookup (head_stream.py) gathers its rows
   with those CPU ids instead of reading the GPU ids back (the forward's last host wait).
@@ -74,7 +75,7 @@ _STATE = {
     "nan_gpu": _env("SOUP_SOLUTION_NAN_FILTER", "gpu") == "gpu",
     "prefetch": _flag("SOUP_SOLUTION_PREFETCH_BATCH", "1"),
     "plan": _flag("SOUP_SOLUTION_HOST_PLAN", "1"),
-    "host_ids": _flag("SOUP_SOLUTION_HOST_IDS", "1"),
+    "host_ids": _flag("SOUP_SOLUTION_HOST_IDS", "0"),
     "timing": _flag("SOUP_SOLUTION_BOUNDARY_TIMING"),
     "bwd_single": _flag("SOUP_SOLUTION_BWD_SINGLE_THREAD", "1"),
     "patched": False,

@@ -1073,8 +1073,12 @@ def test_attention_two_nodes_backward_peak(layer_1p5b, monkeypatch):
         assert peaks.setdefault(mode, peak) == peak or mode == "warm", (mode, peaks, peak)
         del loss, xr
     n = sum(LENGTHS)
-    assert peaks["two"] <= peaks["three"], peaks
-    assert peaks["one"] >= peaks["three"] + n * 1024, peaks
+    # three nodes' peak here depends on the tests run before it in the process (run alone it equals
+    # two nodes'; after the attention tests above it is N x 1024 bytes lower, two nodes' does not
+    # move): two nodes may sit that much above it, never more; on the T4 the step's allocated peak is
+    # the same with both (soup-c1-abba5: 225.5 MiB)
+    assert peaks["two"] <= peaks["three"] + n * 1024, peaks
+    assert peaks["one"] >= peaks["two"] + n * 2048, peaks
 
 
 @pytest.mark.parametrize("mode", ["three", "two", "one"])

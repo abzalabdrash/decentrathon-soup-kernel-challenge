@@ -1147,8 +1147,10 @@ class _AttnBlock(torch.autograd.Function):
 # o_proj backward still consumes the output's gradient before the attention backward runs; the node
 # holds its incoming gradient (the attention output's, N x D half) through the q/k/v backward in place
 # of the q/k/v gradients (N x (nq + nk + nv) half) that _QKVRope's node held there. One autograd node
-# and the reshape's view node less per layer and direction. SOUP_SOLUTION_ATTN_ONE_FUNCTION=1 wins
-_ATTN["two_nodes"] = os.environ.get("SOUP_SOLUTION_ATTN_TWO_NODES", "1").strip().lower() \
+# and the reshape's view node less per layer and direction. SOUP_SOLUTION_ATTN_ONE_FUNCTION=1 wins.
+# Off by default: bitwise and the same memory, but T4 ABBA soup-c1-abba5 (with SOUP_SOLUTION_HOST_IDS)
+# measured steps 3+ -0.08 s, wall +0.05 s: in the noise
+_ATTN["two_nodes"] = os.environ.get("SOUP_SOLUTION_ATTN_TWO_NODES", "0").strip().lower() \
     not in ("0", "false", "no", "")
 # SOUP_SOLUTION_EXPAND_KV_ONCE=1 (task C1): the recompute expands k and v to the q heads once and
 # hands the same expanded tensors to its attention forward and to the attention backward (which

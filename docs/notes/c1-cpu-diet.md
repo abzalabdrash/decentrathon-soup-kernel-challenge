@@ -294,3 +294,13 @@ which tools/kaggle_run.py does not download (file pattern), and the jury batches
 My opinion: nothing to do about hot-card sensitivity on our side (our runs vary +-2 % within a session,
 less than the base). The jury gap is per-token GPU cost on token-heavy rows; levers are per-token ones
 (the int8 MLP backward, measured -12 to -36 ms per step), not start-up or CPU.
+
+### State of the branch (end of session 2)
+
+`claude/c1-cpu-diet-2` = main 141818e + this session. Defaults of the new switches are **off** (the
+orchestrator's decision: in the noise on the T4): `SOUP_SOLUTION_ATTN_TWO_NODES=0`,
+`SOUP_SOLUTION_HOST_IDS=0`, `SOUP_SOLUTION_EXPAND_KV_ONCE=0`; with them off the step runs main's code
+paths. Tests for all three stay in `test_fused_proj.py`, `test_step_pipeline.py`, `test_head_stream.py`
+(they set the switches themselves). `solution/bench_nodes.py` is the one-Function pre-test.
+`test_attention_two_nodes_backward_peak` tolerates N x 1024 bytes on the laptop (three nodes' peak
+depends on the tests run before it there); the T4 allocated peak is equal (abba5).
