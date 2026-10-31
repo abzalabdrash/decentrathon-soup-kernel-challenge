@@ -359,7 +359,7 @@ def patch_soup_first_step_mark():
 
     install_marks()  # SOUP_SOLUTION_STARTUP_PROFILE=1 only: marks inside the trainer build
     # apply() calls this function unconditionally, so the trainer-build switches hook in here
-    # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_EARLY_ROWS, ...)
+    # (SOUP_SOLUTION_EARLY_ROWS, SOUP_SOLUTION_HELD_ENCODE)
     patch_soup_trainer_build()
     from .tracker_async import enabled as tracker_thread, patch_tracker
 

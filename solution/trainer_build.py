@@ -1,29 +1,8 @@
 """Soup's trainer build (the rest of SFTTrainerWrapper.setup after the model): the tokenization of the
-training rows and datasets' fingerprint of it, with the same results and less work. Each part has
-its own switch, off by default until measured on the T4; every replacement lives only while Soup's
-`setup` runs and takes the original code for anything it does not recognize.
-
-SOUP_SOLUTION_FAST_ROWS=1: Soup formats every row with `build_assistant_only_labels`
-(soup_cli/data/loss_mask.py:273). It first asks the chat template for an assistant mask
-(`_apply_template_with_mask`: a render with `return_assistant_tokens_mask=True` and a tokenization),
-and Qwen2.5's template has no `{% generation %}` block, so transformers returns an all-zero mask
-(transformers/utils/chat_template_utils.py:508, tokenization_utils_base.py:3133-3154: no generation
-indices, `current_mask = [0] * len(ids)`) and Soup rejects it whenever the row has an assistant
-message (loss_mask.py:146-147), then renders and tokenizes the conversation again for its incremental
-fallback. Here, for a real transformers tokenizer whose template has no `{% generation %}` block
-(transformers' own regex) and a conversation with an assistant message, `_apply_template_with_mask`
-returns None at once: the value Soup computes, without the first render (one of the four renders
-and tokenizations of each row). Every ids list then goes through `_coerce_int_list` (loss_mask.py:48),
-which checks and converts each token in a Python loop; a list whose items are all exactly `int` is
-returned as a copy (what the loop returns for it: `index(x)` and `int(x)` of an int are x), anything
-else takes the loop. And Soup's incremental fallback tokenizes the whole conversation twice per row
-(first as `full_ids`, loss_mask.py:336, then as the last cumulative prefix, :347, which for a
-user/assistant row is the same list of messages): `_tokenize_only` remembers its last MEMO_CALLS
-calls (the tokenizer, its chat template, a copy of the messages) and answers a call with equal
-messages from them, so each row has two renders and tokenizations instead of four. The rows are the same
-(test_trainer_build.py; on the 256 training rows, input ids and labels compared one by one); datasets' fingerprint of the map changes, because the functions
-it hashes through the module's globals are these two (a fingerprint only names cache files of
-datasets backed by files, and this one is built in memory; the organizers allow even a random one).
+training rows, with the same rows and datasets' own fingerprint (the organizers' answers 9, 13 and 53:
+how the fingerprint is computed and what it hashes stay Soup's). Each part has its own switch, off by
+default until measured on the T4; every replacement lives only while Soup's `setup` runs and takes the
+original code for anything it does not recognize.
 
 SOUP_SOLUTION_EARLY_ROWS=1: the tokenization of the training rows needs only the tokenizer and the
 rows, and the tokenizer is ready before the model load starts (soup_cli/trainer/sft.py:1661-1666,
@@ -57,92 +36,13 @@ attribute, goes to the tokenizer itself. The stand-in lives only for that one ca
 """
 
 import os
-import re
 import threading
 import time
 
-_GENERATION = re.compile(r"\{\%-?\s*generation\s*-?\%\}")  # transformers' check (chat_template_utils.py:508)
 
 
 def _flag(name, default="0"):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
-
-
-# ---------------------------------------------------------------- SOUP_SOLUTION_FAST_ROWS
-
-def _template_without_generation(tokenizer):
-    """The tokenizer's single chat template when it is a real transformers tokenizer with the
-    standard apply_chat_template and its template has no `{% generation %}` block, else None."""
-    try:
-        from transformers import PreTrainedTokenizerBase
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(tokenizer, PreTrainedTokenizerBase):
-        return None
-    if getattr(type(tokenizer), "apply_chat_template", None) is not PreTrainedTokenizerBase.apply_chat_template:
-        return None
-    template = getattr(tokenizer, "chat_template", None)
-    if not isinstance(template, str) or not template or _GENERATION.search(template):
-        return None
-    return template
-
-
-def _fast_mask(original):
-    def _apply_template_with_mask(tokenizer, messages, *args, **kwargs):
-        try:
-            if (not args and not kwargs and _template_without_generation(tokenizer) is not None
-                    and isinstance(messages, (list, tuple)) and messages
-                    and all(isinstance(m, dict) for m in messages)
-                    and any(m.get("role") == "assistant" for m in messages)):
-                return None  # the all-zero mask Soup rejects (see the module docstring)
-        except Exception:  # noqa: BLE001
-            pass
-        return original(tokenizer, messages, *args, **kwargs)
-
-    _apply_template_with_mask._soup_original = original
-    return _apply_template_with_mask
-
-
-MEMO_CALLS = 8  # _tokenize_only calls remembered: a row's prefixes come between its two full renders
-
-
-def _fast_tokenize_only(original):
-    recent = []  # [(tokenizer, chat template, copy of the messages, ids)], newest last
-
-    def _tokenize_only(tokenizer, messages, *args, **kwargs):
-        if args or kwargs or not isinstance(messages, (list, tuple)):
-            return original(tokenizer, messages, *args, **kwargs)
-        template = getattr(tokenizer, "chat_template", None)
-        try:
-            for cached_tok, cached_template, cached, ids in reversed(recent):
-                if (cached_tok is tokenizer and cached_template is template and len(cached) == len(messages)
-                        and all(a == b for a, b in zip(cached, messages))):
-                    return list(ids)
-        except Exception:  # noqa: BLE001
-            recent.clear()
-        ids = original(tokenizer, messages)
-        try:
-            recent.append((tokenizer, template, [dict(m) if isinstance(m, dict) else m for m in messages],
-                           list(ids)))
-            del recent[:-MEMO_CALLS]
-        except Exception:  # noqa: BLE001
-            recent.clear()
-        return ids
-
-    _tokenize_only._soup_original = original
-    return _tokenize_only
-
-
-def _fast_int_list(original):
-    def _coerce_int_list(values, *args, **kwargs):
-        if type(values) is list and values:
-            kinds = set(map(type, values))
-            if len(kinds) == 1 and int in kinds:
-                return values.copy()
-        return original(values, *args, **kwargs)
-
-    _coerce_int_list._soup_original = original
-    return _coerce_int_list
 
 
 # ---------------------------------------------------------------- SOUP_SOLUTION_EARLY_ROWS
@@ -413,16 +313,6 @@ def _replacements():
 
             if callable(TokenizersBackend.__dict__.get("_encode_plus")):
                 out.append((TokenizersBackend, "_encode_plus", _held_encode_plus))
-        except Exception:  # noqa: BLE001
-            pass
-    if _flag("SOUP_SOLUTION_FAST_ROWS", "0"):  # OFF: it changes the fingerprint of Soup's map (dill walks the replaced
-        # functions' globals); answers 9 and 53 require datasets' fingerprint untouched
-        try:
-            from soup_cli.data import loss_mask
-
-            out.append((loss_mask, "_apply_template_with_mask", _fast_mask))
-            out.append((loss_mask, "_coerce_int_list", _fast_int_list))
-            out.append((loss_mask, "_tokenize_only", _fast_tokenize_only))
         except Exception:  # noqa: BLE001
             pass
     return out
