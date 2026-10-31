@@ -119,16 +119,36 @@ soup-a1-extremes2 (peagverr, main 5f3fd27 = 8d2d0bd + S1 + A1 + R3, seed 101, `-
 
 ## 6. Перед сдачей: что прогнать на финальном коммите
 
-Порядок такой, чтобы последний зелёный результат был именно на том sha, который уходит жюри (проверки 3 и 4 жюри считает на своём `result.json`, а `checks.json` хранит sha256 папки `solution/`).
+Порядок такой, чтобы последний зелёный результат был именно на том sha, который уходит жюри: `checks.json` хранит sha256 папки `solution/`, и любая правка в ней, даже в комментарии, требует повторить прогоны. Ниже F это финальный sha, запушенный в origin.
 
-1. Заморозить код: ни одной правки в `solution/` после шагов 2–5. Любая правка, даже в комментарии, меняет `solution_sha256` и требует повторить шаги.
-2. Локально (WSL, 1–2 мин): `python tools/fast_rows_check.py . 300 100 100` (быстрая подготовка строк против Soup) и `python -m pytest solution/test_jury_*.py -q` (выход прогрева, отказы pinned, длинные батчи 2 048 / 2 047 / 1 999). Полный `pytest solution` гонять на Kaggle (`--mode full` делает это сам), не в WSL.
-3. Kaggle, два прогона жюри на финальном sha с разными строками и seed, порядок base/solution/solution/base (`--mode jury`), например `--jury-data "--train-rows 33000:33256 --eval-rows 47000:47256" --jury-seed 67` и `--jury-data "--train-rows 5000:5256 --eval-rows 12000:12256" --jury-seed 89` (seed 7, 13, 21, 31, 42, 57, 61, 71, 83, 97, 99, 123 уже использованы). Ждать 10 из 10 в обоих.
-4. Kaggle, `--mode full` на финальном sha: публичные строки, полный `pytest solution` (397+ тестов), 10 проверок.
-5. Распределение длин с 2 048 токенами (`--select extremes`) жюри не грозит: база на нём падает по памяти (14 719 MiB, seed 21 и 97). Повторять его стоит только для числа «своих ядер» и пика решения; проверки 1 и 5–8 там всегда FAIL из-за базы.
-6. Без диагностики: убедиться, что в окружении ноутбука нет `SOUP_SOLUTION_DIAG`, `SOUP_SOLUTION_CPU_PROFILE`, `SOUP_SOLUTION_PROFILE_STARTUP`, `SOUP_SOLUTION_STREAM_TIMING`, `SOUP_SOLUTION_WEIGHT_RING_TIMING` (по умолчанию все выключены; `diag.py` сбрасывает пиковую статистику torch, а это читается как вмешательство в замер проверки 9).
-7. Переключатели, которые меняют поведение у жюри, выставлять только в коде (умолчания в `solution/`), не через окружение ноутбука: жюри запускает `harness/run_task.py` со своим окружением. Это касается `SOUP_SOLUTION_EXIT_RELEASE`: с 8d2d0bd он включён в коде как `=1` (`setdefault` в `__init__.py`), `=all` не включать (раздел 2).
-8. В логах обоих прогонов решения финального жюри-прогона проверить строки: «allocator: ... 0 alloc retries, 0 segment frees», «weight streaming ... 0 of them not prefetched», «head stream ... 0 not prefetched», «pinned stack ... (N prepinned)» с N, равным числу слабов, и отсутствие «warmup ... failed», «skipped», «undone», «kept on the GPU».
-9. Публичный ноутбук Kaggle: Run All без правок на финальном sha, сравнить его 10 проверок с шагом 3.
+Шаг 0, локально в WSL до пуша F (5 минут, без полного `pytest solution`):
+
+```bash
+HF_HUB_OFFLINE=1 python tools/fast_rows_check.py . 300 100 100
+python -m pytest solution/test_jury_*.py -q -p no:cacheprovider --basetemp=$HOME/pt_final
+SOUP_APPLY_SOLUTION=1 python -m pytest tests -q -p no:cacheprovider; echo "rc=$?"
+```
+
+Ждать: 0 расхождений строк, все `test_jury_*` зелёные, «79 passed» и rc=0. `--basetemp` на диске, потому что `/tmp` в WSL это tmpfs 3,7 ГБ, общий с другими сессиями (у меня один раз кончилось место).
+
+Волна A, четыре слота сразу (два аккаунта по два слота), всё на F:
+
+| Слот | Команда (из корня чекаута F) | Время | Зачем |
+|---|---|---|---|
+| namedesign 1 | `bash tools/kaggle_win.sh 1 --mode jury --slug soup-final-j1 --commit F --jury-seed 67 --jury-data "--train-rows 33000:33256 --eval-rows 47000:47256"` | ~20–25 мин | полный порядок жюри (base/solution/solution/base), строки и seed не использовались |
+| namedesign 2 | `bash tools/kaggle_win.sh 1 --mode jury --slug soup-final-j2 --commit F --jury-seed 89 --jury-data "--train-rows 5000:5256 --eval-rows 12000:12256"` | ~20–25 мин | второй полный порядок жюри на другом распределении строк |
+| peagverr 1 | `bash tools/kaggle_win.sh 2 --mode full --slug soup-final-full --commit F` | ~13 мин | публичные строки, полный `pytest solution` на T4, 10 проверок |
+| peagverr 2 | `bash tools/kaggle_win.sh 2 --mode jury --slug soup-final-x --commit F --jury-seed 107 --jury-data "--select extremes"` | ~13 мин (база падает быстро) | распределение с шагами 2 048 токенов и смесью длин: доля своих ядер и пик решения на худшей форме; проверки 1 и 5–8 там FAIL из-за базы, это ожидаемо |
+
+Два прогона жюри первыми, потому что они самые долгие; full и extremes короче и освобождают слоты peagverr раньше. Если слотов меньше (другие сессии), приоритет такой: j1, full, j2, extremes. Seed 7, 13, 21, 31, 42, 57, 61, 71, 83, 97, 99, 101, 103, 123 уже использованы.
+
+Волна B, после зелёной волны A: публичный ноутбук на F (`--mode full --public --slug soup-final-public`, на аккаунте, от которого идёт сдача), Run All без правок, сверить его 10 проверок с soup-final-full.
+
+Критерии приёмки каждого прогона (не только «10 из 10»):
+- проверки: j1, j2 и full 10 из 10; extremes: PASS по 2, 3, 4, 9, 10;
+- запасы не ниже виденных в аудите: свои ядра ≥ 9 % на extremes и ≥ 11 % на обычных строках; пик nvidia-smi − 0,97 · reserved ≥ 100 MiB в каждом прогоне; loss первого шага и средний разрыв < 0,1 %; eval в пределах ±0,05 %;
+- строки решения в `train.log` обоих прогонов solution: «0 alloc retries, 0 segment frees»; «0 of them not prefetched» у весов и «0 not prefetched» у головы; «pinned stack ... in N slabs (N prepinned...)» с одинаковыми N; «exit release: ... MiB of offload slabs freed, ... unregistered» без скобок с ошибкой; «warmup done» без «failed»; нигде «skipped», «undone», «kept on the GPU», «stopped»;
+- `pytest solution` в full: 0 падений (до этого должны быть влиты de0292c из этой ветки и правка S1 для `test_early_probes_serve_same_answers`);
+- в окружении ноутбука нет `SOUP_SOLUTION_*` (режимы `full` и `jury` их не ставят, `tools/kaggle_run.py:62-83`; `--env` не передавать). Переключатели, которые должны действовать у жюри, задаются только умолчаниями в `solution/` (как `SOUP_SOLUTION_EXIT_RELEASE=1` через `setdefault` в `__init__.py`), потому что жюри запускает `harness/run_task.py` со своим окружением. Диагностические переключатели (`SOUP_SOLUTION_DIAG`, `SOUP_SOLUTION_CPU_PROFILE`, `SOUP_SOLUTION_PROFILE_STARTUP`, `SOUP_SOLUTION_STREAM_TIMING`, `SOUP_SOLUTION_WEIGHT_RING_TIMING`, `SOUP_SOLUTION_WARMUP_AUDIT`) по умолчанию выключены; `diag.py` сбрасывает пиковую статистику torch, это читается как вмешательство в замер проверки 9.
 
 Остаточные риски, которые я не закрыл: (а) строка «[solution] warmup done ...; failed: ...» или «warmup X failed» может попасть после итога pytest, если регистрация прогрева упадёт в те миллисекунды между печатью итога и началом atexit; нужна и ошибка регистрации, и такое совпадение по времени, в прогонах T4 ошибок регистраций не было; (б) у базы на T4 почти нет запаса памяти на длинных строках (14 345–14 407 MiB на обычных, OOM на 2 048 токенов), это общий риск всех команд, от нас не зависит.
