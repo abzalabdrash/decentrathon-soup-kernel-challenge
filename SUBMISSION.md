@@ -4,7 +4,7 @@ Decentrathon 6.0, трек 01 Soup Kernel Challenge. Описание решен
 ограничения: [README.md](README.md).
 
 ## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/commit/<FINAL_COMMIT>
+- Repository, final commit: https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/commit/0b2cb75
   (код заморожен на 0b2cb75; папка `solution/` совпадает с 6c426d1)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   README.md): https://www.kaggle.com/code/slerfas/soup-final-public?scriptVersionId=<PUB_VERSION_ID>
@@ -23,7 +23,7 @@ Decentrathon 6.0, трек 01 Soup Kernel Challenge. Описание решен
 Доля — время ядра по CUDA-событиям харнесса на шагах 3+ к времени этих шагов (проверка 4). Числа —
 полный прогон на Kaggle T4 soup-m13-full (f152a56, 31 октября 2026; в нём уже все ядра финального кода):
 `own_kernel_ms` / `timed_loop_s` из `runs/solution_1/metrics.json`, 24,433 с шагов 3+. Итог финального
-прогона soup-final-full: `<FULL_OWN_PCT>`.
+прогона soup-final-full: `23,1 %`.
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
@@ -77,10 +77,10 @@ Ideas taken from other kernels, with links (we wrote the code ourselves):
 | Peak GPU memory, MiB | `<PUB_BASE_MIB>` | `<PUB_PEAK>` | base/ours x`<PUB_M>` | 14 345 → 395 (x36,32) |
 | Eval loss (public rows) | `<PUB_BASE_EVAL>` | `<PUB_EVAL>` | `<PUB_EVAL_PCT>` vs base | 2,04963 → 2,04980 (+0,008 %) |
 
-Полный прогон soup-final-full: s = `<FULL_S>`, пик `<FULL_PEAK_MIB>` MiB, eval `<FULL_EVAL_PCT>`,
-`<FULL_CHECKS>`. Протокол жюри на других строках (base, solution, solution, base): soup-final-j1
-(seed 67) s = `<J1_S>`, пик `<J1_PEAK>` MiB, eval `<J1_EVAL>`, `<J1_CHECKS>`; soup-final-j2 (seed 89)
-s = `<J2_S>`, пик `<J2_PEAK>` MiB, eval `<J2_EVAL>`, `<J2_CHECKS>`. До заморозки — 10 из 10 на всех
+Полный прогон soup-final-full: s = `1,875`, пик `395` MiB, eval `+0,002 %`,
+`10 из 10`. Протокол жюри на других строках (base, solution, solution, base): soup-final-j1
+(seed 67) s = `1,803`, пик `415` MiB, eval `+0,002 %`, `10 из 10`; soup-final-j2 (seed 89)
+s = `1,841`, пик `415` MiB, eval `+0,002 %`, `10 из 10`. До заморозки — 10 из 10 на всех
 18 наборах строк и seed из `docs/STATUS.md`; все прогоны и стресс-формы: README.md, разделы 3.1–3.3.
 
 - [ ] All 10 checks of `harness/check_rules.py` passed (финальные прогоны: `<PUB_CHECKS>`; до заморозки 10 из 10 во всех 18 прогонах жюри и в полных прогонах main 31 октября)
