@@ -84,11 +84,13 @@ DEFAULT_MODE = "offload"
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
 SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
-# pinned ahead (patch_soup_setup_prepin) once Soup has built a real CUDA model: the stack of the
-# task's largest step (1427 tokens, 6 slabs); a larger step pins more on demand. On the T4 a slab
-# takes 130 ms of cudaHostAlloc, which holds the forward up when the stack grows during training
-# (the "stalls in torch.empty" of the d9f60bb trace): 6 of them per run.
-PREPIN_MB = 1536
+# pinned ahead (patch_soup_setup_prepin) once Soup has built a real CUDA model; a larger step pins
+# more on demand. On the T4 a slab takes 130 ms of cudaHostAlloc, which holds the forward up when the
+# stack grows during training (the "stalls in torch.empty" of the d9f60bb trace). With the layer
+# inputs offloaded too a step stacks ~42 KB per token per layer: 7 slabs at the public data's 1,427
+# tokens (one pinned on demand with 6 ahead), 10 at the ~1,970-token steps of jury-style rows (four
+# on demand: soup-night-ejury2 / fjury logs). 10 slabs cover steps up to ~2,100 tokens.
+PREPIN_MB = 2560
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
