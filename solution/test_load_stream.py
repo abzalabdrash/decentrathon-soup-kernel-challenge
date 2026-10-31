@@ -308,3 +308,29 @@ def test_meta_init_same_rng_lora_and_weights(patched, tiny_dir, monkeypatch):
     assert all(torch.equal(ours["lora"][k], theirs["lora"][k]) for k in theirs["lora"])  # (b)
     assert ours["weights"].keys() == theirs["weights"].keys()
     assert all(torch.equal(ours["weights"][k], theirs["weights"][k]) for k in theirs["weights"])  # (c)
+
+
+def test_load_one_sync_same_setup(patched, tiny_dir, monkeypatch):
+    """SOUP_SOLUTION_LOAD_ONE_SYNC: one synchronize when the load returns instead of one per layer; the
+    layers' host copies and the training step are the same bits."""
+    from solution.head_stream import streamer_for
+    from solution.weight_stream import streamer_of
+
+    def run(flag):
+        monkeypatch.setenv("SOUP_SOLUTION_LOAD_ONE_SYNC", flag)
+        seen = {}
+
+        def after_load(model):
+            seen["host"] = [w.data.clone() for w in _layer_weights(model)]
+
+        model, _ = _setup(patched, tiny_dir, after_load=after_load)
+        step = _step(model)
+        streamer_of(model).restore()
+        streamer_for(model.get_base_model().get_input_embeddings().weight).restore()
+        return seen["host"], step
+
+    ours_host, ours_step = run("1")
+    theirs_host, theirs_step = run("0")
+    assert len(ours_host) == len(theirs_host) == 7 * LAYERS
+    assert all(torch.equal(a, b) for a, b in zip(ours_host, theirs_host))
+    assert all(torch.equal(a, b) for a, b in zip(ours_step, theirs_step))

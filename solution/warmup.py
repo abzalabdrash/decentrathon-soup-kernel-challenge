@@ -573,11 +573,33 @@ def _register_shutdown():
         atexit.register(_shutdown)
 
 
+def lower_thread_priority():
+    """SOUP_SOLUTION_WARMUP_NICE=<n> (off by default; allowed by the organizers): the calling thread's own
+    nice value raised to n (Linux keeps a nice value per thread; `os.setpriority` on the thread id), so the
+    scheduler gives the main thread (imports, Soup, the model load, datasets' hash) a CPU first on the 4-vCPU
+    box; the C compiler and ptxas processes this thread starts inherit it. Only the warm-up's own threads
+    call it; the main thread and the process keep theirs. Returns whether it was applied."""
+    try:
+        value = int(os.environ.get("SOUP_SOLUTION_WARMUP_NICE", "0") or 0)
+    except ValueError:
+        return False
+    if value <= 0 or not hasattr(os, "setpriority") or not hasattr(threading, "get_native_id"):
+        return False
+    try:
+        tid = threading.get_native_id()
+        current = os.getpriority(os.PRIO_PROCESS, tid)
+        os.setpriority(os.PRIO_PROCESS, tid, max(current, min(19, value)))
+        return True
+    except OSError:
+        return False
+
+
 def _worker(device, stream, log):
     """Takes registrations from the queue until it is closed and empty (or the process exits). One
     registration per kernel, so two workers never fill the same kernel's cache."""
     import torch
 
+    lower_thread_priority()  # SOUP_SOLUTION_WARMUP_NICE
     _STATE["idents"].add(threading.get_ident())
     torch.cuda.set_device(device)
     torch.cuda.set_stream(stream)  # a registration that launches stays off the main thread's stream

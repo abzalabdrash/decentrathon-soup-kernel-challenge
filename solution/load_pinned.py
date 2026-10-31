@@ -139,13 +139,14 @@ class _Entry:
     """One checkpoint tensor of the plan and where it is: staged in a buffer, copied (ahead) to the GPU."""
 
     __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "stage_dtype", "nbytes", "job", "where", "ready",
-                 "released", "staged", "error", "out", "event", "early")
+                 "released", "staged", "error", "out", "event", "early", "key")
 
     def __init__(self, index, source, shape, src_dtype, dtype, stage_dtype, job):
         self.index, self.source, self.shape = index, source, shape
         self.src_dtype, self.dtype, self.job = src_dtype, dtype, job
         self.where = None  # (file descriptor, byte offset) when it is read from the file (LOAD_PREAD)
         self.early = None  # (path, byte offset) when load_early.py read its bytes ahead (LOAD_EARLY)
+        self.key = None  # its checkpoint key (load_spec.py's hand-over)
         self.stage_dtype = stage_dtype  # in the buffer and copied: `dtype`, or `src_dtype` cast on the GPU
         numel = 1
         for size in shape:
@@ -178,6 +179,8 @@ class PinnedCopier:
         self.slot_bytes = self.planned = 0
         self.reason = None  # why the copies stopped early, if they did
         self.copied = self.copied_ahead = self.fallbacks = self.copied_bytes = self.copied_early = 0
+        self.handed_over = 0  # load_spec.py's stand-ins
+        self.model = None  # the model being loaded (load_stream.py sets it; load_spec.py's checks)
         self.wait_seconds = 0.0  # the loop waiting for a tensor to be staged
         self.fill_seconds = 0.0  # the thread staging (slice and conversion into a buffer)
         self.slot_wait_seconds = 0.0  # the thread waiting for a buffer's copy to finish
@@ -290,6 +293,7 @@ class PinnedCopier:
                     path = getattr(self.locate, "fd_path", {}).get(found[0])
                     if path is not None and _early_covers(path):
                         entry.early = (path, found[1])
+                        entry.key = getattr(self.locate, "key_of", {}).get(id(source))
             except Exception:  # noqa: BLE001 - staged from the slice
                 entry.where = None
         return entry
@@ -344,6 +348,14 @@ class PinnedCopier:
             self._hand_over(entry.event)
             return out
         started = time.perf_counter()
+        if entry.early is not None and entry.key is not None and self.model is not None:
+            from .load_spec import stand_in  # LOAD_SPEC: the thread's quantized result, when it matches
+
+            placeholder = stand_in(entry.early[0], entry.key, entry.shape, entry.dtype, self.device, self.model)
+            if placeholder is not None:
+                self.wait_seconds += time.perf_counter() - started
+                self.handed_over += 1
+                return placeholder
         if entry.early is not None:  # LOAD_EARLY: its bytes are in pinned memory read ahead (no ring slot)
             from .load_early import view
 
@@ -505,6 +517,7 @@ class PinnedCopier:
             self.log(f"[solution] pinned load copies: {self.copied} of {self.planned} checkpoint tensors "
                      + (f"({self.read_from_file} read from the file with preadv) " if self.read_from_file else "")
                      + (f"({self.copied_early} from the checkpoint read ahead) " if self.copied_early else "")
+                     + (f"({self.handed_over} quantized ahead by load_spec.py) " if self.handed_over else "")
                      + f"({self.copied_bytes / 2**20:.0f} MiB, {self.copied_ahead} copied ahead on a side stream, "
                      f"window {self.window}, cast on the {self.cast.upper()}) through {len(buffers)} pinned buffers of "
                      f"{self.slot_bytes / 2**20:.1f} MiB; staging {self.fill_seconds:.2f} s in a thread "

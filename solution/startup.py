@@ -246,6 +246,12 @@ def prepare_imports(log=True):
         loaded = [name for name in _SKIPPED if name in sys.modules]
         print("[solution] imports: " + ", ".join(f"{name} {s:.2f} s" for name, s in seconds.items())
               + f"; loaded of {', '.join(_SKIPPED)}: {', '.join(loaded) or 'none'}", flush=True)
+    try:
+        from .load_spec import start as start_spec
+
+        start_spec()  # SOUP_SOLUTION_LOAD_SPEC: the layers' NF4 quantization ahead, now that bitsandbytes is imported
+    except Exception:  # noqa: BLE001 - the loop quantizes as usual
+        pass
     from .startup_profile import mark as profile_mark
 
     profile_mark("imports done")  # SOUP_SOLUTION_STARTUP_PROFILE=1 only

@@ -70,6 +70,7 @@ class _File:
     def __init__(self, path, data_start, size, chunks, stamp):
         self.path, self.data_start, self.size, self.chunks = path, data_start, size, chunks
         self.stamp = stamp  # (size, mtime_ns) of the file when it was planned
+        self.tensors = {}  # key -> (dtype name, shape, first, end): the header's entries (load_spec.py)
         self.buffer = None
         self.failed = False
 
@@ -146,7 +147,10 @@ def _plan(path):
     for chunk in chunks:
         keys = [_natural(key) for first, end, key in tensors if chunk.start <= first and end <= chunk.end]
         chunk.order = min(keys) if keys else ()
-    return _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
+    entry = _File(os.path.realpath(path), 8 + length, size, chunks, (stat.st_size, stat.st_mtime_ns))
+    entry.tensors = {key: (info["dtype"], tuple(info["shape"]), *info["data_offsets"]) for key, info in header.items()
+                     if key != "__metadata__"}
+    return entry
 
 
 def _natural(key):
@@ -187,6 +191,38 @@ def _read(files, device):
             for chunk in entry.chunks:
                 chunk.ready.set()  # nobody waits for a chunk that will not come (failed: not used)
         _STATE["seconds"] = round(time.perf_counter() - started, 3)
+    _prepin(files)
+
+
+EMBEDDING_KEY = "model.embed_tokens.weight"
+
+
+def _prepin(files):
+    """SOUP_SOLUTION_LOAD_PREPIN: the embedding's pinned buffer (load_stream.py's first request: the
+    loop's first tensor, 445 MiB in half precision) made here, after the read and still during the
+    imports, instead of by load_stream.py's pinner thread when the load begins (the loop waited 0.2 s
+    for it on the T4, soup-l2-p0). The size is the one load_stream.py asks for: the embedding's
+    elements times 2 bytes (the run loads it in half precision); the pinner takes it only for a request
+    of exactly that size."""
+    if os.environ.get("SOUP_SOLUTION_LOAD_PREPIN", "0").strip().lower() in ("0", "false", "no", ""):
+        return
+    try:
+        from .weight_stream import PinnedBuffer
+
+        for entry in files:
+            info = entry.tensors.get(EMBEDDING_KEY)
+            if info is not None and len(info[1]) == 2:
+                nbytes = info[1][0] * info[1][1] * 2
+                _STATE.setdefault("prepinned", {})[nbytes] = PinnedBuffer(nbytes)
+                return
+    except Exception as exc:  # noqa: BLE001 - the pinner makes it then
+        _STATE["error"] = _STATE["error"] or f"prepin: {exc!r}"
+
+
+def take_prepinned(nbytes):
+    """The buffer made ahead for a request of exactly `nbytes`, once (None otherwise)."""
+    pool = _STATE.get("prepinned")
+    return pool.pop(nbytes, None) if pool else None
 
 
 def start(argv=None):
@@ -216,8 +252,8 @@ def start(argv=None):
 def view(path, offset, nbytes):
     """The uint8 host view of the file range [offset, offset + nbytes) of `path`, pinned, once its chunk
     is read (waits for it); None when it is not covered or the read failed."""
-    entry = _STATE["files"].get(os.path.realpath(path)) if _STATE["files"] else None
-    if entry is None or _STATE["released"]:
+    entry = _covered(path)
+    if entry is None:
         return None
     chunk = entry.chunk_of(offset, nbytes)
     if chunk is None:
@@ -230,19 +266,30 @@ def view(path, offset, nbytes):
     return entry.buffer[begin:begin + nbytes]
 
 
+def _covered(path):
+    """The _File read ahead for `path`, a file transformers opened, when it is the same file (real path,
+    size and modification time), else None. Resolved once per path (every tensor of a load asks)."""
+    if not _STATE["files"] or _STATE["released"]:
+        return None
+    covered = _STATE.setdefault("covered", {})  # path as transformers opened it -> _File or None
+    if path in covered:
+        return covered[path]
+    entry = _STATE["files"].get(os.path.realpath(path))
+    if entry is not None:
+        try:
+            stat = os.stat(entry.path)
+            if (stat.st_size, stat.st_mtime_ns) != entry.stamp:
+                entry = None
+        except OSError:
+            entry = None
+    covered[path] = entry
+    return entry
+
+
 def covers(path):
     """Whether `path`, a file transformers opened, is one read ahead: the same real path, size and
     modification time."""
-    if not _STATE["files"] or _STATE["released"]:
-        return False
-    entry = _STATE["files"].get(os.path.realpath(path))
-    if entry is None:
-        return False
-    try:
-        stat = os.stat(entry.path)
-    except OSError:
-        return False
-    return (stat.st_size, stat.st_mtime_ns) == entry.stamp
+    return _covered(path) is not None
 
 
 def release(log=print):
@@ -252,12 +299,16 @@ def release(log=print):
         if _STATE["released"] or not _STATE["files"]:
             return
         _STATE["released"] = True
+        _STATE.setdefault("covered", {}).clear()
         files = list(_STATE["files"].values())
+        leftovers = list(_STATE.pop("prepinned", {}).values())  # LOAD_PREPIN buffers nobody took
     thread = _STATE["thread"]
 
     def run():
         if thread is not None:
             thread.join()
+        for buffer in leftovers:
+            buffer.unpin()
         cudart = torch.cuda.cudart()
         for entry in files:
             if entry.buffer is None:
