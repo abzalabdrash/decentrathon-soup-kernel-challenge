@@ -4,7 +4,7 @@ head computed in one streamed pass over the vocabulary (own Triton kernels).
 The 151,936 x 1536 weight of Qwen2.5-1.5B (445 MiB in fp16) was the largest static tensor of the
 run, and the fused head's logits chunk (512 rows x V, 148 MiB) set the step's peak. Here neither
 exists on the GPU: the weight lives in page-locked host memory and goes through the GPU once per
-step in chunks of R vocabulary rows (8,192 by default: 24 MiB) on a ring of K slots (2 by default).
+step in chunks of R vocabulary rows (4,096 by default: 12 MiB) on a ring of K slots (2 by default).
 
 Setup (peft's `prepare_model_for_kbit_training` casts every fp16 parameter to fp32, the embedding
 included: 933 MiB next to the fp16 copy, the setup's peak). Right before it is called inside Soup's
@@ -73,7 +73,12 @@ import triton.language as tl
 
 from .fused_ce import IGNORE_INDEX, compute_dtype
 
-DEFAULT_ROWS = 8192  # vocabulary rows per chunk: 8192 x 1536 x 2 bytes = 24 MiB per slot
+# vocabulary rows per chunk: 4096 x 1536 x 2 bytes = 12 MiB per slot (the last chunk 384 rows). With
+# the early (gate|up) offload the run's peak sat at the head's start (ring 2 x 24 MiB + logits buffer
+# 21 MiB at 8192 rows next to the last layer's (gate|up), soup-night-wdiag); 4096 rows on the T4
+# (soup-night-head, ABBA): nvidia-smi 449 -> 429 MiB, alloc 279 -> 255, steps in the noise; 2048
+# rows give nothing more (the peak moves elsewhere)
+DEFAULT_ROWS = 4096
 DEFAULT_SLOTS = 2
 # where a training forward starts copying the head's first chunks: "embedding" (the start of the
 # forward: the ring alive through the forward; the lowest reserved peak on the T4), "norm" (the final
@@ -838,8 +843,9 @@ def _warm_kernels(rows):
 
     half, f32 = training_half_dtype(), torch.float32
     block = triton.next_power_of_2(rows)
-    # the training launches: stride_l = rows of the chunk (8192 and the last 4480: both divisible by
-    # 16), hidden size and its strides 1536, c0 / vc / n_lab not specialized, every pointer aligned
+    # the training launches: stride_l = rows of the chunk (4096 and the last 384, or 8192 and 4480:
+    # divisible by 16), hidden size and its strides 1536, c0 / vc / n_lab not specialized, every
+    # pointer aligned
     for first in (True, False):
         compile_kernel(head_chunk_kernel, half, rows, torch.int64, f32, f32, f32, f32, f32, torch.int32,
                        f32, HIDDEN, half, HIDDEN, half, HIDDEN, 0, rows, 387, HIDDEN,
