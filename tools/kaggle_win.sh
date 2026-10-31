@@ -8,7 +8,7 @@
 #   bash tools/kaggle_win.sh <1|2> --mode full --slug soup-xx --commit <sha>
 #   bash tools/kaggle_win.sh <1|2> --attach --slug soup-xx --mode variants      # re-join a running kernel
 #
-# 1 = account namedesign (kaggle1.token), 2 = account peagverr (kaggle2.token); the token files live in
+# 1 = account namedesign (kaggle1.token), 2 = peagverr (kaggle2.token), 3 = slerfas (kaggle3.token, from 31 Oct 12:45); the token files live in
 # "C:\Users\User\Downloads\Telegram Desktop" (never committed). Both accounts have the private dataset
 # soup-secrets with the GitHub read token. The commit must be pushed to origin first.
 #
@@ -21,7 +21,8 @@ TOKDIR="/c/Users/User/Downloads/Telegram Desktop"
 case "$acct" in
   1) tok="$TOKDIR/kaggle1.token"; user=namedesign ;;
   2) tok="$TOKDIR/kaggle2.token"; user=peagverr ;;
-  *) echo "first argument: account 1 (namedesign) or 2 (peagverr)"; exit 2 ;;
+  3) tok="$TOKDIR/kaggle3.token"; user=slerfas ;;
+  *) echo "first argument: account 1 (namedesign), 2 (peagverr) or 3 (slerfas)"; exit 2 ;;
 esac
 [ -r "$tok" ] || { echo "token file $tok not found"; exit 2; }
 PYDIR=/c/Users/User/AppData/Local/Programs/Python/Python312
