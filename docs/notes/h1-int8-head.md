@@ -254,6 +254,29 @@ not flips: at 0.44-0.50 % it sits at the 0.5 % line on seed 139.
   argument specialization of ~40 arguments), copies 0.6 ms; more cuts (fewer arguments, the transpose inside the
   chunk kernel with a 6 MiB buffer of its own) are worth ~0.1 s per run.
 
+## Final ABBA (dcf2d19: this branch + main 33a7023, which holds 834e5ad; Modal, 3 rounds + warm, peak 395-397 MiB all)
+
+Variants: the fp16 streamed head; int8 without the corrections (SOUP_SOLUTION_HEAD_INT8_DELTA=0,
+SOUP_SOLUTION_HEAD_INT8_LOSS_FIX=0: no rescoring, no loss correction, no runner-up); int8 with them (the code's
+settings). Per step against fp16 (steps 0-5 hold the build; the switch is at head 6).
+
+| host | variant | wall | steps 0-5 | steps 6+ | build in training |
+|---|---|---:|---:|---:|---|
+| x16 (h1-final-abba2) | fp16 | 49.59 | | | |
+| | int8 without corrections | 49.74 (+0.15) | +0.39 | -0.88 s (-15.2 ms per step) | 2.0-2.2 s (compilation 1.6-1.75) |
+| | int8 with corrections | 50.72 (+1.13) | +0.53 | -0.03 s (-0.5 ms per step) | 2.8-3.0 s (compilation 2.3-2.5) |
+| x8, copy-bound (h1-final-abba, no x16 host in 6 waves) | fp16 | 49.10 | | | |
+| | int8 without corrections | 47.09 (-2.01) | +0.25 | -2.06 s (-35.5 ms per step) | |
+| | int8 with corrections | 47.38 (-1.72) | +0.35 | -2.08 s (-35.9 ms per step) | |
+
+On the x16 host (Kaggle's T4s are x16) there is no wall gain: the build costs 0.4-0.5 s of steps 0-5 and the
+corrected variant's steps did not gain in this session (its run-to-run spread, 29.4-30.5 s of training, is wider than
+the effect). On x8 hosts the head is copy-bound and the int8 copy's halved bytes win ~2 s. Verdict unchanged: the
+int8 head stays off by default (SOUP_SOLUTION_HEAD_INT8=0); with the orchestrator's and Astra's reading (int32
+logits, P's quantization, the transpose and the scaling take back the IMMA saving on short and medium shapes; the
+corrections polish the shown metrics at the same dL/dh) it is not worth enabling. The peak fix (build buffers
+from the training stream's pool, 693af66) holds: 395-397 MiB in every run.
+
 ## Summary (31 Oct ~19:35)
 
 - Code: 75558d9..ad4cf33 on the branch, int8 head off by default (SOUP_SOLUTION_HEAD_INT8=1 turns it on).
