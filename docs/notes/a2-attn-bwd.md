@@ -122,8 +122,11 @@ layout: left to itself Triton gives the half store 8-wide vectors, the tile beco
 the last bit); with stride_y16 not specialized the half store stays narrow and rstd/y are the
 original kernel's bits (tested: plain and fused-add norms; a tiny 4-bit Qwen2 with LoRA through the
 fused path gives equal hidden states, loss and every LoRA gradient with the switch on and off).
-`half_of` falls back to the cast when the output changed since the norm (version check), the dtype
-or shape differs, or no copy exists; `_MLP` keeps its single padded copy when there is none.
+`half_of` hands the copy over once (the fp32 output lets go of it, so it lives as long as the
+consumer keeps it, as the cast did) and falls back to the cast when the output changed since the
+norm (version check), the dtype or shape differs, or no copy exists; `_MLP` keeps its single padded
+copy when there is none. Note: test_recompute's decoder-layer memory test fails when it runs after
+any tiny-model test in the same process, on main too (order dependence, not this change).
 Laptop (RTX 3050 Ti, per norm at 830 / 1,440 rows): norm + cast 157 / 230 us (plain), 199 / 320 us
 (with the add) against 110 / 169 and 165 / 250 us: -35..-70 us per norm, 56 norms per step, plus 56
 cast launches less. Warm-up: `rms_norm_rows_fwd_half` registered by `patch_qwen2_rmsnorm` (two
