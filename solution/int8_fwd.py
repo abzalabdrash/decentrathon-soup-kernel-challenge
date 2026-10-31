@@ -1,43 +1,46 @@
-"""int8 tensor cores for the fused MLP's forward GEMMs, gate|up and down (task I1,
-SOUP_SOLUTION_INT8_FWD; on by default in the `soup train` process only, like int8_bwd.py: pytest keeps
-the fp16 forward that test_fused_proj compares bit for bit, =1 turns it on there, =0 off everywhere).
-Organizers' answer 29 allows int8 for the frozen linear layers in the forward and the backward by
-input when all 10 checks pass.
+"""int8 tensor cores for the fused MLP's forward GEMM of gate|up (task I1, SOUP_SOLUTION_INT8_FWD; on
+by default in the `soup train` process only, like int8_bwd.py: pytest keeps the fp16 forward that
+test_fused_proj compares bit for bit, =1 turns it on there, =0 off everywhere). Organizers' answer 29
+allows int8 for the frozen linear layers in the forward and the backward by input when all 10 checks
+pass.
 
 The fp16 forward of fused_proj._MLP rebuilds W_gate, W_up and W_down in fp16 (nf4.py), runs two fp16
-GEMMs into (gate|up) (2I, M) and one after the SwiGLU. Here, with M the step's tokens (padded to 8):
+GEMMs into (gate|up) (2I, M), the SwiGLU, and the down GEMM. Here (MODE "gu", the default), with M the
+step's tokens (padded to 8):
 
 1. x (M, D) fp32 -> int8 with one scale per token, absmax / 127 (`quant_rows_kernel`; padding rows
-   are zeros with scale 0);
+   are zeros with scale 0), without the layer's TOPK input channels of the largest max |x|: those go
+   to x_k (M, TOPK) in fp32 (an LLM.int8-style decomposition; see `channels`);
 2. W_gate, W_up (I, D) NF4 -> int8 (2I, D) in their natural row-major layout, one scale per output
    row (`nf4_int8_gu_kernel`): the row's largest |w| is the largest absmax of its 64-element blocks
    (every NF4 block holds a +-1 code), so the kernel reads the row's absmax codes first and decodes
    the row with that scale in the same program: no pass over the weight, nothing kept between steps;
+   extra programs of the same launch decode the TOPK columns of both in fp32 (w_k (2I, TOPK));
 3. acc (2I, M) int32 = W_q @ x_q^T (`torch._int_mm`, "TN": x_q^T is column-major), CHUNKS products
    of 2I / CHUNKS rows each into one reused int32 buffer (the int8 weight rows are interleaved by
    chunk: gate rows of chunk k, then up rows of chunk k);
-4. `int8_gate_up_kernel`: gate and up = acc * s_w[row] * s_x[token] in fp32, rounded to half into
-   (gate|up) (2I, M), the tensor the backward keeps (offload.py moves it to the host as before), and
-   every token's absmax of silu(gate) * up per group of PG features (no atomics);
-5. `int8_hidden_kernel`: silu(gate) * up again from the half (gate|up), quantized with the token's
-   scale (the max of its group maxima) and stored transposed, (M, I) int8 token-major;
-6. W_down (D, I) NF4 -> int8 (D, I) with one scale per output row (`nf4_int8_rows_kernel`);
-7. acc (M, D) int32 = h_q @ W_down_q^T (`torch._int_mm`), and `int8_out_kernel` writes the half
-   output acc * s_h[token] * s_w[col].
+4. `int8_gate_up_kernel`: gate and up = acc * s_w[row] * s_x[token] + w_k @ x_k^T in fp32, rounded to
+   half into (gate|up) (2I, M), the tensor the backward keeps (offload.py moves it to the host as
+   before), and the SwiGLU output silu(gate) * up in half (I, M) for fused_proj's fp16 down GEMM.
+MODE "all" runs down in int8 too (`int8_hidden_kernel`, `nf4_int8_rows_kernel`, `int8_out_kernel`:
+per-token int8 of the SwiGLU output, whose peak / RMS per token is 45-95 on the real activations:
+5-12 % error of the MLP output, kept for measurements only).
 The int8 weights take the place of the fp16 rebuilds in fused_proj's shared buffer (int8 gate|up is
 exactly the size of one fp16 (I, D) weight). The int32 product of step 3 is 2I * M / CHUNKS * 4 bytes
-(transient).
+(transient; the forward MLP is the moment of the run's peak).
 
-Schedule: the kernels are compiled by a thread started at an eligible forward; the first
-START_CALLS eligible MLP forwards (eight steps of the 28-layer model) take the fp16 path, and the next
-one waits for the thread if it is not done, so which forwards run int8 never depends on timing (the
-thread starts at the COMPILE_CALLS-th, in step 2). Only
-forwards with autograd on count (the training's), no-grad forwards (Soup's rewind or generation)
-stay fp16.
+Schedule: the kernels are compiled by a thread started at the COMPILE_CALLS-th eligible forward (in
+step 2); the first START_CALLS eligible MLP forwards (eight steps of the 28-layer model) take the fp16
+path, and the next one waits for the thread if it is not done, so which forwards run int8 never
+depends on timing. Before the switch every fp16 forward records the layer's max |x| per input channel
+(`observe`); the first int8 forward of the layer fixes its TOPK channels from it for the rest of the
+run. Only forwards with autograd on count (the training's), no-grad forwards (Soup's rewind or
+generation) stay fp16.
 
 Numerics: per-token x per-row absmax int8, round half up; the backward is unchanged (it reads the
-saved (gate|up), which now carries the int8 GEMM's noise). Measured on the real model's activations by
-bench_int8_fwd.py --errors.
+saved (gate|up), which now carries the int8 GEMM's noise). On the real model's activations
+(bench_int8_fwd.py --errors) the loss of a row moves by 0.41 % on average with TOPK = 16 and 1.33 %
+without; on the T4 the training curves stay within 0.10-0.15 % of the fp16 run.
 """
 
 import atexit
