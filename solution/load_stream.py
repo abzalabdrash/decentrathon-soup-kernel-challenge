@@ -42,6 +42,12 @@ them to the GPU. If the thread fails, the main thread fills the buffer the same 
 only for the embedding of a load handled here (its key read to the CPU, a safetensors slice of the
 embedding's shape, a float dtype, no thread pool or sharding) when its pinned buffer is there.
 
+SOUP_SOLUTION_LOAD_ONE_SYNC=1: each finished layer's 4-bit tensors are copied to their pinned host buffer
+with `non_blocking=True` and weight_stream.py synchronized the device after every layer (28 waits of the
+loop for the GPU, and as many GIL retakes behind the warm-up threads). The GPU tensors they leave are
+freed in stream order, which is safe without a wait; only readers of the host copies need them complete,
+and nothing reads them before the load returns: here the load synchronizes once when it returns.
+
 SOUP_SOLUTION_LOAD_CODE_TABLE (on by default since soup-l1-v2/v4: with the warm-up shorter the main thread's
 load is on the way to the first step, -0.07..-0.27 s; =0 for bitsandbytes' own function): bitsandbytes'
 `quantize_4bit` (functional.py:936) asks
@@ -108,7 +114,9 @@ class _Pinner:
                     if self._stop:
                         break
                     try:
-                        self._made[key] = PinnedBuffer(nbytes)
+                        from .load_early import take_prepinned
+
+                        self._made[key] = take_prepinned(nbytes) or PinnedBuffer(nbytes)  # LOAD_PREPIN
                     except Exception:  # noqa: BLE001 - the consumer pins it itself
                         self._made[key] = None
                     self._ready[key].set()
@@ -164,12 +172,17 @@ class _Load:
         self.layers_moved = self.layer_bytes = self.embedding_bytes = 0
         self.layer_seconds = self.embedding_seconds = 0.0  # spent here (copies to the host, pinning)
         self.locate = locate  # LOAD_PREAD: slice -> its byte range in the file
+        # SOUP_SOLUTION_LOAD_ONE_SYNC: the layers' copies to pinned host memory are left in flight and the
+        # load synchronizes once when it returns (see the module docstring)
+        self.one_sync = _flag("SOUP_SOLUTION_LOAD_ONE_SYNC", "0")
         self.embedding_pinned = None  # the embedding's pinned buffer once its job took it
         self.embedding_fill = None  # EMBED_ASYNC: (thread, host view, slice, outcome)
         self.pinner = _Pinner(self._requests(), device)
         from .load_pinned import new_copier
 
         self.copier = new_copier(device, locate=locate)  # load_pinned.py (SOUP_SOLUTION_LOAD_PINNED=1), else None
+        if self.copier is not None:
+            self.copier.model = model  # load_spec.py's checks of each hand-over
 
     def _requests(self):
         """The pinned buffers this load will need, in the order it needs them."""
@@ -302,7 +315,8 @@ class _Load:
         started = time.perf_counter()
         try:
             pinned = self.pinner.take(id(layer))
-            self.layer_bytes += offload_loaded_layer(layer, self.device, self.only, pinned)
+            self.layer_bytes += offload_loaded_layer(layer, self.device, self.only, pinned,
+                                                     sync=not self.one_sync)
             self.layers_moved += 1
         except Exception as exc:  # noqa: BLE001 - the rest of the load stays on the GPU
             self.failed = True
@@ -604,16 +618,34 @@ def _loader(original):
                     functional.get_4bit_type = table
             except Exception:  # noqa: BLE001 - bitsandbytes' own tables then
                 table = None
+        undo_handover = None
+        from . import load_spec
+
+        if load_spec._STATE["spec"] is not None:
+            try:
+                undo_handover = load_spec.install_handover()  # LOAD_SPEC: Params4bit._quantize takes the stand-ins
+            except Exception as exc:  # noqa: BLE001 - the loop quantizes everything itself
+                load_spec.drop(f"install: {exc!r}")
         try:
             return original(*args, **kwargs)
         finally:
+            if undo_handover is not None:
+                undo_handover()
             if table is not None and functional.get_4bit_type is table:
                 functional.get_4bit_type = table._soup_original
+            if load.one_sync and load.layers_moved:
+                torch.cuda.synchronize(device)  # every layer's copy to the host is complete from here on
             _ACTIVE["load"] = None
             LAST["load"] = load
             load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on
             if load.copier is not None:
                 load.copier.close()
+            if load_spec._STATE["spec"] is not None:
+                load_spec.stop()  # joined before the pinned chunks it copies from are released
+                torch.cuda.synchronize(device)
+                report = load_spec.report()
+                if report:
+                    print(report, flush=True)
             if _early_on():
                 from .load_early import release as release_early
 

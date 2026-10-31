@@ -461,3 +461,29 @@ def test_audit_counts_training_launches_per_variant(fresh, monkeypatch, capsys):
               for line in lines}
     assert counts["example_swiglu_fwd_kernel"] >= 2 and counts["example_swiglu_bwd_kernel"] >= 2, counts
     _forget_compiled()  # the counting caches stay with this test
+
+
+def test_lower_thread_priority_only_the_calling_thread(monkeypatch):
+    """SOUP_SOLUTION_WARMUP_NICE: the calling thread's nice value goes up; the main thread's does not."""
+    import os
+    import threading
+
+    from solution import warmup
+
+    if not hasattr(os, "setpriority") or not hasattr(threading, "get_native_id"):
+        pytest.skip("no per-thread priority here")
+    main_before = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+    monkeypatch.delenv("SOUP_SOLUTION_WARMUP_NICE", raising=False)
+    assert not warmup.lower_thread_priority()  # off by default
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP_NICE", "19")
+    seen = {}
+
+    def work():
+        seen["applied"] = warmup.lower_thread_priority()
+        seen["nice"] = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join()
+    assert seen["applied"] and seen["nice"] == 19
+    assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) == main_before

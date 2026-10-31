@@ -270,6 +270,9 @@ def start(registrations, build=None):
     LAST["sources"] = len(texts)
 
     def run():
+        from .warmup import lower_thread_priority
+
+        lower_thread_priority()  # SOUP_SOLUTION_WARMUP_NICE: the one C compiler run at the warm-up's priority
         try:
             _STATE["module"] = _build_and_load(texts, build)
         except Exception as exc:  # noqa: BLE001 - every launcher takes triton's own build
