@@ -53,6 +53,7 @@ TABLE = 16  # classes per chunk table (a 4-bit code)
 # 4,096 rows: 25-33 us against 104 us for one value per lane with a gathered nibble load)
 BLOCK, WARPS = 1024, 8
 N_CLASSES = 37  # class ids: 1..31 normal exponent fields, 32..35 the subnormal classes, 36 none
+SUB_ROWS = 2048  # rows encoded at a time while building (an int32 index of 12 MiB)
 _SUBNORMAL = ((0, 0), (128, 0), (256, 1), (512, 2))  # class id 32 + k: (ADD, SH)
 
 
@@ -115,6 +116,13 @@ def classify(x16):
     cid = torch.where(sub, torch.where(sub_ok, 32 + sub_k, N_CLASSES - 1), cid)
     a = ((v >> 15) << 7) | stored
     return a.to(torch.uint8), cid.to(torch.uint8)
+
+
+def bit_tables(device):
+    """(A byte, class id) of every 16-bit pattern: two uint8 tables of 65,536 entries on `device`, so
+    that encoding a block of values is a mask and two gathers (few launches, little memory)."""
+    every = torch.arange(1 << 16, dtype=torch.int32, device=device).to(torch.int16).view(torch.float16)
+    return classify(every)
 
 
 def decode_chunk(packed, out, table, esc_pos, esc_val, n_esc, block=None, warps=None):
@@ -209,6 +217,7 @@ class HeadPack:
             g_tables = torch.empty(self.n_chunks, TABLE, dtype=torch.int32, device=dev)
             g_pos = torch.empty(self.n_chunks, MAX_ESC, dtype=torch.int32, device=dev)
             g_val = torch.empty(self.n_chunks, MAX_ESC, dtype=torch.int32, device=dev)
+            a_of, cid_of = bit_tables(dev)
             for c in range(self.n_chunks):
                 if self._stop.is_set():
                     unpin()
@@ -216,15 +225,30 @@ class HeadPack:
                 c0, vc, b0, nb = self.chunk(c)
                 x = self._source[c0:c0 + vc].to(dev, non_blocking=True)
                 n = x.numel()
-                a, cid = classify(x)
-                hist = torch.bincount(cid.int(), minlength=N_CLASSES).tolist()
+                packed = torch.empty(nb, dtype=torch.uint8, device=dev)
+                cid = torch.empty(n, dtype=torch.uint8, device=dev)
+                hist = torch.zeros(N_CLASSES, dtype=torch.int64, device=dev)
+                step = SUB_ROWS * self.hidden
+                for i in range(0, n, step):  # A plane and class ids, a block of rows at a time
+                    j = min(i + step, n)
+                    bits = x.view(-1)[i:j].view(torch.int16).to(torch.int32)
+                    bits &= 0xFFFF
+                    torch.index_select(a_of, 0, bits, out=packed[i:j])
+                    torch.index_select(cid_of, 0, bits, out=cid[i:j])
+                    hist += torch.bincount(cid[i:j], minlength=N_CLASSES)
+                hist = hist.tolist()
                 present = sorted((k for k in range(1, N_CLASSES - 1) if hist[k]), key=lambda k: -hist[k])
                 chosen = present[:TABLE]
                 lut = torch.full((N_CLASSES,), TABLE, dtype=torch.uint8)
                 for code, k in enumerate(chosen):
                     lut[k] = code
                     tables[c, code] = _entry(k)
-                code = lut.to(dev)[cid.int()]
+                lut = lut.to(dev)
+                code = torch.empty(n, dtype=torch.uint8, device=dev)
+                for i in range(0, n, step):
+                    j = min(i + step, n)
+                    torch.index_select(lut, 0, cid[i:j].int(), out=code[i:j])
+                del cid
                 escaped = torch.nonzero(code == TABLE).flatten()
                 k = escaped.numel()
                 if k > MAX_ESC:
@@ -236,8 +260,6 @@ class HeadPack:
                     esc_val[c, :k] = x.reshape(-1).view(torch.int16)[escaped].int().cpu() & 0xFFFF
                 self.n_esc[c] = k
                 self.escapes += k
-                packed = torch.empty(nb, dtype=torch.uint8, device=dev)
-                packed[:n].copy_(a)
                 pairs = code.view(-1, 2)
                 torch.bitwise_or(pairs[:, 0], pairs[:, 1] << 4, out=packed[n:])
                 g_tables[c].copy_(tables[c])
