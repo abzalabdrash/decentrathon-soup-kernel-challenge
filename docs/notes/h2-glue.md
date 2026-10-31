@@ -69,3 +69,8 @@ reserved 274 in both; own kernels 19.4 -> 20.3 %.
   backward in rmsnorm.py writing a half copy), another owner's kernel.
 - 113 scalar `add_` per step: AdamW's step counters of the 112 LoRA tensors (the optimizer: not ours to change).
 - No floor left; one clamp per step (the loss path's).
+
+What this residue is worth within the task's limits: only the attention block's cast, 28 launches per step at
+~0.05 ms of GPU each (1376 x 1536 fp32 read, half written) plus ~8 us of launch CPU: ~1.6 ms per step, ~0.1 s
+per run, below the 0.3 s the orchestrator set for another round. Stopped here (31 Oct ~21:40). H2 itself is in
+main bd5593c (f152a56 restored fused_proj.py's CRLF line endings, which the branch had turned to LF).
