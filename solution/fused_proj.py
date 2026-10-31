@@ -1719,6 +1719,7 @@ def patch_qwen2_mlp_fused():
     from transformers.models.qwen2 import modeling_qwen2 as mq
 
     cls = mq.Qwen2MLP
+    int8_fwd.compile_early()  # SOUP_SOLUTION_INT8_COMPILE=apply: the int8 kernels from now on
     if getattr(cls, "_soup_fused_proj", False):
         return
     previous = cls.forward

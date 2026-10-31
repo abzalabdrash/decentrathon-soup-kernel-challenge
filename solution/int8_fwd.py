@@ -316,6 +316,25 @@ def int8_out_kernel(acc_ptr, row_scale_ptr, col_scale_ptr, out_ptr, n_cols,
 # ---------------------------------------------------------------------------------------------
 
 
+# When the int8 kernels of both directions are compiled (SOUP_SOLUTION_INT8_COMPILE): "first" (the
+# default) by each module's thread at its first eligible MLP forward / backward, "apply" by both
+# threads started when apply() patches the MLP (`compile_early`), under the model load
+COMPILE = os.environ.get("SOUP_SOLUTION_INT8_COMPILE", "first").strip().lower()
+
+
+def compile_early():
+    """COMPILE == "apply": starts the compile threads of this module and of int8_bwd.py now (each
+    once; a module switched off compiles nothing). The switch points stay START_CALLS."""
+    if COMPILE != "apply":
+        return
+    from . import int8_bwd
+
+    if _STATE["on"] and not _READY.is_set():
+        _start_compile()
+    if int8_bwd._STATE["on"] and not int8_bwd._READY.is_set():
+        int8_bwd._start_compile()
+
+
 def _start_compile():
     """The thread that compiles the kernels (once), while the fp16 forward runs."""
     if _STATE["thread"] is not None:
