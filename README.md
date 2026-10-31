@@ -6,9 +6,12 @@ LoRA r=16 на `q_proj` и `v_proj`, batch 4, до 512 токенов на ст�
 bitsandbytes, trl и Soup: обучение то же, а время команды и пик памяти GPU меньше. Условие, правила,
 10 проверок и баллы организаторов сохранены в [docs/KIT_README.md](docs/KIT_README.md).
 
-- Публичный Kaggle-ноутбук (сохранённая версия с `COMMIT` = финальный коммит):
-  `https://www.kaggle.com/code/slerfas/soup-final-public`
-- Финальный коммит: `0b2cb75` (код заморожен на 0b2cb75; папка `solution/` совпадает с 6c426d1)
+- Публичный Kaggle-ноутбук (сохранённая версия с `COMMIT` = финальный коммит, Run All без правок):
+  https://www.kaggle.com/code/slerfas/soup-final-public
+- Финальный коммит кода: [`0b2cb75`](https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/commit/0b2cb75484fcd3d8225eaa61a36cd9d1470bfdd2)
+  (после него в репозитории менялись только README, SUBMISSION и материалы презентации; папка
+  `solution/` та же)
+- Демо-видео и слайды: [docs/presentation/](docs/presentation/)
 - Заполненная форма сдачи: [SUBMISSION.md](SUBMISSION.md)
 
 ## Итог
@@ -614,7 +617,7 @@ mem-efficient attention, поэлементные torch, наши) стек по
 ### 2.1 Kaggle-ноутбук (так перезапускает жюри)
 
 Публичный ноутбук с финальным коммитом: https://www.kaggle.com/code/slerfas/soup-final-public (сохранённая
-версия `1 (единственная сохранённая версия, COMMIT = 0b2cb75)`; Copy & Edit, затем Run All). Или с нуля:
+версия 1, в ней `COMMIT = "0b2cb75"`; Copy & Edit, затем Run All — правки не нужны). Или с нуля:
 
 1. Kaggle → **Create → New Notebook → File → Import Notebook**, файл `templates/kaggle_notebook.ipynb`.
 2. Справа: **Accelerator: GPU T4 x2**, **Internet: on** (нужен аккаунт с подтверждённым телефоном).
@@ -626,7 +629,7 @@ mem-efficient attention, поэлементные torch, наши) стек по
    Если репозиторий приватный, добавить секрет Kaggle `GITHUB_TOKEN` (Add-ons → Secrets) с токеном
    только на чтение.
 4. **Run All**. Ноутбук ставит пакеты задачи, клонирует репозиторий, готовит данные, гоняет наши тесты
-   `pytest solution` (на T4 около 7 минут: 506 прошли, 5 пропущены на f152a56), затем
+   `pytest solution` (на T4 около 7–8 минут: 518 прошли, 5 пропущены, 0 упали на 0b2cb75), затем
    `harness/run_task.py` (база и решение), `check_rules.py` и `score.py`. Всего около 12 минут.
 
 Результаты: `runs/result.json` (время, пик, eval), `runs/checks.json` (10 проверок), логи
