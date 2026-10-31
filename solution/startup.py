@@ -361,6 +361,10 @@ def patch_soup_first_step_mark():
     # apply() calls this function unconditionally, so the trainer-build switches hook in here
     # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_EARLY_ROWS, ...)
     patch_soup_trainer_build()
+    from .tracker_async import enabled as tracker_thread, patch_tracker
+
+    if tracker_thread():
+        patch_tracker()  # SOUP_SOLUTION_TRACKER_THREAD: Soup's per-log SQLite commits in a thread
     original_train = cls.train
 
     class FirstStepMark(transformers.TrainerCallback):
