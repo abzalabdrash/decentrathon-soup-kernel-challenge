@@ -68,9 +68,11 @@ _STATE = {
     "max_len": _env_int("SOUP_SOLUTION_ATTN_BWD_MAX_LEN", 256),
     "scratch": os.environ.get("SOUP_SOLUTION_ATTN_BWD_SCRATCH", "nf4").strip().lower(),
     "scratch_mb": _env_int("SOUP_SOLUTION_ATTN_BWD_SCRATCH_MB", 16),
+    # query-row blocks per bin (the products skip the causal square's upper right part above them)
+    "blocks": max(1, _env_int("SOUP_SOLUTION_ATTN_BWD_BLOCKS", 2)),
     "calls": 0, "fallbacks": 0, "shared": 0, "error": None,
 }
-ALIGN = 16  # padded sequence length: a multiple of this (16-byte aligned fp16 rows for cuBLAS)
+ALIGN = 16  # a block of query rows: a multiple of this (16-byte aligned fp16 rows for cuBLAS)
 NUM_WARPS_ROWS = 2
 
 
@@ -84,11 +86,11 @@ def enabled():
 
 @triton.jit
 def attn_bwd_gather_kernel(q_ptr, k_ptr, v_ptr, g_ptr, rowmap_ptr, qp_ptr, kp_ptr, vp_ptr, gp_ptr, LP,
-                           H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
+                           H: tl.constexpr, G: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
                            HB: tl.constexpr, GB: tl.constexpr):
-    """Row r of bin `bin` (program bin * LP + r): the H query and grad_out rows and the G key and
-    value rows of the token rowmap[bin * LP + r] (-1: none, zeros), token-major (N, heads, D) ->
-    head-major (bins, heads, LP, D)."""
+    """Row r of bin `bin` (program bin * LP + r), token rowmap[bin * LP + r] (-1: none, zeros):
+    its query and grad_out rows to (bins * G, LP, R, D), the R heads of a kv group after each other
+    for each row, and its key and value rows to (bins * G, LP, D)."""
     at = tl.program_id(0)
     bin = at // LP
     r = at % LP
@@ -99,7 +101,7 @@ def attn_bwd_gather_kernel(q_ptr, k_ptr, v_ptr, g_ptr, rowmap_ptr, qp_ptr, kp_pt
     hq = tl.arange(0, HB)[:, None]
     in_q = hq < H
     src = tok * (H * D) + hq * D + col
-    dst = ((bin * H + hq) * LP + r).to(tl.int64) * D + col
+    dst = (((bin * G + hq // R) * LP + r) * R + hq % R).to(tl.int64) * D + col
     tl.store(qp_ptr + dst, tl.load(q_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     tl.store(gp_ptr + dst, tl.load(g_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     hk = tl.arange(0, GB)[:, None]
@@ -110,36 +112,37 @@ def attn_bwd_gather_kernel(q_ptr, k_ptr, v_ptr, g_ptr, rowmap_ptr, qp_ptr, kp_pt
     tl.store(vp_ptr + dst, tl.load(v_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
 
 
-@triton.jit
-def attn_bwd_probs_kernel(s_ptr, p_ptr, seg_ptr, row0, LP, H, scale_log2e, BLOCK: tl.constexpr):
-    """One row of P = softmax(scale * S): local row `pid` of this chunk's scores is global row
-    row0 + pid = (bin * H + h) * LP + r, query row r of a bin; its keys are its own sequence's from
-    seg[bin * LP + r] (the sequence's first row in the bin; -1: no sequence, a zero row) to r."""
+@triton.jit(do_not_specialize=["e0", "r0"])
+def attn_bwd_probs_kernel(s_ptr, p_ptr, seg_ptr, e0, r0, W, LP, RT, scale_log2e,
+                          G: tl.constexpr, R: tl.constexpr, BLOCK: tl.constexpr):
+    """One row of P = softmax(scale * S) in a block of query rows r0 .. r0 + RT / R - 1 against keys
+    0 .. W - 1: local row pid is head pid % R of query row r0 + (pid % RT) // R of entry
+    e0 + pid // RT (bin entry // G); its keys run from its sequence's first row in the bin
+    (seg[bin * LP + r], -1: no sequence, a zero row) to r."""
     pid = tl.program_id(0)
-    row = row0 + pid
-    r = row % LP
-    bin = row // (H * LP)
+    r = r0 + (pid % RT) // R
+    bin = (e0 + pid // RT) // G
     first = tl.load(seg_ptr + bin * LP + r)
     j = tl.arange(0, BLOCK)
     alive = first >= 0
     keep = (j <= r) & (j >= first) & alive
-    at = pid.to(tl.int64) * LP + j
+    at = pid.to(tl.int64) * W + j
     x = tl.load(s_ptr + at, mask=keep, other=float("-inf"))
     top = tl.where(alive, tl.max(x, axis=0), 0.0)
     e = tl.exp2((x - top) * scale_log2e)
     total = tl.sum(e, axis=0)
     p = e / tl.where(total > 0.0, total, 1.0)
-    tl.store(p_ptr + at, p.to(p_ptr.dtype.element_ty), mask=j < LP)
+    tl.store(p_ptr + at, p.to(p_ptr.dtype.element_ty), mask=j < W)
 
 
 @triton.jit
-def attn_bwd_dscores_kernel(p_ptr, dp_ptr, LP, scale, BLOCK: tl.constexpr):
-    """dS = scale * P * (dP - delta) for one row, delta = sum_j P_j dP_j (the softmax's backward
-    without the attention output), written over P."""
+def attn_bwd_dscores_kernel(p_ptr, dp_ptr, W, scale, BLOCK: tl.constexpr):
+    """dS = scale * P * (dP - delta) for one row of W keys, delta = sum_j P_j dP_j (the softmax's
+    backward without the attention output), written over P."""
     row = tl.program_id(0)
     j = tl.arange(0, BLOCK)
-    inside = j < LP
-    at = row.to(tl.int64) * LP + j
+    inside = j < W
+    at = row.to(tl.int64) * W + j
     p = tl.load(p_ptr + at, mask=inside, other=0.0).to(tl.float32)
     dp = tl.load(dp_ptr + at, mask=inside, other=0.0)
     delta = tl.sum(p * dp, axis=0)
@@ -149,10 +152,11 @@ def attn_bwd_dscores_kernel(p_ptr, dp_ptr, LP, scale, BLOCK: tl.constexpr):
 
 @triton.jit
 def attn_bwd_scatter_kernel(dqp_ptr, dkp_ptr, dvp_ptr, inv_ptr, dq_ptr, dk_ptr, dv_ptr, LP,
-                            H: tl.constexpr, G: tl.constexpr, D: tl.constexpr,
+                            H: tl.constexpr, G: tl.constexpr, R: tl.constexpr, D: tl.constexpr,
                             HB: tl.constexpr, GB: tl.constexpr):
-    """Token `tok`: its rows of dQ (H heads), dK and dV (G heads) from bin row inv[tok] of the
-    head-major buffers into the token-major gradients; zeros where inv is -1 (the tail)."""
+    """Token `tok`: its rows of dQ (H heads, half, (bins * G, LP, R, D)) and of the fp32 dK and dV
+    sums ((bins * G, LP, D)) at bin row inv[tok] into the token-major half gradients; zeros where
+    inv is -1 (the tail)."""
     tok = tl.program_id(0)
     at = tl.load(inv_ptr + tok)
     live = at >= 0
@@ -162,15 +166,17 @@ def attn_bwd_scatter_kernel(dqp_ptr, dkp_ptr, dvp_ptr, inv_ptr, dq_ptr, dk_ptr, 
     col = tl.arange(0, D)[None, :]
     hq = tl.arange(0, HB)[:, None]
     in_q = hq < H
-    src = ((bin * H + hq) * LP + r).to(tl.int64) * D + col
+    src = (((bin * G + hq // R) * LP + r) * R + hq % R).to(tl.int64) * D + col
     dst = tok.to(tl.int64) * (H * D) + hq * D + col
     tl.store(dq_ptr + dst, tl.load(dqp_ptr + src, mask=in_q & live, other=0.0), mask=in_q)
     hk = tl.arange(0, GB)[:, None]
     in_k = hk < G
     src = ((bin * G + hk) * LP + r).to(tl.int64) * D + col
     dst = tok.to(tl.int64) * (G * D) + hk * D + col
-    tl.store(dk_ptr + dst, tl.load(dkp_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
-    tl.store(dv_ptr + dst, tl.load(dvp_ptr + src, mask=in_k & live, other=0.0), mask=in_k)
+    dk = tl.load(dkp_ptr + src, mask=in_k & live, other=0.0)
+    tl.store(dk_ptr + dst, dk.to(dk_ptr.dtype.element_ty), mask=in_k)
+    dv = tl.load(dvp_ptr + src, mask=in_k & live, other=0.0)
+    tl.store(dv_ptr + dst, dv.to(dv_ptr.dtype.element_ty), mask=in_k)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -235,12 +241,14 @@ class Plan:
     -1 none), seg (bin row -> its sequence's first row in the bin, -1 none) and inv (token -> bin
     row, -1 for the tail). Built once per step, copied from pinned memory without a host wait."""
 
-    __slots__ = ("bounds", "n_seq", "lp", "bins", "where", "host", "maps", "rowmap", "seg", "inv")
+    __slots__ = ("bounds", "n_seq", "blocks", "lp", "bins", "where", "host", "maps", "rowmap", "seg",
+                 "inv")
 
-    def __init__(self, bounds, n_seq, device):
+    def __init__(self, bounds, n_seq, device, blocks=None):
         self.bounds, self.n_seq = bounds, n_seq
+        self.blocks = nb = blocks or _STATE["blocks"]
         lens = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
-        self.lp = lp = -(-max(lens) // ALIGN) * ALIGN
+        self.lp = lp = -(-max(lens) // (ALIGN * nb)) * (ALIGN * nb)
         used, where = [], [None] * n_seq
         for b in sorted(range(n_seq), key=lambda i: -lens[i]):
             for i, u in enumerate(used):
@@ -274,7 +282,7 @@ _PLAN = {"key": None, "plan": None}
 
 def plan_for(bounds, n_seq, device):
     """The step's Plan, built at the first layer that asks and shared by the others."""
-    key = (bounds, n_seq, device)
+    key = (bounds, n_seq, device, _STATE["blocks"])
     if _PLAN["key"] != key:
         _PLAN["key"], _PLAN["plan"] = key, Plan(bounds, n_seq, device)
     return _PLAN["plan"]
@@ -282,44 +290,60 @@ def plan_for(bounds, n_seq, device):
 
 def math_backward(grad_out, q, k, v, plan, scale):
     """(grad_q, grad_k, grad_v) of causal attention within each real sequence of `plan`, zeros for
-    the tokens after them. grad_out, q: (1, N, H, D); k, v: (1, N, G, D); contiguous, one half dtype."""
+    the tokens after them. grad_out, q: (1, N, H, D); k, v: (1, N, G, D); contiguous, one half dtype.
+    The query rows of a bin go in NB blocks of T = LP / NB rows; block t needs keys 0 .. (t+1)T - 1
+    only (causal), so the products skip the square's upper right part."""
     _, n, heads, dim = q.shape
     groups = k.shape[2]
     per = heads // groups
-    lp, bins = plan.lp, plan.bins
+    lp, bins, nb = plan.lp, plan.bins, plan.blocks
+    rows_t = lp // nb
+    rt = per * rows_t  # rows of one block of one entry (query rows x heads of the group)
     half, device = q.dtype, q.device
-    rq, rk = bins * heads * lp * dim, bins * groups * lp * dim
-    work = torch.empty(2 * rq + 3 * rk, dtype=half, device=device)
-    qp, gp = work[:rq], work[rq:2 * rq]
-    kp, vp, dvp = work[2 * rq:2 * rq + rk], work[2 * rq + rk:2 * rq + 2 * rk], work[2 * rq + 2 * rk:]
-    hb, gb = _pow2(heads), _pow2(groups)
-    attn_bwd_gather_kernel[(bins * lp,)](q, k, v, grad_out, plan.rowmap, qp, kp, vp, gp, lp,
-                                         H=heads, G=groups, D=dim, HB=hb, GB=gb, num_warps=4)
     entries = bins * groups
-    qg, gg = qp.view(entries, per * lp, dim), gp.view(entries, per * lp, dim)
-    kg, vg, dvg = kp.view(entries, lp, dim), vp.view(entries, lp, dim), dvp.view(entries, lp, dim)
-    per_entry = per * lp * lp
-    s, p, chunk = _scratch(device, half, per_entry, entries)
-    block = _pow2(lp)
+    rq, rk = entries * lp * per * dim, entries * lp * dim
+    work = torch.empty(2 * rq + 2 * rk, dtype=half, device=device)
+    qp, gp, kp, vp = work[:rq], work[rq:2 * rq], work[2 * rq:2 * rq + rk], work[2 * rq + rk:]
+    sums = torch.empty(2 * rk, dtype=torch.float32, device=device)  # dK, dV accumulated over blocks
+    hb, gb = _pow2(heads), _pow2(groups)
+    shape = dict(H=heads, G=groups, R=per, D=dim, HB=hb, GB=gb, num_warps=4)
+    attn_bwd_gather_kernel[(bins * lp,)](q, k, v, grad_out, plan.rowmap, qp, kp, vp, gp, lp, **shape)
+    qe, ge = qp.view(entries, lp * per, dim), gp.view(entries, lp * per, dim)
+    ke, ve = kp.view(entries, lp, dim), vp.view(entries, lp, dim)
+    dke, dve = sums[:rk].view(entries, lp, dim), sums[rk:].view(entries, lp, dim)
+    s, p, chunk = _scratch(device, half, rt * lp, entries)
     log2e_scale = scale * 1.4426950408889634
+    f32 = torch.float32
     for e0 in range(0, entries, chunk):
         e1 = min(entries, e0 + chunk)
         m = e1 - e0
-        s3, p3 = s[:m * per_entry].view(m, per * lp, lp), p[:m * per_entry].view(m, per * lp, lp)
-        rows = m * per * lp
-        torch.bmm(qg[e0:e1], kg[e0:e1].transpose(1, 2), out_dtype=torch.float32, out=s3)
-        attn_bwd_probs_kernel[(rows,)](s3, p3, plan.seg, e0 * per * lp, lp, heads, log2e_scale,
-                                       BLOCK=block, num_warps=NUM_WARPS_ROWS)
-        torch.bmm(p3.transpose(1, 2), gg[e0:e1], out=dvg[e0:e1])
-        torch.bmm(gg[e0:e1], vg[e0:e1].transpose(1, 2), out_dtype=torch.float32, out=s3)
-        attn_bwd_dscores_kernel[(rows,)](p3, s3, lp, scale, BLOCK=block, num_warps=NUM_WARPS_ROWS)
-        torch.bmm(p3, kg[e0:e1], out=gg[e0:e1])  # dQ over these entries' grad_out (read above only)
-        torch.bmm(p3.transpose(1, 2), qg[e0:e1], out=vg[e0:e1])  # dK over their v (read by dP only)
+        for t in reversed(range(nb)):  # the last block first: it covers every key row
+            width = (t + 1) * rows_t
+            block = _pow2(width)
+            s3, p3 = s[:m * rt * width].view(m, rt, width), p[:m * rt * width].view(m, rt, width)
+            q_t, g_t = qe[e0:e1, t * rt:(t + 1) * rt], ge[e0:e1, t * rt:(t + 1) * rt]
+            k_w, v_w = ke[e0:e1, :width], ve[e0:e1, :width]
+            dk_w, dv_w = dke[e0:e1, :width], dve[e0:e1, :width]
+            torch.bmm(q_t, k_w.transpose(1, 2), out_dtype=f32, out=s3)
+            attn_bwd_probs_kernel[(m * rt,)](s3, p3, plan.seg, e0, t * rows_t, width, lp, rt,
+                                             log2e_scale, G=groups, R=per, BLOCK=block,
+                                             num_warps=NUM_WARPS_ROWS)
+            if t == nb - 1:
+                torch.bmm(p3.transpose(1, 2), g_t, out_dtype=f32, out=dv_w)
+            else:
+                torch.baddbmm(dv_w, p3.transpose(1, 2), g_t, out_dtype=f32, out=dv_w)
+            torch.bmm(g_t, v_w.transpose(1, 2), out_dtype=f32, out=s3)
+            attn_bwd_dscores_kernel[(m * rt,)](p3, s3, width, scale, BLOCK=block,
+                                               num_warps=NUM_WARPS_ROWS)
+            torch.bmm(p3, k_w, out=g_t)  # dQ over this block's grad_out (read above only)
+            if t == nb - 1:
+                torch.bmm(p3.transpose(1, 2), q_t, out_dtype=f32, out=dk_w)
+            else:
+                torch.baddbmm(dk_w, p3.transpose(1, 2), q_t, out_dtype=f32, out=dk_w)
     grad_q = torch.empty_like(q)
     grad_k = torch.empty_like(k)
     grad_v = torch.empty_like(v)
-    attn_bwd_scatter_kernel[(n,)](gp, vp, dvp, plan.inv, grad_q, grad_k, grad_v, lp,
-                                  H=heads, G=groups, D=dim, HB=hb, GB=gb, num_warps=4)
+    attn_bwd_scatter_kernel[(n,)](gp, dke, dve, plan.inv, grad_q, grad_k, grad_v, lp, **shape)
     return grad_q, grad_k, grad_v
 
 
@@ -396,18 +420,23 @@ def _warm():
 
     half = training_half_dtype()
     i32, f32 = torch.int32, torch.float32
-    heads = dict(H=Q_HEADS, G=KV_HEADS, D=HEAD_DIM, HB=_pow2(Q_HEADS), GB=_pow2(KV_HEADS), num_warps=4)
+    per = Q_HEADS // KV_HEADS
+    shape = dict(H=Q_HEADS, G=KV_HEADS, R=per, D=HEAD_DIM, HB=_pow2(Q_HEADS), GB=_pow2(KV_HEADS),
+                 num_warps=4)
     compile_kernel(attn_bwd_gather_kernel, half, half, half, half, i32, half, half, half, half, 208,
-                   **heads)
-    compile_kernel(attn_bwd_scatter_kernel, half, half, half, i32, half, half, half, 208, **heads)
+                   **shape)
+    compile_kernel(attn_bwd_scatter_kernel, half, f32, f32, i32, half, half, half, 208, **shape)
+    nb = _STATE["blocks"]
+    align = ALIGN * nb
     # a batch of 4 rows with at least min_tokens has a row of min_tokens / 4 or more
-    block = _pow2(-(-max(1, _STATE["min_tokens"] // 4) // ALIGN) * ALIGN)
-    while block <= _pow2(-(-_STATE["max_len"] // ALIGN) * ALIGN):
-        compile_kernel(attn_bwd_probs_kernel, f32, half, i32, 0, 208, Q_HEADS, 0.1, BLOCK=block,
-                       num_warps=NUM_WARPS_ROWS)
+    low = -(-max(1, _STATE["min_tokens"] // 4) // align) * align
+    high = -(-_STATE["max_len"] // align) * align
+    blocks = sorted({_pow2((t + 1) * lp // nb) for lp in range(low, high + 1, align) for t in range(nb)})
+    for block in blocks:
+        compile_kernel(attn_bwd_probs_kernel, f32, half, i32, 0, 0, 208, 208, 96 * 16, 0.1,
+                       G=KV_HEADS, R=per, BLOCK=block, num_warps=NUM_WARPS_ROWS)
         compile_kernel(attn_bwd_dscores_kernel, half, f32, 208, 0.1, BLOCK=block,
                        num_warps=NUM_WARPS_ROWS)
-        block *= 2
 
 
 def _report():

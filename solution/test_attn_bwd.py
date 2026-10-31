@@ -79,9 +79,10 @@ def _max_rel(a, b):
 
 @pytest.mark.parametrize("pattern", list(PATTERNS))
 @pytest.mark.parametrize("tail", [True, False])
-def test_math_backward_matches_reference_and_original(pattern, tail):
+@pytest.mark.parametrize("blocks", [1, 2, 4])
+def test_math_backward_matches_reference_and_original(pattern, tail, blocks):
     q, k, v, dout, cu, bounds, n_seq = _batch(PATTERNS[pattern], tail=tail)
-    plan = attn_bwd.Plan(bounds, n_seq, q.device)
+    plan = attn_bwd.Plan(bounds, n_seq, q.device, blocks=blocks)
     assert plan.bins == BINS[pattern]
     got = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)
     want = _reference(q, k, v, dout, bounds, n_seq)
@@ -105,7 +106,7 @@ def test_scratch_in_the_shared_buffer_and_chunks(math_on):
     own = attn_bwd.math_backward(dout, q, k, v, plan, SCALE)  # one chunk (16 MiB cap)
     key = (q.device, torch.float16)
     saved_buf, saved_held = fused_proj._BUFFERS.get(key), dict(fused_proj._HELD)
-    per_entry = 6 * plan.lp * plan.lp
+    per_entry = 6 * plan.lp // plan.blocks * plan.lp
     try:
         buf = torch.randn(13_125_000, device="cuda").half()
         fused_proj._BUFFERS[key] = buf
