@@ -83,7 +83,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import int8_bwd, nf4, rope
+from . import int8_bwd, nf4, rope, weight_stream
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -933,7 +933,7 @@ def set_mlp_recompute(on):
 
 
 class _MLPPlan:
-    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early")
+    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early", "ring")
 
 
 def _mlp_plan(mlp, x):
@@ -964,29 +964,51 @@ def _mlp_plan(mlp, x):
     m = x.numel() // hidden
     if any(_bnb_would_fuse(m, b, half, x.device) for b in (gate, up, down)):
         return None
+    ring = weight_stream.mlp_ring(gate, up, down)
+    if ring is False:  # only some of the three in weight_stream.py's type ring
+        return None
     plan = _MLPPlan()
     plan.gate, plan.up, plan.down, plan.half, plan.split = gate, up, down, half, _gate_up_split()
     plan.recompute = _MLP_MEMORY["recompute"]
     plan.early = False  # set by the patched forward (offload.EARLY)
+    plan.ring = ring  # weight_stream.py's type ring holding the three matrices, or None
     return plan
+
+
+def _ring_weights(plan, bases, device, step):
+    """_weights of MLP matrices of `plan`. With weight_stream.py's type ring (SOUP_SOLUTION_WEIGHT_RING
+    =type: one GPU slot per matrix type, shared by all layers) the compute stream first waits for
+    each matrix's copy into its slot (acquire), and once the dequantization is queued the copy of
+    the same matrices of the next layer in the pass (step +1: forward, -1: backward) starts
+    (release): the GEMMs read the dequantized buffer, not the slot."""
+    ring = plan.ring
+    if ring is None:
+        return _weights(bases, plan.half, device)
+    for base in bases:
+        ring.acquire(base, step)
+    w = _weights(bases, plan.half, device)
+    for base in bases:
+        ring.release(base, step)
+    return w
 
 
 def _gate_up_matmul(plan, left, right_t, out):
     """out (2I, ·) = [W_gate; W_up] @ right_t (`left` False) or out (·, K) = left @ [W_gate; W_up]
     (`right_t` None), with the two weights in one buffer or one after the other (split)."""
     inter = plan.gate.out_features
+    step = 1 if right_t is not None else -1  # the forward's product, or the backward's
     if not plan.split:
-        w = _weights((plan.gate, plan.up), plan.half, out.device)
+        w = _ring_weights(plan, (plan.gate, plan.up), out.device, step)
         if right_t is not None:
             return torch.mm(w, right_t, out=out)
         return torch.mm(left, w, out_dtype=torch.float32)
-    w = _weights((plan.gate,), plan.half, out.device)
+    w = _ring_weights(plan, (plan.gate,), out.device, step)
     if right_t is not None:
         torch.mm(w, right_t, out=out[:inter])
-        w = _weights((plan.up,), plan.half, out.device)
+        w = _ring_weights(plan, (plan.up,), out.device, step)
         return torch.mm(w, right_t, out=out[inter:])
     result = torch.mm(left[:, :inter], w, out_dtype=torch.float32)
-    w = _weights((plan.up,), plan.half, out.device)
+    w = _ring_weights(plan, (plan.up,), out.device, step)
     return torch.addmm(result, left[:, inter:], w, out_dtype=torch.float32)
 
 
@@ -1008,17 +1030,22 @@ def _recompute_backward(plan, x16, grad_hidden, padded):
     gate_up = torch.empty((2 * inter, padded), dtype=half, device=x16.device)
     x_t = x16.t()
     if not plan.split:
-        w = _weights((plan.gate, plan.up), half, x16.device)
+        w = _ring_weights(plan, (plan.gate, plan.up), x16.device, -1)
         torch.mm(w, x_t, out=gate_up)
         _swiglu_bwd(grad_hidden, gate_up, gate_up, inter, padded)
         return torch.mm(gate_up.t(), w, out_dtype=torch.float32)
+    ring = plan.ring
+    if ring is not None:  # up is dequantized twice here: it keeps its slot until the second time
+        ring.acquire(plan.up, -1)
     w = _weights((plan.up,), half, x16.device)
     torch.mm(w, x_t, out=gate_up[inter:])
-    w = _weights((plan.gate,), half, x16.device)
+    w = _ring_weights(plan, (plan.gate,), x16.device, -1)
     torch.mm(w, x_t, out=gate_up[:inter])
     _swiglu_bwd(grad_hidden, gate_up, gate_up, inter, padded)
     result = torch.mm(gate_up[:inter].t(), w, out_dtype=torch.float32)
     w = _weights((plan.up,), half, x16.device)
+    if ring is not None:
+        ring.release(plan.up, -1)
     return torch.addmm(result, gate_up[inter:].t(), w, out_dtype=torch.float32)
 
 
@@ -1053,7 +1080,7 @@ class _MLP(torch.autograd.Function):
         count = inter * padded
         example_swiglu_fwd_kernel[(triton.cdiv(count, SWIGLU_BLOCK),)](
             gate_up[:inter], gate_up[inter:], hidden, count, BLOCK=SWIGLU_BLOCK)
-        w = _weights((plan.down,), half, x.device)
+        w = _ring_weights(plan, (plan.down,), x.device, 1)
         out = torch.mm(hidden.t(), w.t())  # (padded, D)
         # recompute: x16 (N x 1536 half) instead of (gate|up) (2 x 8960 x N half), 12x less, or not
         # even x16 when it is rebuilt from the post-attention norm's saved tensors (rmsnorm.rebuild)
@@ -1075,11 +1102,16 @@ class _MLP(torch.autograd.Function):
             # SOUP_SOLUTION_INT8_BWD=1: both input-gradient GEMMs on int8 tensor cores, the int8
             # weights in the shared buffer, (gate|up) overwritten with its gradient
             buffer = _buffer(grad.device, half, plan.down.out_features * plan.down.in_features)
+            matrices = (plan.down, plan.gate, plan.up) if plan.ring is not None else ()
+            for base in matrices:  # it reads the three (scales, int8 decode) in one go
+                plan.ring.acquire(base, -1)
             grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer)[:n]
+            for base in matrices:
+                plan.ring.release(base, -1)
             if ctx.x_dtype != torch.float32:
                 grad_x = grad_x.to(ctx.x_dtype)
             return grad_x.view(ctx.x_shape), None
-        w = _weights((plan.down,), half, grad.device)
+        w = _ring_weights(plan, (plan.down,), grad.device, -1)
         grad_hidden = torch.mm(w.t(), grad16.t())  # (I, padded)
         if plan.recompute:
             grad_x = _recompute_backward(plan, saved, grad_hidden, padded)
@@ -1158,6 +1190,7 @@ def patch_qwen2_mlp_fused():
     def forward(self, x):
         plan = _mlp_plan(self, x)
         if plan is None:
+            weight_stream.mlp_unmanaged(self)  # a type ring loads this layer's matrices for it
             return previous(self, x)
         from .offload import DRAIN_LAST, EARLY, drain_inflight
 
@@ -1167,6 +1200,7 @@ def patch_qwen2_mlp_fused():
                 drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 
+    forward._soup_weight_ring = True  # weight_stream.py: the matrices' reads go through acquire()
     if "_soup_original_forward" not in vars(cls):
         cls._soup_original_forward = previous
     cls._soup_fused_proj_previous = previous
