@@ -49,6 +49,8 @@ import os
 import torch
 import torch.nn.functional as F
 
+from . import attn_bwd
+
 
 def _env_flag(name, default):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
@@ -245,6 +247,7 @@ class _VarlenAttention(torch.autograd.Function):
             recompute.attention_taken(cu, max_len, scale, q, k, v, out, lse)
             ctx.save_for_backward(cu)
         ctx.args = (seed, offset, max_len, scale, groups)
+        ctx.seqs = attn_bwd.taken(cu)  # SOUP_SOLUTION_ATTN_BWD=math: this step's boundaries
         return out
 
     @staticmethod
@@ -258,6 +261,9 @@ class _VarlenAttention(torch.autograd.Function):
             q, k, v, out, lse, seed, offset = ctx.recompute.attention_tensors()
             ctx.recompute = None
         grad_out = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+        grads = attn_bwd.backward(grad_out, q, k, v, cu, ctx.seqs, scale)  # None: the original
+        if grads is not None:
+            return (*grads, None, None, None, None)
         grad_q, grad_k, grad_v, _ = _efficient_backward(
             grad_out, q, _expand_heads(k, groups), _expand_heads(v, groups), out, cu, max_len, lse,
             seed, offset, scale)
@@ -355,6 +361,7 @@ def patch_qwen2_attention():
     cls = mq.Qwen2Attention
     if getattr(cls, "_soup_varlen", False):
         return
+    attn_bwd.register_warmup()  # SOUP_SOLUTION_ATTN_BWD=math only
     original = cls.forward
 
     def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,

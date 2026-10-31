@@ -342,9 +342,22 @@ def _warm():
                        SB=sb, num_warps=4)
 
 
+def _report():
+    st = stats()
+    print(f"[solution] attention math backward: {st['calls']} layer calls ({st['shared']} with the "
+          f"scratch in the shared buffer), {st['fallbacks']} to the original backward"
+          + (f", off after {st['error']}" if st["error"] else ""), flush=True)
+
+
 def register_warmup():
-    if _STATE["mode"] != "math":
+    """unpad.patch_qwen2_attention: with SOUP_SOLUTION_ATTN_BWD=math, the kernels' warm-up and a log
+    line at exit."""
+    if _STATE["mode"] != "math" or _STATE.get("registered"):
         return
+    _STATE["registered"] = True
+    import atexit
+
+    atexit.register(_report)
     try:
         from .warmup import register
     except ImportError:
