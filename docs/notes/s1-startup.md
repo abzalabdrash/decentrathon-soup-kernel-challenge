@@ -94,3 +94,51 @@ Left: decide defaults from v4/v5; one ABBA session of new defaults vs old; `--mo
 the switches that stay on (embedding cast in a thread, preadv staging, light triton key, shared
 entry points); tests for these switches pass locally (targeted), the full `pytest solution` goes to
 Kaggle/Modal (Modal runner: tools/modal_run.py on main, profile tripleacodex for this task).
+
+## Continuation (branch claude/s1-startup-2, from d7d5278, main ce27a54 merged in 4aa84d4)
+
+### soup-s1-v4 and soup-s1-v5, phases from `apply begin` (means of 2 ABBA rounds after a warm run)
+
+Columns: apply end / Soup setup begin / setup end / train begin / first step begin / warm-up length /
+waited for the warm-up / tensor loop / staging / loop waited for staging / step 0 / wall.
+
+soup-s1-v4 (peagverr, 836ec72):
+- base 3.36 / 3.87 / 7.35 / 9.15 / 9.30 / 5.33 / 0.00 / 2.18 / 0.99 / 0.17 / 0.53 / 44.73
+- embed 3.34 / 3.86 / 6.93 / 9.05 / 9.21 / 5.74 / 0.15 / 1.84 / 1.08 / 0.27 / 0.54 / 45.04
+- tk 3.30 / 3.74 / 7.20 / 9.07 / 9.23 / 5.54 / 0.00 / 2.19 / 1.12 / 0.18 / 0.53 / 45.17
+- ep 3.30 / 3.83 / 7.37 / 9.20 / 9.30 / 5.25 / 0.00 / 2.30 / 1.02 / 0.15 / 0.55 / 45.20
+- etk 3.18 / 3.67 / 6.86 / 8.79 / 8.88 / 5.48 / 0.07 / 1.89 / 1.17 / 0.23 / 0.54 / 44.63
+- etkp (+ p2p probes + code table) 3.22 / 3.73 / 6.84 / 8.68 / 8.77 / 5.42 / 0.00 / 1.74 / 1.16 / 0.56 / 0.53 / 44.64
+- etks (+ WARMUP_SKIP=step_ops) 3.25 / 3.75 / 6.88 / 8.69 / 8.80 / 5.24 / 0.00 / 1.92 / 1.10 / 0.23 / 0.70 / 44.88
+
+soup-s1-v5 (namedesign, dfe0d65):
+- base 3.34 / 3.85 / 7.36 / 9.12 / 9.28 / 5.28 / 0.00 / 2.16 / 0.97 / 0.17 / 0.53 / 46.48
+- pread 3.35 / 3.85 / 7.04 / 8.95 / 9.11 / 5.54 / 0.00 / 2.00 / 0.71 / 0.05 / 0.54 / 46.78
+- etk 3.19 / 3.71 / 6.77 / 8.80 / 8.90 / 5.65 / 0.11 / 1.88 / 1.14 / 0.31 / 0.54 / 46.54
+- etkr (+ pread) 3.17 / 3.70 / 6.85 / 8.78 / 8.88 / 5.56 / 0.04 / 1.81 / 0.89 / 0.17 / 0.53 / 46.55
+- etkrc (+ code table + p2p) 3.24 / 3.76 / 6.72 / 8.86 / 8.96 / 5.67 / 0.25 / 1.69 / 0.98 / 0.44 / 0.56 / 46.80
+- etkrs (+ skip step_ops) 3.21 / 3.69 / 6.79 / 8.71 / 8.82 / 5.36 / 0.04 / 1.92 / 0.93 / 0.20 / 0.68 / 46.72
+
+Reading: the three switches together (etk) bring the first step 0.42 s (v4) and 0.38 s (v5) earlier,
+more than the sum of each alone (embed -0.09, tk -0.07, ep 0.00): on the 4-vCPU box the CPU the
+light key frees during apply and the embedding's cast off the main thread add up. The peak is
+401 MiB in every run; walls are within the loop's noise (train_loop_s varies by +-0.3 s between
+runs of one variant). LOAD_PREAD alone -0.17 s, on top of etk -0.02 s (its embedding fill from the
+file takes 0.74 s against 0.33 s in the thread, and the loop now waits on the warm-up, not on
+staging). The code table with p2p probes: loop -0.12 s but the load waits longer for staging and
+the train waits 0.25 s for the warm-up: no gain. Skipping step_ops: first step -0.06..-0.08 s,
+step 0 +0.15..+0.17 s: a loss. With etk the warm-up (apply end + 5.5-5.7 s) ends together with
+train begin (waits 0.07-0.11 s): from here the warm-up and the main thread are both on the
+critical path.
+
+Registration times of the warm-up on the T4 (26 runs of v4 and v5, seconds, two workers):
+head_stream_kernels 1.68, rms_norm_rows_fwd 1.36, rope_qk_kernel 1.01, fused_proj_nf4_dequant3
+0.82, nf4_dequant_kernel 0.79, rms_norm_rows_bwd 0.75, fused_proj_x16_rebuild 0.73,
+rms_norm_rows_bwd_split 0.62, example_swiglu_fwd_kernel 0.52, step_ops 0.51,
+example_swiglu_bwd_kernel 0.42, fused_proj_masked_pair_sum 0.40, cublas 0.22 (sum 9.8 s). A
+two-worker list schedule of these costs gives 5.04 s in registration order and 5.06 s longest first
+(lower bound 4.9 s): WARMUP_ORDER=longest no longer helps, and splitting registrations would not
+either. What is left: fewer or cheaper compiles, an earlier start, or more workers.
+
+Decided (0b1bba7): EMBED_ASYNC, TRITON_KEY=light, ENTRY_POINTS on by default; EARLY_PROBES,
+LOAD_CODE_TABLE, WARMUP_SKIP off.

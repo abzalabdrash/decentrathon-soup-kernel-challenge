@@ -825,9 +825,15 @@ def _probe_registrations():
     try:
         from . import fused_proj, head_stream, rmsnorm
 
+        # fused_proj.py registers one of its two dequantization kernels (its _CPU flags, read from the
+        # environment at its import): nf4_dequant4 with the CPU diet's weight reuse (the default)
+        cpu = getattr(fused_proj, "_CPU", {})
+        dequant = (("fused_proj_nf4_dequant4", fused_proj._warm_dequant4)
+                   if cpu.get("diet") and cpu.get("reuse") and hasattr(fused_proj, "_warm_dequant4")
+                   else ("fused_proj_nf4_dequant3", fused_proj._warm_dequant3))
         out += [("fused_proj_x16_rebuild", rmsnorm.warm_rebuild),
                 ("fused_proj_masked_pair_sum", fused_proj._warm_masked_pair_sum),
-                ("fused_proj_nf4_dequant3", fused_proj._warm_dequant3),
+                dequant,
                 ("rms_norm_rows_bwd_split", rmsnorm.warm_bwd_split),
                 ("head_stream_kernels", functools.partial(head_stream._warm_kernels, head_stream._config()[0]))]
     except Exception:  # noqa: BLE001 - this file's registrations only
