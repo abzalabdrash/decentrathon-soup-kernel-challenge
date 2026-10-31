@@ -162,6 +162,73 @@ def profile_heads(streamer, n, frac, resident, label):
             f"{name} x{cnt} {ms:.2f}" for ms, name, cnt in rows[:9]), flush=True)
 
 
+def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):
+    """One head's worth of each chunk kernel variant on synthetic chunks, ms (FIRST=False launches)."""
+    import triton
+
+    from .fused_ce import IGNORE_INDEX
+    from .head_int8 import head_i8_chunk_kernel, head_i8_rows_kernel, int8_transpose_kernel
+    from .head_stream import BLOCK_D, head_chunk_kernel
+
+    dev = "cuda"
+    n_lab = max(int(n * frac), 1)
+    gen = torch.Generator(device=dev).manual_seed(n)
+    l32 = torch.randint(-200000, 200000, (n, rows), dtype=torch.int32, device=dev, generator=gen)
+    l16 = (torch.randn(n, rows, device=dev, generator=gen) * 3).half()
+    sv = torch.rand(rows, device=dev, generator=gen) * 1e-3 + 3e-4
+    sh = torch.rand(n, device=dev, generator=gen) * 1e-4 + 1e-4
+    targets = torch.randint(0, rows * 2, (n,), device=dev, generator=gen)
+    targets[n_lab:] = IGNORE_INDEX
+    state = torch.zeros(5, n, device=dev)
+    state[0] = 2.0
+    state[1] = 1.0
+    idx = torch.zeros(n, dtype=torch.int32, device=dev)
+    pq = torch.empty(n_lab, rows, dtype=torch.int8, device=dev)
+    asp = torch.empty(2, n_lab, device=dev)
+    q = torch.randint(-127, 127, (rows, d), dtype=torch.int8, device=dev, generator=gen)
+    w16 = torch.randn(rows, d, device=dev, generator=gen).half()
+    wt = torch.empty(n_lab, d, dtype=torch.float16, device=dev)
+    acc = torch.zeros(n_lab, d, device=dev)
+    svm = sv.max().reshape(1).repeat(4)
+    qt = torch.empty(d, rows, dtype=torch.int8, device=dev)
+    block = triton.next_power_of_2(rows)
+    m, s_, e, best, xt = state
+    res = {}
+
+    def fp16(w):
+        for _ in range(chunks):
+            head_chunk_kernel[(n,)](l16, rows, targets, m, s_, e, best, xt, idx, acc, d, w16, d, wt, d,
+                                    0, rows, n_lab, d, FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block,
+                                    BLOCK_D=BLOCK_D, num_warps=w)
+
+    def one(w, pb):
+        for _ in range(chunks):
+            head_i8_chunk_kernel[(n,)](l32, rows, 0, pq, rows, sh, sv, targets, m, s_, e, best, xt, idx,
+                                       asp[0], asp[1], q, d, wt, d, svm, 1, 0, rows, n_lab, d,
+                                       FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D,
+                                       PBOUND=pb, num_warps=w)
+
+    def multi(r, w, pb):
+        for _ in range(chunks):
+            head_i8_rows_kernel[(triton.cdiv(n, r),)](
+                l32, rows, 0, n, pq, rows, sh, sv, targets, m, s_, e, best, xt, idx, asp[0], asp[1],
+                q, d, wt, d, svm, 1, 0, rows, n_lab, d, FIRST=False, IGNORE=IGNORE_INDEX, BLOCK=block,
+                BLOCK_D=BLOCK_D, PBOUND=pb, R=r, num_warps=w)
+
+    for w in (8, 16):
+        res[f"fp16 kernel w{w}"] = _timed(lambda: fp16(w), reps)
+    for w in (4, 8, 16):
+        for pb in (False, True):
+            res[f"int8 1 row w{w}{' pbound' if pb else ''}"] = _timed(lambda: one(w, pb), reps)
+    for r, w in ((2, 8), (2, 16), (4, 16), (4, 32), (8, 32)):
+        for pb in (False, True):
+            res[f"int8 {r} rows w{w}{' pbound' if pb else ''}"] = _timed(lambda: multi(r, w, pb), reps)
+    for t, w in ((32, 4), (64, 4), (64, 8), (128, 8), (128, 16)):
+        res[f"transpose T{t} w{w}"] = _timed(lambda: [int8_transpose_kernel[(triton.cdiv(rows, t), triton.cdiv(d, t))](
+            q, qt, rows, d, T=t, num_warps=w) for _ in range(chunks)], reps)
+    return res
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tokens", default="512,830,1440,2048")
@@ -171,6 +238,7 @@ def main():
     parser.add_argument("--gemms", type=int, default=1)
     parser.add_argument("--profile", type=int, default=0, help="1: per-kernel GPU time instead of the sweep")
     parser.add_argument("--fwd-rows", default="512")
+    parser.add_argument("--kernels", type=int, default=0, help="1: the chunk kernel variants only")
     args = parser.parse_args()
     import types
 
@@ -180,6 +248,13 @@ def main():
     tokens = [int(x) for x in re.split(r"[,/]", args.tokens)]
     fracs = [float(x) for x in re.split(r"[,/]", args.frac)]
     print(torch.cuda.get_device_name(0), flush=True)
+    if args.kernels:
+        for n in tokens:
+            for frac in fracs:
+                res = bench_kernels(n, frac)
+                print(f"kernels per head N {n} lab {frac}: " + ", ".join(f"{k} {v:.2f}" for k, v in res.items()),
+                      flush=True)
+        return
     if args.gemms:
         for n in tokens:
             for frac in fracs:

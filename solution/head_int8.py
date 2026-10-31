@@ -66,6 +66,8 @@ ACC_BLOCK = 512
 # hidden rows per forward GEMM: the int32 logits of a chunk (FWD_ROWS x 4096 x 4 bytes, 16 MiB) are
 # twice the fp16 head's per row, so long steps take the forward in blocks of rows
 PBOUND = os.environ.get("SOUP_SOLUTION_HEAD_INT8_PBOUND", "0").strip().lower() not in ("0", "false", "no", "")
+RPP = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_RPP", "1"))  # rows per program of the chunk kernel
+WARPS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARPS", "0"))  # 0: head_stream's choice (x RPP)
 FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "1024")) // 8 * 8, 24)
 
 
@@ -176,6 +178,84 @@ def head_i8_chunk_kernel(
                 tl.store(wt_row + od, w.to(wt_ptr.dtype.element_ty), mask=md)
 
 
+@triton.jit(do_not_specialize=["row0", "n_rows", "chunk", "c0", "vc", "n_lab"])
+def head_i8_rows_kernel(
+    l32_ptr, stride_l, row0, n_rows,  # as head_i8_chunk_kernel, R rows per program (n_rows in the block)
+    pq_ptr, stride_pq, sh_ptr, sv_ptr, targets_ptr,
+    m_ptr, s_ptr, e_ptr, best_ptr, xt_ptr, idx_ptr, alpha_ptr, sp_ptr,
+    q_ptr, stride_q, wt_ptr, stride_wt, svm_ptr, chunk,
+    c0, vc, n_lab, D,
+    FIRST: tl.constexpr, IGNORE: tl.constexpr, BLOCK: tl.constexpr, BLOCK_D: tl.constexpr,
+    PBOUND: tl.constexpr, R: tl.constexpr,
+):
+    # head_i8_chunk_kernel for R rows at once: the chunk's s_v is loaded once for them, and the
+    # reductions of the R rows share their barriers
+    local = tl.program_id(0) * R + tl.arange(0, R)
+    live = local < n_rows
+    row = row0 + local
+    offs = tl.arange(0, BLOCK)
+    mask = offs < vc
+    m2 = live[:, None] & mask[None, :]
+    sv = tl.load(sv_ptr + offs, mask=mask, other=0.0)
+    sh = tl.load(sh_ptr + row, mask=live, other=0.0)
+    base = l32_ptr + local.to(tl.int64)[:, None] * stride_l
+    xi = tl.load(base + offs[None, :], mask=m2, other=0)
+    target = tl.load(targets_ptr + row, mask=live, other=IGNORE)
+    t_local = target - c0
+    hit = live & (target != IGNORE) & (t_local >= 0) & (t_local < vc)
+    t_safe = tl.where(hit, t_local, 0)
+    sv_t = tl.load(sv_ptr + t_safe, mask=hit, other=0.0)
+    x_hit = tl.load(l32_ptr + local.to(tl.int64) * stride_l + t_safe, mask=hit, other=0).to(tl.float32) * (sh * sv_t)
+    x = tl.where(m2, xi.to(tl.float32) * (sh[:, None] * sv[None, :]), -float("inf"))
+    c_max, c_idx = tl.max(x, axis=1, return_indices=True, return_indices_tie_break_left=True)
+    if FIRST:
+        m_old = tl.full([R], -float("inf"), tl.float32)
+        s = tl.zeros([R], tl.float32)
+        e = tl.zeros([R], tl.float32)
+        best = tl.full([R], -float("inf"), tl.float32)
+        best_idx = tl.zeros([R], tl.int32)
+        x_t = tl.zeros([R], tl.float32)
+    else:
+        m_old = tl.load(m_ptr + row, mask=live, other=0.0)
+        s = tl.load(s_ptr + row, mask=live, other=0.0)
+        e = tl.load(e_ptr + row, mask=live, other=0.0)
+        best = tl.load(best_ptr + row, mask=live, other=0.0)
+        best_idx = tl.load(idx_ptr + row, mask=live, other=0)
+        x_t = tl.load(xt_ptr + row, mask=live, other=0.0)
+    m_new = tl.maximum(m_old, c_max)
+    alpha = tl.exp(m_old - m_new)
+    p = tl.exp(x - m_new[:, None])
+    s = s * alpha + tl.sum(p, axis=1)
+    e = e * alpha + tl.sum(p * tl.where(m2, x, 0.0), axis=1)
+    best_idx = tl.where(c_max > best, c0 + c_idx, best_idx)
+    best = tl.maximum(best, c_max)
+    x_t = tl.where(hit, x_hit, x_t)
+    tl.store(m_ptr + row, m_new, mask=live)
+    tl.store(s_ptr + row, s, mask=live)
+    tl.store(e_ptr + row, e, mask=live)
+    tl.store(best_ptr + row, best, mask=live)
+    tl.store(idx_ptr + row, best_idx, mask=live)
+    tl.store(xt_ptr + row, x_t, mask=live)
+    lab = live & (row < n_lab)
+    u = p * sv[None, :]
+    if PBOUND:
+        u_max = tl.exp(c_max - m_new) * tl.load(svm_ptr + chunk)
+    else:
+        u_max = tl.max(u, axis=1)
+    inv = tl.where(u_max > 0.0, 127.0 / u_max, 0.0)
+    pq = tl.minimum(tl.floor(u * inv[:, None] + 0.5), 127.0).to(tl.int8)
+    tl.store(pq_ptr + row.to(tl.int64)[:, None] * stride_pq + offs[None, :], pq, mask=lab[:, None] & mask[None, :])
+    tl.store(sp_ptr + row, u_max / 127.0, mask=lab)
+    tl.store(alpha_ptr + row, alpha, mask=lab)
+    copy = lab & hit
+    for d0 in range(0, D, BLOCK_D):
+        od = d0 + tl.arange(0, BLOCK_D)
+        md = copy[:, None] & (od < D)[None, :]
+        w = tl.load(q_ptr + t_safe[:, None] * stride_q + od[None, :], mask=md, other=0).to(tl.float32)
+        tl.store(wt_ptr + row.to(tl.int64)[:, None] * stride_wt + od[None, :],
+                 (w * sv_t[:, None]).to(wt_ptr.dtype.element_ty), mask=md)
+
+
 @triton.jit
 def int8_transpose_kernel(src_ptr, dst_ptr, n_rows, n_cols, T: tl.constexpr):
     # src (n_rows, n_cols) row-major -> dst (n_cols, n_rows) row-major, one T x T tile per program
@@ -241,7 +321,7 @@ class HeadInt8:
         self.block = triton.next_power_of_2(self.rows)
         from .head_stream import _num_warps
 
-        self.num_warps = _num_warps(self.block)
+        self.num_warps = WARPS if WARPS in (1, 2, 4, 8, 16, 32) else min(_num_warps(self.block) * RPP, 32)
         self.ready, self.error, self.seconds = False, None, 0.0
         self.calls = 0  # heads that asked (take())
         self.log = log
@@ -401,6 +481,13 @@ class HeadInt8:
             gemms, p_q = chunk
             for (b0, nb), (h_b, logits) in zip(blocks, gemms):
                 torch._int_mm(h_b, q.t(), out=logits)
+                if RPP > 1:
+                    head_i8_rows_kernel[(triton.cdiv(nb, RPP),)](
+                        logits, vc, b0, nb, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, alpha, sp,
+                        q, d, wt, wt.stride(0), self.sv_max, c, c0, vc, n_lab, d,
+                        FIRST=c == 0, IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D,
+                        PBOUND=PBOUND, R=RPP, num_warps=self.num_warps)
+                    continue
                 head_i8_chunk_kernel[(nb,)](
                     logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, alpha, sp,
                     q, d, wt, wt.stride(0), self.sv_max, c, c0, vc, n_lab, d,
@@ -463,6 +550,11 @@ def warm_kernels(obj=None):
     warps = obj.num_warps if obj is not None else 8
     # stride_l = rows of the chunk (4096 and the last 384: divisible by 16), the hidden size 1536
     for first in (True, False):
+        if RPP > 1:
+            compile_kernel(head_i8_rows_kernel, i32, rows, 0, 512, i8, rows, f32, f32, i64, f32, f32, f32, f32,
+                           f32, i32, f32, f32, i8, hidden, half, hidden, f32, 3, 0, rows, 387, hidden,
+                           FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, PBOUND=PBOUND,
+                           R=RPP, num_warps=warps)
         compile_kernel(head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
                        f32, f32, i8, hidden, half, hidden, f32, 3, 0, rows, 387, hidden,
                        FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, PBOUND=PBOUND,

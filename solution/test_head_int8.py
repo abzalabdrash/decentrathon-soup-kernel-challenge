@@ -226,6 +226,22 @@ def test_bounded_p_scale(streamed, monkeypatch):
         assert err < 2e-2, err
 
 
+@pytest.mark.parametrize("rpp,pbound", [(2, False), (4, True), (8, False)])
+def test_rows_per_program_kernel(streamed, monkeypatch, rpp, pbound):
+    """head_i8_rows_kernel (R rows per program) gives head_i8_chunk_kernel's bits."""
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(701, 0.6, 2.0, seed=rpp)
+    monkeypatch.setattr(head_int8, "PBOUND", pbound)
+    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    monkeypatch.setattr(head_int8, "RPP", rpp)
+    monkeypatch.setattr(head_int8, "FWD_ROWS", 256)
+    b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    for name, x, y in zip(("loss", "entropy", "correct", "dh"), a, b):
+        assert torch.allclose(x.float(), y.float(), rtol=1e-6, atol=1e-6), name
+
+
 def test_nn_backward_matches_transposed(streamed, monkeypatch):
     from solution import head_int8
 
