@@ -111,7 +111,9 @@ would save (1 - labelled share) of that, ~0.1 s per run at best, below one sessi
 needs a gather/scatter through fused_proj's `_MLP`, the offload of gate|up and int8_bwd (C1's files
 today). Not worth the risk on the last day.
 
-(ii) `SOUP_SOLUTION_NORM_HALF=1` (review 2, section 4.2; R3's row "float16_copy"): the decoder
+(ii) `SOUP_SOLUTION_NORM_HALF=1` (review 2, section 4.2; R3's row "float16_copy"), in the branch, off,
+not measured on the T4: the orchestrator stopped both fallback items before the ABBA (fused_proj.py
+and rmsnorm.py belong to C1 today) and moved me to the save tail (`docs/notes/save-tail.md`). The decoder
 layer's input norm and post-attention norm write their output's half copy in the same kernel
 (`rmsnorm.rms_norm_rows_fwd_half`), attached to the fp32 output; `_QKVRope` and `_MLP` take it through
 `rmsnorm.half_of` instead of `x.to(half)` (fused_proj.py: two lines and the import). The final norm
