@@ -204,15 +204,32 @@ Before the rescoring and the correction (2e5e2ac): accuracy 0.68-0.89 %, rewind 
 What remains of the accuracy gap is the trajectory (dL/dh 7-10 % from the fp16 head's, through P of int8 logits),
 not flips: at 0.44-0.50 % it sits at the 0.5 % line on seed 139.
 
-## Summary (31 Oct ~18:15)
+## Final runs on d3d3f65 (b024044 only fixes a test)
 
-- Code 693af66 (local: GitHub pushes from this laptop hang in the credential manager since 17:47; last pushed
-  73796c4 has the +22 MiB build-stream bug, 7b67a32 is the last pushed commit without it). Default: on in every
-  process (conftest pins the fp16 head for solution's tests), the first five heads fp16, build at the first head.
-  `SOUP_SOLUTION_HEAD_INT8=0` turns it off.
-- Accuracy: forward-only flips fixed (rescoring), loss/rewind corrected to first order; jury seeds 139 and 149: 10/10,
-  eval +0.016/+0.020 %, loss 0.08 %, entropy 0.18-0.34 %, accuracy 0.38-0.50 %, rewind 0.27-0.33 %.
-- Speed: steps after the switch -6.6..-15.6 ms per step on Kaggle; the build thread's compilations cost steps 0-4
-  +0.3..+0.46 s; wall -0.41 s on a Modal x16 host (73796c4), +0.10 s in one Kaggle session (7b67a32). The -0.5 s
-  wall criterion is not met reliably.
-- Not done: the 693af66 peak fix measured on the T4, full + two juries on 693af66, variant B (resident head).
+- soup-h1-full5 (Kaggle): **10/10**; base 86.8 s / 14,345 MiB, ours 48.6 s / 395 MiB (reserved 274: the build-stream
+  fix holds), check 6: first step 0.01 %, mean of all steps 0.09 %; check 7: eval +0.022 %; curves loss 0.092 %,
+  entropy 0.328 %, accuracy 0.308 %, rewind 0.305 %. pytest on the T4: 456 passed, 3 failed:
+  test_weight_stream::test_stream_memory (fails on main m9 too), test_head_int8::test_build_allocates_nothing_on_its_stream
+  (too strict in the full suite: fixed in b024044), test_boundary::test_layer_slices_keep_the_lists (also in
+  soup-h1-full3; not on main: boundary's cache keys on module ids, and a new ModuleList that reuses a dead module's
+  id bumps the generation, so it depends on the allocation history of the tests before it, which this branch's
+  conftest fixture changes; to fix in test_boundary.py, not this branch's file).
+- Modal h1-jury6 (seed 149, rows 26000/44000): **10/10**; s 1.744, eval +0.014 %, check 6: 0.00 / 0.09 %, curves loss
+  0.088 / 0.085 %, entropy 0.186 / 0.163 %, accuracy 0.419 / 0.462 %, rewind 0.307 / 0.286 %; reserved 292-294
+  (as 7b67a32 on Kaggle).
+- Modal h1-abba7 (PCIe x16, ABBA 3 rounds): fp16 49.41 s / steps 3+ 27.46 / step 0 0.696; **int8 49.97 (+0.56) /
+  27.54 / 0.889**; peak 396 both. Steps 0-5 +0.52 s (the build thread), steps 6+ -0.19 s (-3.3 ms per step; ce85dc8
+  before the accuracy work: -15.6 ms per step in soup-h1-abba3).
+
+## Summary (31 Oct ~18:40)
+
+- Accuracy criteria met on the final code: full + two juries 10/10, |delta eval| 0.014-0.022 %, every curve
+  <= 0.5 % (accuracy 0.31-0.50 %, the closest), first steps on the fp16 head (first step 0.00-0.01 %).
+- Speed criterion not met: with the rescoring, the runner-up and the loss correction the head gains 3-7 ms per
+  step after the switch, and the build thread (compilation of four kernels, 1.7-2.2 s, sharing the GIL with steps
+  0-4) costs +0.3..+0.5 s: wall +0.10 s (Kaggle soup-h1-abba4, 7b67a32) and +0.56 s (Modal x16 h1-abba7, d3d3f65).
+  Verdict: no-go as the default; the default is "0" on the branch since its last commit (the code is ready behind
+  SOUP_SOLUTION_HEAD_INT8=1; all runs above had it on).
+- What would turn it: the build's compilations off the steps (they cost 0.1 s per step for five steps), and the
+  runner-up / rescore cost per step (measured 0.8-1.3 ms + the extra reduction; the rest of the drop from -15.6 to
+  -3.3 ms per step is unexplained and session-dependent).

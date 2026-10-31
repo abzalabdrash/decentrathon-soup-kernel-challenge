@@ -4,7 +4,7 @@ int8_bwd.py runs the MLP backward on int8 tensor cores by default, in every proc
 tests of the fp16 path (test_fused_proj.py and the tests of the modules built on it) compare against
 plain PyTorch, so every test starts with the int8 backward off; the int8 path has its own tests
 (test_int8_bwd.py, fixture `int8_on`), which switch it on explicitly. The same for the int8 head
-(head_int8.py, on by default): every test starts with the fp16 streamed head (test_head_stream.py
+(head_int8.py, off by default, on with SOUP_SOLUTION_HEAD_INT8=1): every test starts with the fp16 streamed head (test_head_stream.py
 compares it with the base's head), and test_head_int8.py switches the int8 head on."""
 
 import pytest

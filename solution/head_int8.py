@@ -55,8 +55,8 @@ and dL/dh are not finite either and GradScaler skips the step as in the base.
 Which heads take this path never depends on timing: the first START_HEADS heads of the run (the
 kernels compile and the int8 copy is built meanwhile) and any head when the build failed take the
 fp16 path; head START_HEADS + 1 waits for the thread if it is not done. Switches (environment):
-SOUP_SOLUTION_HEAD_INT8 (on by default in every process; solution/conftest.py pins the fp16 head
-for solution's own tests, test_head_int8.py switches it on), SOUP_SOLUTION_HEAD_INT8_START (START_HEADS), SOUP_SOLUTION_HEAD_INT8_AT
+SOUP_SOLUTION_HEAD_INT8 (off by default in every process, see _STATE; solution/conftest.py pins the fp16
+head for solution's own tests, test_head_int8.py builds the int8 copy itself), SOUP_SOLUTION_HEAD_INT8_START (START_HEADS), SOUP_SOLUTION_HEAD_INT8_AT
 (where the build thread starts: "setup", the end of Soup's setup, or "head", the run's first head),
 SOUP_SOLUTION_HEAD_INT8_WARM (where the kernels compile: "thread" or "warmup"),
 SOUP_SOLUTION_HEAD_INT8_SMOOTH / _ALPHA (smoothing()), SOUP_SOLUTION_HEAD_INT8_FWD_ROWS,
@@ -76,7 +76,10 @@ import triton.language as tl
 from .fused_ce import IGNORE_INDEX
 from .head_stream import BLOCK_D, head_finish_kernel
 
-_STATE = {"on": os.environ.get("SOUP_SOLUTION_HEAD_INT8", "1").strip().lower() not in ("0", "false", "no", "")}
+# off by default in every process: with the rescoring and the loss correction the head gains 3-7 ms per step
+# after the switch, and the build thread's compilations cost steps 0-4 +0.3..+0.5 s (wall +0.10 s Kaggle
+# soup-h1-abba4, +0.56 s Modal h1-abba7); SOUP_SOLUTION_HEAD_INT8=1 turns it on
+_STATE = {"on": os.environ.get("SOUP_SOLUTION_HEAD_INT8", "0").strip().lower() not in ("0", "false", "no", "")}
 START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "5"))
 # the accuracy's rescoring (head_i8_rescore_kernel): rows whose int8 top two (or top and target) are
 # closer than DELTA logits take exact logits for these tokens; DELTA <= 0 switches it off
@@ -122,8 +125,8 @@ def smoothing(streamer):
 
 
 def enabled():
-    """SOUP_SOLUTION_HEAD_INT8 (on by default in every process; solution/conftest.py pins the fp16 head
-    for solution's own tests of it)."""
+    """SOUP_SOLUTION_HEAD_INT8 (off by default in every process; solution/conftest.py pins the fp16 head for
+    solution's own tests of it)."""
     return _STATE["on"]
 
 
