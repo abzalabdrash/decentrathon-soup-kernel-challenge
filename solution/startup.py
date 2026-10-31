@@ -84,6 +84,7 @@ import contextlib
 import importlib
 import os
 import sys
+import threading
 import time
 import types
 
@@ -204,9 +205,28 @@ def _import(name, seconds):
     seconds[name] = round(time.perf_counter() - start, 3)
 
 
-def prepare_imports(log=True):
+def _trl_imports(seconds):
+    """trl's SFTTrainer and the transformers collators it imports, with the shortcuts of the module
+    docstring (the part of prepare_imports that SOUP_SOLUTION_IMPORT_THREAD moves to a thread)."""
+    import transformers
+    import transformers.utils
+
+    with _replaced(transformers.utils, "is_sklearn_available", _not_installed):
+        _import("transformers.data", seconds)  # trl imports its collators
+    with distributions_from_transformers():
+        _import("trl", seconds)
+        # is_wandb_available: transformers' top-level lazy attribute, which trl's base trainer
+        # imports by name; is_torchvision_available: transformers' image-processing modules,
+        # which trl's SFTTrainer reaches through ProcessorMixin
+        with (_replaced(transformers, "is_wandb_available", _not_installed),
+              _replaced(transformers.utils, "is_torchvision_available", _not_installed)):
+            _import("trl.trainer.sft_trainer", seconds)
+
+
+def prepare_imports(log=True, trl=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
-    Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
+    Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches.
+    trl=False leaves out _trl_imports (start_import_thread does them)."""
     seconds = {}
     try:
         from .load_early import start as start_early_read
@@ -225,20 +245,15 @@ def prepare_imports(log=True):
 
         with _replaced(transformers.utils, "is_sklearn_available", _not_installed):
             _import("transformers.generation.candidate_generator", seconds)
-            _import("transformers.data", seconds)  # trl imports its collators
+            if trl:
+                _import("transformers.data", seconds)  # trl imports its collators
         with (_replaced(transformers.utils, "is_scipy_available", _not_installed),
               _replaced(transformers.utils, "is_torchvision_available", _not_installed)):
-            _import("transformers.loss.loss_utils", seconds)
+            _import("transformers.loss.loss_utils", seconds)  # modeling_utils needs it at the first patch
         with _dynamo_disabled():
             _import("bitsandbytes", seconds)
-        with distributions_from_transformers():
-            _import("trl", seconds)
-            # is_wandb_available: transformers' top-level lazy attribute, which trl's base trainer
-            # imports by name; is_torchvision_available: transformers' image-processing modules,
-            # which trl's SFTTrainer reaches through ProcessorMixin
-            with (_replaced(transformers, "is_wandb_available", _not_installed),
-                  _replaced(transformers.utils, "is_torchvision_available", _not_installed)):
-                _import("trl.trainer.sft_trainer", seconds)
+        if trl:
+            _trl_imports(seconds)
     except Exception as exc:  # noqa: BLE001 - the patches import what they need themselves
         if log:
             print(f"[solution] import shortcuts skipped: {exc!r}", flush=True)
@@ -250,6 +265,92 @@ def prepare_imports(log=True):
 
     profile_mark("imports done")  # SOUP_SOLUTION_STARTUP_PROFILE=1 only
     return seconds
+
+
+# ---------------------------------------------------------------- imports in a thread
+
+_THREAD = {"thread": None, "error": None, "seconds": {}, "start": None, "done": None}
+
+
+def _import_thread_run(patch, shortcuts):
+    try:
+        if shortcuts:
+            _trl_imports(_THREAD["seconds"])
+        patch()
+    except BaseException as exc:  # noqa: BLE001 - join_import_thread redoes it on the main thread
+        _THREAD["error"] = exc
+    _THREAD["done"] = time.perf_counter()
+
+
+def start_import_thread(patch, shortcuts=True):
+    """SOUP_SOLUTION_IMPORT_THREAD=1: _trl_imports and `patch` (patch_sft_trainer) on a thread
+    while apply() and Soup's CLI go on; patch_soup_import_join makes SFTTrainerWrapper.setup, whose
+    first line imports trl (soup_cli/trainer/sft.py:734, before the model load at :767), join it
+    first. soup_cli.trainer.sft is imported here, before the thread starts (patch_soup_phases
+    imports it later in apply() anyway), so the modules the main thread still imports meanwhile
+    are our own and those of Soup's CLI. Without Soup's wrapper, both run here as before.
+    Returns whether the thread started."""
+    try:
+        from soup_cli.trainer import sft as soup_sft
+
+        callable(soup_sft.SFTTrainerWrapper.setup)
+    except Exception:  # noqa: BLE001 - no Soup trainer to join at: the plain order
+        if shortcuts:
+            try:
+                _trl_imports({})
+            except Exception:  # noqa: BLE001 - the patch imports what it needs itself
+                pass
+        patch()
+        return False
+    _THREAD.update(error=None, seconds={}, start=time.perf_counter(), done=None, patch=patch,
+                   shortcuts=shortcuts)
+    thread = threading.Thread(target=_import_thread_run, args=(patch, shortcuts),
+                              name="soup-import", daemon=True)
+    _THREAD["thread"] = thread
+    thread.start()
+    return True
+
+
+def patch_soup_import_join():
+    """SFTTrainerWrapper.setup joins start_import_thread's thread before anything else (installed at
+    the end of apply(), so it wraps our other wrappers of setup)."""
+    from soup_cli.trainer import sft as soup_sft
+
+    cls = soup_sft.SFTTrainerWrapper
+    original = cls.setup
+    if getattr(original, "_soup_import_join", False):
+        return
+
+    def setup(self, *args, **kwargs):
+        join_import_thread()
+        return original(self, *args, **kwargs)
+
+    setup._soup_import_join = True
+    cls.setup = setup
+
+
+def join_import_thread():
+    """Waits for start_import_thread's thread (once); if it failed, its work on this thread."""
+    thread = _THREAD["thread"]
+    if thread is None:
+        return
+    _THREAD["thread"] = None
+    begin = time.perf_counter()
+    thread.join()
+    waited = time.perf_counter() - begin
+    seconds, error = _THREAD["seconds"], _THREAD["error"]
+    took = (_THREAD["done"] or begin) - _THREAD["start"]
+    print("[solution] import thread: " + ", ".join(f"{name} {s:.2f} s" for name, s in seconds.items())
+          + f"; done {took:.2f} s after its start, main thread waited {waited:.2f} s at setup"
+          + f"; loaded of {', '.join(_SKIPPED)}: {', '.join(n for n in _SKIPPED if n in sys.modules) or 'none'}"
+          + (f"; failed ({error!r}), redone here" if error is not None else ""), flush=True)
+    if error is not None:
+        if _THREAD["shortcuts"]:
+            try:
+                _trl_imports({})
+            except Exception:  # noqa: BLE001 - the patch imports what it needs itself
+                pass
+        _THREAD["patch"]()
 
 
 # ---------------------------------------------------------------- diagnostics: profile of the setup

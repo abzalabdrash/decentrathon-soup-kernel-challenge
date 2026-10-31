@@ -72,10 +72,12 @@ def apply():
         from .warmup import start_early
 
         start_early()  # triton's own hash now, next to the imports, not next to the model load
+    # off by default: trl's imports and patch_sft_trainer on a thread, joined where Soup's setup() imports trl
+    import_thread = os.environ.get("SOUP_SOLUTION_IMPORT_THREAD", "0") not in ("0", "false", "no", "")
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
         from .startup import prepare_imports
 
-        prepare_imports()  # trl without a second metadata scan, without sklearn and wandb
+        prepare_imports(trl=not import_thread)  # trl without a second metadata scan, without sklearn and wandb
     from .embed16 import patch_soup_setup
     from .fused_ce import patch_qwen2_causal_lm
     from .mlp16 import patch_qwen2_mlp_half
@@ -85,7 +87,12 @@ def apply():
     chunk = int(os.environ.get("SOUP_SOLUTION_CE_CHUNK", "512"))
     patch_qwen2_causal_lm(chunk=chunk, unpad_enabled=_on("SOUP_SOLUTION_UNPAD"))
     patch_qwen2_attention()
-    patch_sft_trainer()
+    if import_thread:
+        from .startup import start_import_thread
+
+        import_thread = start_import_thread(patch_sft_trainer, shortcuts=_on("SOUP_SOLUTION_IMPORT_DIET"))
+    else:
+        patch_sft_trainer()
     if _on("SOUP_SOLUTION_MLP16"):
         patch_qwen2_mlp_half()
     else:
@@ -146,6 +153,10 @@ def apply():
         watch_compiles()  # logs any kernel compiled or loaded outside the warm-up
         patch_soup_warmup(start_in_setup=False)
         start_background_warmup()  # compiles every registered kernel in a background thread
+    if import_thread:
+        from .startup import patch_soup_import_join
+
+        patch_soup_import_join()  # last, so the join comes before our other wrappers of setup
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
         pass  # gc.freeze() of the imported objects removed: the organizers forbade collector tweaks in apply() (answer 31)
     mark("apply end")
