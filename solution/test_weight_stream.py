@@ -318,31 +318,29 @@ def _quiet_gpu():
     torch.cuda.synchronize()
 
 
-def test_stream_memory():
+def test_stream_memory(cuda_bytes):
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
 
     patch_bnb_matmul4bit()
-    _quiet_gpu()
     blocks = make_stack()
     x, weight = _inputs()
     _step(blocks, x, weight)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    base_allocated = torch.cuda.memory_allocated()
+    cuda_bytes.reset_peak()
+    base_allocated = cuda_bytes.now()
     _step(blocks, x, weight)
-    base_peak = torch.cuda.max_memory_allocated()
+    base_peak = cuda_bytes.peak()
 
     streamer = WeightStreamer(blocks, slots=2)
     try:
         assert all(h.is_pinned() for h in streamer._hosts) and streamer.host_bytes == sum(streamer.layer_bytes)
-        freed = base_allocated - torch.cuda.memory_allocated()
+        freed = base_allocated - cuda_bytes.now()
         streamed = sum(streamer.layer_bytes) - streamer.slots * streamer.slot_bytes
         assert streamer.layer_bytes[0] > 24_000_000  # 46.8 M NF4 weights and their scales
         assert freed >= 0.99 * streamed
-        torch.cuda.reset_peak_memory_stats()
+        cuda_bytes.reset_peak()
         _step(blocks, x, weight)
-        peak = torch.cuda.max_memory_allocated()
+        peak = cuda_bytes.peak()
         assert base_peak - peak >= 0.99 * streamed
         print(f"\nlayer {streamer.layer_bytes[0] / 2**20:.2f} MiB, freed {freed / 2**20:.1f} MiB, "
               f"peak {base_peak / 2**20:.1f} -> {peak / 2**20:.1f} MiB")

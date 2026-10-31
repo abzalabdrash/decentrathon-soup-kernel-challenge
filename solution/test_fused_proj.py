@@ -665,7 +665,7 @@ def _mlp_forward(mlp, x):
         return mlp(x)
 
 
-def _launches_and_memory(module, forward, x, grad):
+def _launches_and_memory(module, forward, x, grad, cuda_bytes):
     for _ in range(2):  # warm up (Triton compiles, cuBLAS workspaces)
         out = forward(module, x.detach().requires_grad_(True))
         out.backward(grad.to(out.dtype))
@@ -676,15 +676,15 @@ def _launches_and_memory(module, forward, x, grad):
     # in the model the layer input is a norm output, not a leaf (autocast caches casts of leaves only)
     inp = xg * 1.0
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    before = cuda_bytes.now()
     out = forward(module, inp)
     torch.cuda.synchronize()
-    saved = torch.cuda.memory_allocated() - before - out.numel() * out.element_size()
+    saved = cuda_bytes.now() - before - out.numel() * out.element_size()
     out.backward(grad.to(out.dtype))
     return n_fwd, n_bwd, saved
 
 
-def test_launches_and_saved_memory_per_layer(layer_1p5b):
+def test_launches_and_saved_memory_per_layer(layer_1p5b, cuda_bytes):
     from solution import fused_proj
 
     _, attn, mlp, rotary = layer_1p5b
@@ -695,7 +695,7 @@ def test_launches_and_saved_memory_per_layer(layer_1p5b):
             ("mlp", mlp, _mlp_forward, grad)):
         for on in (False, True):
             _fused(on)
-            rows[name, on] = _launches_and_memory(module, forward, x, g)
+            rows[name, on] = _launches_and_memory(module, forward, x, g, cuda_bytes)
     _fused(True)
     print()
     for name in ("attention", "mlp"):

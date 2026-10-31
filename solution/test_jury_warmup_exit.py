@@ -133,7 +133,7 @@ def test_coordinator_failure_drains_live_helpers_before_done(monkeypatch, failur
 
     monkeypatch.setattr(warmup.threading, "Thread", make_thread)
     coordinator = original_thread(target=warmup._run,
-                                  args=(0, False, 3 if failure == "helper_start" else 2, 0.001))
+                                  args=(0, False, 3 if failure == "helper_start" else 2))
     coordinator.start()
     try:
         assert entered.wait(5) and failed.wait(5)
