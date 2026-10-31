@@ -1674,7 +1674,12 @@ class _MLP(torch.autograd.Function):
             matrices = (plan.down, plan.gate, plan.up) if plan.ring is not None else ()
             for base in matrices:  # it reads the three (scales, int8 decode) in one go
                 plan.ring.acquire(base, -1)
-            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer)[:n]
+            # SOUP_SOLUTION_RING_EARLY_RELEASE: each matrix's slot is released right after its int8
+            # decode, so the next layer's copy starts under this backward's GEMMs (the loop below
+            # is then a no-op)
+            done = ((lambda base: plan.ring.release(base, -1))
+                    if plan.ring is not None and weight_stream.EARLY_RELEASE else None)
+            grad_x = int8_bwd.mlp_backward(plan, saved, grad16, buffer, done)[:n]
             for base in matrices:
                 plan.ring.release(base, -1)
             if ctx.x_dtype != torch.float32:

@@ -371,3 +371,96 @@ def test_type_ring_unmanaged_mlp(sleep, monkeypatch):
     finally:
         streamer.restore()
     assert _equal(reference, _step(blocks, x, weight))
+
+
+@pytest.mark.parametrize("early", [True, False])
+def test_type_ring_int8_backward_early_release(layer_shaped_qwen_dir, night, monkeypatch, early):
+    """The int8 MLP backward (int8_bwd.py) with the type ring: with SOUP_SOLUTION_RING_EARLY_RELEASE
+    each matrix's slot is released right after its int8 decode, so the next layer's copy into it
+    starts while this backward still runs. Every decode is queued behind a GPU sleep: a copy that did
+    not wait for its decode changes the result. Two steps equal the resident model's bit for bit."""
+    from solution import int8_bwd, weight_stream
+    from solution.weight_stream import stream_model_weights
+
+    monkeypatch.setitem(int8_bwd._STATE, "on", True)
+    int8_bwd.compile_now()
+    monkeypatch.setattr(weight_stream, "EARLY_RELEASE", early)
+    model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
+    sleep = [0]
+    decode = int8_bwd._decode_t
+
+    def slow_decode(*args, **kwargs):
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(int8_bwd, "_decode_t", slow_decode)
+    calls = []
+    backward = int8_bwd.mlp_backward
+    monkeypatch.setattr(int8_bwd, "mlp_backward",
+                        lambda *a, **k: calls.append(a[4] is not None) or backward(*a, **k))
+    resident = _ring_step(model)
+    exact = _same(resident, _ring_step(model))
+    streamer = stream_model_weights(model, slots=2, ring="type")
+    assert streamer is not None and streamer.ring == "type"
+    calls.clear()
+    sleep[0] = SLEEP_CYCLES // 3
+    try:
+        steps = [_ring_step(model), _ring_step(model)]
+        assert streamer.late_loads == 0
+    finally:
+        sleep[0] = 0
+        streamer.restore()
+    assert calls and all(c == early for c in calls)  # the int8 path ran, with the callback or not
+    compare = _same if exact else _close
+    assert all(compare(resident, got) for got in steps)
+
+
+@pytest.mark.parametrize("int8", [False, True])
+def test_type_ring_two_slots_per_matrix_type(layer_shaped_qwen_dir, night, monkeypatch, int8):
+    """SOUP_SOLUTION_RING_SLOTS_GATE/_UP/_DOWN=2: layer j's matrix in slot j % 2, the release of layer
+    i loads layer i + 2*step. Two steps (fp16 or int8 MLP backward), every dequantization and int8
+    decode queued behind a GPU sleep, equal the resident model's bit for bit; every copy prefetched
+    (no late load), and the forward ends with the last two layers' matrices in their slots."""
+    from solution import fused_proj, int8_bwd, weight_stream
+    from solution.weight_stream import stream_model_weights
+
+    for name in ("gate", "up", "down"):
+        monkeypatch.setitem(weight_stream.MLP_SLOTS, name, 2)
+    if int8:
+        monkeypatch.setitem(int8_bwd._STATE, "on", True)
+        int8_bwd.compile_now()
+    model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
+    sleep = [0]
+    rebuild, decode = fused_proj._weights, int8_bwd._decode_t
+
+    def slow_weights(bases, dtype, device, offset=0):
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return rebuild(bases, dtype, device, offset)
+
+    def slow_decode(*args, **kwargs):
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(fused_proj, "_weights", slow_weights)
+    monkeypatch.setattr(int8_bwd, "_decode_t", slow_decode)
+    resident = _ring_step(model)
+    exact = _same(resident, _ring_step(model))
+    streamer = stream_model_weights(model, slots=2, ring="type")
+    assert streamer is not None and streamer.ring == "type"
+    assert [g.count for g in streamer._groups] == [2, 2, 2, 2]
+    sleep[0] = SLEEP_CYCLES // 3
+    try:
+        steps = [_ring_step(model), _ring_step(model)]
+        assert streamer.late_loads == 0
+        # after the backward: layers 0 and 1 in the matrix slots for the next forward
+        for g in streamer._matrix_groups:
+            first = streamer._groups[g].first
+            assert sorted(streamer._owner[first:first + 2]) == [0, 1]
+    finally:
+        sleep[0] = 0
+        streamer.restore()
+    compare = _same if exact else _close
+    assert all(compare(resident, got) for got in steps)
