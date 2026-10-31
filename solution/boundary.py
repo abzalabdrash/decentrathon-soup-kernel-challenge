@@ -29,7 +29,7 @@ Every list is dropped when a parameter or module is registered on one of the mod
 (torch's global registration hooks; registrations elsewhere in the process, a deepcopy or another
 model, leave it) or when the model's trainable set no longer matches the optimizer's; anything
 else (Soup's tests with fake trainers, other models, DoRA's own `train`) runs the original code.
-SOUP_SOLUTION_STEP_BOUNDARY=1 turns it on (off by default until measured).
+On by default; SOUP_SOLUTION_STEP_BOUNDARY=0 turns it off.
 """
 
 import os
@@ -37,7 +37,7 @@ import weakref
 
 import torch
 
-_STATE = {"on": os.environ.get("SOUP_SOLUTION_STEP_BOUNDARY", "0").strip().lower()
+_STATE = {"on": os.environ.get("SOUP_SOLUTION_STEP_BOUNDARY", "1").strip().lower()
           not in ("0", "false", "no", ""), "generation": 0, "hooks": None,
           "watched": set(),  # ids of the listed models' modules
           "builds": 0, "bumps": {}}  # (module type, name) -> registrations that dropped lists

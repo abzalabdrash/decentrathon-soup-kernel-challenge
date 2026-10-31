@@ -11,7 +11,8 @@ plan's `nonzero` and `tolist`, the cu_seqlens copy: 2.7 ms). Inside the step, th
 labelled-token count and `num_items_in_batch` are read from the GPU at the head (the CPU waited
 70 ms there for the forward).
 
-Here, each behind its switch, for the real CUDA trainer only (anything else runs the original):
+Here, each behind its switch (all on by default but the timing; =0, or NAN_FILTER=host, turns one
+off), for the real CUDA trainer only (anything else runs the original):
 
 - SOUP_SOLUTION_NAN_FILTER=gpu: the filter is applied on the GPU. transformers adds the step's loss
   to its running `_tr_loss`, or, when the loss is nan or inf, `_tr_loss / (1 + steps since the last
@@ -65,11 +66,12 @@ def _flag(name, default="0"):
 
 
 _STATE = {
-    "nan_gpu": _env("SOUP_SOLUTION_NAN_FILTER", "host") == "gpu",
-    "prefetch": _flag("SOUP_SOLUTION_PREFETCH_BATCH"),
-    "plan": _flag("SOUP_SOLUTION_HOST_PLAN"),
+    # on by default (measured on the T4, docs/notes/b1-boundary.md); =host / =0 turn each off
+    "nan_gpu": _env("SOUP_SOLUTION_NAN_FILTER", "gpu") == "gpu",
+    "prefetch": _flag("SOUP_SOLUTION_PREFETCH_BATCH", "1"),
+    "plan": _flag("SOUP_SOLUTION_HOST_PLAN", "1"),
     "timing": _flag("SOUP_SOLUTION_BOUNDARY_TIMING"),
-    "bwd_single": _flag("SOUP_SOLUTION_BWD_SINGLE_THREAD"),
+    "bwd_single": _flag("SOUP_SOLUTION_BWD_SINGLE_THREAD", "1"),
     "patched": False,
 }
 _STATS = {"prefetched": 0, "planned": 0, "plans_used": 0, "known_used": 0, "fetch_s": 0.0, "plan_s": 0.0}

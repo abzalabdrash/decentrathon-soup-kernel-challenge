@@ -6,10 +6,10 @@ the fused head (fused_ce.py) the model leaves the per-token entropy, loss and co
 values and hands Soup's rewind recorder the per-token losses through the attribute it already reads
 (`_soup_chunked_step`, see soup_cli.trainer.rewind_hf: `row_losses_from_token_losses`).
 
-SOUP_SOLUTION_DEFER_METRICS=1: the values stay on the GPU until the step is logged. TRL reads them
-with `.item()` and Soup's rewind recorder with `float()` between the forward and the backward, and
-the first read waits for the whole forward and head to finish, so the CPU starts queueing the
-backward with the GPU empty. Here `_log_trl_metrics` keeps detached device scalars, and the rewind
+SOUP_SOLUTION_DEFER_METRICS (on by default, =0 off): the values stay on the GPU until the step is
+logged. TRL reads them with `.item()` and Soup's rewind recorder with `float()` between the forward
+and the backward, and the first read waits for the whole forward and head to finish, so the CPU
+starts queueing the backward with the GPU empty. Here `_log_trl_metrics` keeps detached device scalars, and the rewind
 recorder gets the per-row means and token counts as device tensors (the same operations as Soup's
 `row_losses_from_token_losses`), its record queued; `flush_deferred` turns them into the same Python
 numbers, in the same order, into TRL's `_metrics` and Soup's `RewindState.on_micro_batch` right
@@ -27,7 +27,7 @@ from . import fused_ce
 
 STEP_ATTR = "_soup_chunked_step"  # soup_cli.utils.stream_loss_chunk.STEP_ATTR
 PENDING_ATTR = "_soup_pending_metrics"  # device scalars of the steps not logged yet
-DEFER = {"on": os.environ.get("SOUP_SOLUTION_DEFER_METRICS", "0").strip().lower()
+DEFER = {"on": os.environ.get("SOUP_SOLUTION_DEFER_METRICS", "1").strip().lower()
          not in ("0", "false", "no", ""),
          "armed": None,  # the token_loss tensor the rewind recorder may take deferred
          "rows": []}  # queued rewind records: (state, step, means, tokens)
