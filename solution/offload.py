@@ -262,6 +262,13 @@ class Offloader:
                  host_limit=HOST_LIMIT_BYTES, weights=()):
         self.device = torch.device("cuda", torch.cuda.current_device()) if device is None else device
         self.stream = torch.cuda.Stream(self.device)
+        from .weight_stream import CurrentStream, SideStream
+
+        # the stream switches and current-stream reads of weight_stream.py (SOUP_SOLUTION_FAST_STREAMS),
+        # and one event, recorded again at every use, for the side stream's waits for the current one
+        self._side = SideStream(self.stream)
+        self._current = CurrentStream(self.device)
+        self._order = torch.cuda.Event()
         self.min_numel = _env_int("SOUP_SOLUTION_OFFLOAD_MIN_NUMEL", MIN_NUMEL) \
             if min_numel is None else min_numel
         layer = saved_per_layer() + (1 if _RESIDUAL["on"] else 0) + (6 if ATTN else 0)
@@ -336,13 +343,14 @@ class Offloader:
             self.stats["kept"] += 1
             return tensor
         side = self.stream
-        home = torch.cuda.current_stream(tensor.device)
-        side.wait_event(home.record_event())
+        home = self._current()
+        self._order.record(home)
+        side.wait_event(self._order)
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
         host = host.view(tensor.dtype).view(tensor.shape)
-        with torch.cuda.stream(side):
+        with self._side():
             host.copy_(tensor, non_blocking=True)
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
@@ -366,7 +374,7 @@ class Offloader:
         if type(saved) is not _Saved:
             return saved
         with self.lock:
-            current = torch.cuda.current_stream(saved.device)
+            current = self._current() if saved.device == self.device else torch.cuda.current_stream(saved.device)
             tensor = saved.gpu
             if saved.unpacked:  # a kept residual, unpacked before in this backward
                 return tensor
@@ -409,9 +417,10 @@ class Offloader:
                 continue
             tensor = torch.empty(saved.shape, dtype=saved.dtype, device=saved.device)
             if not waited:
-                side.wait_event(current.record_event())
+                self._order.record(current)
+                side.wait_event(self._order)
                 waited = True
-            with torch.cuda.stream(side):
+            with self._side():
                 tensor.copy_(saved.host, non_blocking=True)
             saved.gpu, saved.ready, saved.home = tensor, side.record_event(), current
             self.stats["prefetched"] += 1

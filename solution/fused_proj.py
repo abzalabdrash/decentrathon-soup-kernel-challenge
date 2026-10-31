@@ -110,24 +110,45 @@ def _gate_up_split():
 # weights
 
 
+# What the shared buffer holds (SOUP_SOLUTION_CPU_DIET): the key of the last dequantization into it
+# and the views it returned. Every _buffer() call forgets it (whoever asks for the buffer writes
+# into it); _weights / _attn_weights set it after their launch.
+_HELD = {"key": None, "views": None}
+_VIEWS = {}  # views of the shared buffers by (device, dtype, what), dropped when a buffer is replaced
+
+
 def _buffer(device, dtype, numel):
+    _HELD["key"] = _HELD["views"] = None
     key = (device, dtype)
     buf = _BUFFERS.get(key)
     if buf is None or buf.numel() < numel:
         buf = torch.empty(numel, dtype=dtype, device=device)
         _BUFFERS[key] = buf
+        _VIEWS.clear()
     return buf
+
+
+def _held(key):
+    """The views of what the shared buffer holds when that is `key` (nothing written into it since
+    the launch that made it), else None."""
+    return _HELD["views"] if _HELD["key"] == key else None
 
 
 def _weights(bases, dtype, device, offset=0):
     """The dequantized weights of `bases` stacked by rows, (sum of out, in), a view of the shared
     buffer starting at element `offset`. Valid until the next call on this device: every GEMM that
-    reads it is queued on the same stream before the next dequantization overwrites it."""
+    reads it is queued on the same stream before the next dequantization overwrites it.
+
+    With SOUP_SOLUTION_CPU_DIET (the default) three weights go in one launch; with
+    SOUP_SOLUTION_DEQUANT_REUSE as well (the default) the kernel's operands come from _nf4_args and a
+    call for exactly what the buffer holds (the same weights from the same offset, nothing written
+    into the buffer since) returns it without a launch: the values in the buffer are those the
+    launch would write again."""
     k = bases[0].in_features
-    rows = sum(b.out_features for b in bases)
-    flat = _buffer(device, dtype, offset + rows * k)
-    w = flat[offset:offset + rows * k].view(rows, k)
-    if _CPU["diet"]:
+    if _CPU["diet"] and not _CPU["reuse"]:  # the diet as before the reuse
+        rows = sum(b.out_features for b in bases)
+        flat = _buffer(device, dtype, offset + rows * k)
+        w = flat[offset:offset + rows * k].view(rows, k)
         packed = [_nf4_packed(base, dtype) for base in bases]
         if all(p is not None for p in packed):
             if len(packed) == 3:
@@ -139,6 +160,35 @@ def _weights(bases, dtype, device, offset=0):
                     nf4._launch(plain, state, dtype, w[row:row + n])
                     row += n
             return w
+    elif _CPU["diet"]:
+        found = [_nf4_args(base, dtype) for base in bases]
+        if None not in found:
+            key = (device, dtype, offset, tuple(f[0] for f in found))
+            views = _held(key)
+            if views is not None:
+                return views[0]
+            shape = tuple(b.out_features for b in bases)
+            rows = sum(shape)
+            flat = _buffer(device, dtype, offset + rows * k)
+            vkey = (device, dtype, offset, shape, k)
+            views = _VIEWS.get(vkey)
+            if views is None:
+                w = flat[offset:offset + rows * k].view(rows, k)
+                parts, row = [], 0
+                for n in shape:
+                    parts.append(w[row:row + n])
+                    row += n
+                views = _VIEWS[vkey] = (w, parts)
+            if len(found) == 3:
+                _launch_many([f[1] for f in found], views[0])
+            else:
+                for part, (_, operands) in zip(views[1], found):
+                    _launch_one(operands, part)
+            _HELD["key"], _HELD["views"] = key, views
+            return views[0]
+    rows = sum(b.out_features for b in bases)
+    flat = _buffer(device, dtype, offset + rows * k)
+    w = flat[offset:offset + rows * k].view(rows, k)
     row = 0
     for base in bases:
         n = base.out_features
@@ -147,18 +197,89 @@ def _weights(bases, dtype, device, offset=0):
     return w
 
 
+def _attn_weights(plan, device):
+    """(W_q|k|v (nq + nk + nv, D), W_o) of an attention plan's layer in the shared buffer, one after
+    the other: one launch for the four weights, or none when the buffer still holds them. With the
+    attention recompute a layer's backward then dequantizes them once (the recompute's launch; its
+    o_proj, the o_proj backward and the q/k/v backward read the same buffer, nothing is written into
+    it in between), and its forward once (q/k/v, then o_proj after the attention kernel). None
+    without SOUP_SOLUTION_CPU_DIET and SOUP_SOLUTION_DEQUANT_REUSE or when a weight is not on nf4.py's
+    kernel (then _weights)."""
+    if not (_CPU["diet"] and _CPU["reuse"]):
+        return None
+    half = plan.half
+    bases = plan.bases + (plan.o_base,)
+    found = [_nf4_args(base, half) for base in bases]
+    if None in found:
+        return None
+    key = (device, half, "attn", tuple(f[0] for f in found))
+    views = _held(key)
+    if views is not None:
+        return views
+    q, k, v, o = bases
+    rows = q.out_features + k.out_features + v.out_features
+    qkv, out = rows * q.in_features, o.out_features * o.in_features
+    flat = _buffer(device, half, qkv + out)
+    vkey = (device, half, "attn", rows, q.in_features, o.out_features, o.in_features)
+    views = _VIEWS.get(vkey)
+    if views is None:
+        views = _VIEWS[vkey] = (flat[:qkv].view(rows, q.in_features),
+                                flat[qkv:qkv + out].view(o.out_features, o.in_features))
+    _launch_many([f[1] for f in found], views[0])
+    _HELD["key"], _HELD["views"] = key, views
+    return views
+
+
 # CPU side of the step (SOUP_SOLUTION_CPU_DIET=0: every launch as before). Every Triton launch of
 # solution/ costs about 50 us of CPU on the training path (Triton's launcher plus the harness's
-# timing events), nf4._fast_path's checks 13 us more, and a layer makes 14 dequantizations: the
-# q/k/v ones go in one launch, the checks' verdict is kept per packed weight
+# timing events; T4 cProfile, task C1: 681 launches per step), nf4._fast_path's checks 13 us more,
+# and a layer made 14 dequantizations. With the diet: q, k, v and o in one launch, reused by the
+# backward from the recompute's launch (_attn_weights), any other repeat of what the buffer holds
+# skipped (_weights), the kernel's operands kept per packed weight (_nf4_args): 4 launches per layer
+# and every Params4bit attribute read of the dequantizations less
 _CPU = {"diet": os.environ.get("SOUP_SOLUTION_CPU_DIET", "1").strip().lower()
+        not in ("0", "false", "no", ""),
+        "reuse": os.environ.get("SOUP_SOLUTION_DEQUANT_REUSE", "1").strip().lower()
         not in ("0", "false", "no", "")}
+_current_device = torch._C._cuda_getDevice
+
+
+def _nf4_args(base, dtype):
+    """(key, operands) of a 4-bit layer's weight for nf4.py's kernel, None when the kernel does not
+    take it. operands: the packed weight as int32 words, the absmax codes, state2.code,
+    state2.absmax, the offset, the NF4 levels, the number of blocks and the launch grid. Kept on the
+    layer while the packed weight's storage, the quant state and the state's tensors stay the same
+    objects, and the dtype and device (weight_stream.py points a layer's packed weight into its slot
+    once), so a step reads no Params4bit attribute for it (each read is a Python __torch_function__
+    call of bitsandbytes) and makes no view; `key` names what a launch dequantizes (_HELD). The
+    cached operands keep the tensors whose ids are in the key alive: an id is not reused while it
+    is in a key."""
+    weight = base.weight
+    state = weight.quant_state
+    state2 = getattr(state, "state2", None)
+    with torch._C.DisableTorchFunctionSubclass():
+        ptr = weight.data_ptr()
+    key = (ptr, id(state), id(state.absmax), id(state.code), id(state.offset), id(state2),
+           id(getattr(state2, "absmax", None)), id(getattr(state2, "code", None)), dtype,
+           _current_device())
+    cached = base.__dict__.get("_soup_nf4_args")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    plain = weight.data
+    found = None
+    if nf4._fast_path(plain, state, dtype):
+        n_blocks = state.absmax.numel()
+        found = (key, (plain.view(-1).view(torch.int32), state.absmax, state2.code, state2.absmax,
+                       state.offset, state.code, n_blocks,
+                       (triton.cdiv(n_blocks, nf4.BLOCKS_PER_PROGRAM),)))
+    base.__dict__["_soup_nf4_args"] = (key, found)
+    return found
 
 
 def _nf4_packed(base, dtype):
-    """(plain packed weight, quant state) of a 4-bit layer when nf4.py's kernel takes it, else None.
-    nf4._fast_path's verdict is kept on the layer for its packed weight's storage, quant state,
-    dtype and device (weight_stream.py moves a layer's packed weight into its slot, a new storage)."""
+    """(plain packed weight, quant state) of a 4-bit layer when nf4.py's kernel takes it, else None
+    (the diet without SOUP_SOLUTION_DEQUANT_REUSE). nf4._fast_path's verdict is kept on the layer
+    for its packed weight's storage, quant state, dtype and device."""
     weight = base.weight
     state = weight.quant_state
     plain = weight.data  # a Params4bit answers attributes through __torch_function__: read once
@@ -168,6 +289,24 @@ def _nf4_packed(base, dtype):
         cached = (key, nf4._fast_path(plain, state, dtype))
         base.__dict__["_soup_nf4_packed"] = cached
     return (plain, state) if cached[1] else None
+
+
+def _launch_one(operands, out):
+    """nf4._launch with _nf4_args' operands: the same kernel on the same arguments."""
+    nf4.nf4_dequant_kernel[operands[7]](
+        *operands[:6], out, operands[6], QBLOCK=nf4.QBLOCK, ABLOCK=nf4.ABLOCK,
+        BLOCKS=nf4.BLOCKS_PER_PROGRAM, num_warps=4, enable_fp_fusion=False)
+
+
+def _launch_many(operands, out):
+    """Three or four weights (_nf4_args' operands) into the contiguous elements of `out`, one after
+    the other, in one launch: nf4_dequant3_kernel / nf4_dequant4_kernel."""
+    blocks = nf4.BLOCKS_PER_PROGRAM
+    programs = sum(op[7][0] for op in operands)
+    args = [a for op in operands for a in op[:7]]
+    kernel = nf4_dequant3_kernel if len(operands) == 3 else nf4_dequant4_kernel
+    kernel[(programs,)](*args, out, QBLOCK=nf4.QBLOCK, ABLOCK=nf4.ABLOCK, BLOCKS=blocks,
+                        num_warps=4, enable_fp_fusion=False)
 
 
 @triton.jit
@@ -214,6 +353,47 @@ def nf4_dequant3_kernel(
     else:
         _nf4_blocks(w2, qa2, c2, s2, o2, l2, out_ptr + (n0 + n1).to(tl.int64) * QBLOCK, n2,
                     pid - p0 - p1, QBLOCK, ABLOCK, BLOCKS)
+
+
+@triton.jit
+def nf4_dequant4_kernel(
+    w0, qa0, c0, s0, o0, l0, n0,  # as nf4_dequant3_kernel, one weight more: q, k, v and o of a layer
+    w1, qa1, c1, s1, o1, l1, n1,
+    w2, qa2, c2, s2, o2, l2, n2,
+    w3, qa3, c3, s3, o3, l3, n3,
+    out_ptr,  # the four weights one after the other, contiguous
+    QBLOCK: tl.constexpr, ABLOCK: tl.constexpr, BLOCKS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    p0 = tl.cdiv(n0, BLOCKS)
+    p1 = tl.cdiv(n1, BLOCKS)
+    p2 = tl.cdiv(n2, BLOCKS)
+    if pid < p0:
+        _nf4_blocks(w0, qa0, c0, s0, o0, l0, out_ptr, n0, pid, QBLOCK, ABLOCK, BLOCKS)
+    elif pid < p0 + p1:
+        _nf4_blocks(w1, qa1, c1, s1, o1, l1, out_ptr + n0.to(tl.int64) * QBLOCK, n1, pid - p0,
+                    QBLOCK, ABLOCK, BLOCKS)
+    elif pid < p0 + p1 + p2:
+        _nf4_blocks(w2, qa2, c2, s2, o2, l2, out_ptr + (n0 + n1).to(tl.int64) * QBLOCK, n2,
+                    pid - p0 - p1, QBLOCK, ABLOCK, BLOCKS)
+    else:
+        _nf4_blocks(w3, qa3, c3, s3, o3, l3, out_ptr + (n0 + n1 + n2).to(tl.int64) * QBLOCK, n3,
+                    pid - p0 - p1 - p2, QBLOCK, ABLOCK, BLOCKS)
+
+
+def _warm_dequant4():
+    """warmup.py registration of nf4_dequant4_kernel: q, k, v and o of the run (every block count
+    divisible by 16, so one class), in the run's half dtype."""
+    from .warmup import HIDDEN, KV_HEADS, Q_HEADS, HEAD_DIM, compile_kernel, training_half_dtype
+
+    per = []
+    for rows, cols in ((Q_HEADS * HEAD_DIM, HIDDEN), (KV_HEADS * HEAD_DIM, HIDDEN),
+                       (KV_HEADS * HEAD_DIM, HIDDEN), (HIDDEN, Q_HEADS * HEAD_DIM)):
+        per += [torch.int32, torch.uint8, torch.float32, torch.float32, torch.float32, torch.float32,
+                rows * cols // nf4.QBLOCK]
+    compile_kernel(nf4_dequant4_kernel, *per, training_half_dtype(), QBLOCK=nf4.QBLOCK,
+                   ABLOCK=nf4.ABLOCK, BLOCKS=nf4.BLOCKS_PER_PROGRAM, num_warps=4,
+                   enable_fp_fusion=False)
 
 
 def _dequant3_args(plain, state):
@@ -279,12 +459,55 @@ def _global_hooks():
                 or nn_module._global_backward_hooks or nn_module._global_backward_pre_hooks)
 
 
+_IMPORTED = {}  # name -> what _imported() found (or None when the import failed)
+_FUSES = {}  # _bnb_would_fuse's verdicts by (m, k, n, blocksize, dtype, device index)
+
+
+def _imported(name):
+    """bitsandbytes' Linear4bit ("bnb") or Params4bit ("params4bit"), peft's LoRA Linear4bit
+    ("lora") or bitsandbytes' CUDA ops ("ops"), imported once (an import statement in a guard costs
+    a lookup through the import system on every call), None when the import fails."""
+    if name not in _IMPORTED:
+        try:
+            if name in ("bnb", "params4bit"):
+                import bitsandbytes as bnb
+
+                found = bnb.nn.Linear4bit if name == "bnb" else bnb.nn.Params4bit
+            elif name == "lora":
+                from peft.tuners.lora.bnb import Linear4bit as found
+            else:
+                from bitsandbytes.backends.cuda import ops as found
+        except Exception:  # noqa: BLE001 - not installed, another layout
+            found = None
+        _IMPORTED[name] = found
+    return _IMPORTED[name]
+
+
+def _flags(weight):
+    """(requires_grad, is_cuda, device) of a weight. A Params4bit's getters are read with torch's
+    function override off: bitsandbytes' __torch_function__ only forwards them (each read through
+    it is a Python call), so the values are the same."""
+    if type(weight) is _imported("params4bit"):
+        with torch._C.DisableTorchFunctionSubclass():
+            return weight.requires_grad, weight.is_cuda, weight.device
+    return weight.requires_grad, weight.is_cuda, weight.device
+
+
 def _bnb_would_fuse(m, base, dtype, device):
     """Whether bitsandbytes' gemm_4bit would run its own fused 4-bit GEMM for m rows (small M):
-    there the base does not dequantize, so this module keeps the original path (as nf4.py does)."""
-    try:
-        from bitsandbytes.backends.cuda import ops
-    except Exception:  # noqa: BLE001 - another bitsandbytes layout
+    there the base does not dequantize, so this module keeps the original path (as nf4.py does).
+    The verdict depends only on the shapes, the dtype and the device: kept by those."""
+    key = (m, base.in_features, base.out_features, base.weight.quant_state.blocksize, dtype,
+           device.index)
+    found = _FUSES.get(key)
+    if found is None:
+        found = _FUSES[key] = _bnb_would_fuse_uncached(m, base, dtype, device)
+    return found
+
+
+def _bnb_would_fuse_uncached(m, base, dtype, device):
+    ops = _imported("ops")
+    if ops is None:
         return True
     custom_max_m = getattr(ops, "_gemm_4bit_custom_max_m", None)
     use_custom = getattr(ops, "_gemm_4bit_use_custom_fn", None)
@@ -302,23 +525,24 @@ def _bnb_would_fuse(m, base, dtype, device):
 def _plain_4bit(module):
     """`module` when it is a bitsandbytes Linear4bit with an NF4 quant state and frozen weights
     that this module can dequantize and multiply like its own forward does, else None."""
-    try:
-        import bitsandbytes as bnb
-    except Exception:  # noqa: BLE001
+    linear4bit = _imported("bnb")
+    if linear4bit is None:
         return None
-    linear4bit = bnb.nn.Linear4bit
     if not isinstance(module, linear4bit) or type(module).forward is not linear4bit.forward:
         return None
     weight = getattr(module, "weight", None)
     state = getattr(weight, "quant_state", None)
-    if state is None or getattr(state, "quant_type", None) != "nf4" or weight.requires_grad:
+    if state is None or getattr(state, "quant_type", None) != "nf4":
+        return None
+    requires_grad, is_cuda, _ = _flags(weight)
+    if requires_grad:
         return None
     shape = getattr(state, "shape", None)
     if shape is None or tuple(int(s) for s in shape) != (module.out_features, module.in_features):
         return None
     if module.bias is not None and module.bias.requires_grad:
         return None
-    if module.compute_dtype not in _HALVES or not weight.is_cuda or not _no_hooks(module):
+    if module.compute_dtype not in _HALVES or not is_cuda or not _no_hooks(module):
         return None
     return module
 
@@ -326,11 +550,8 @@ def _plain_4bit(module):
 def _lora(module):
     """(base, lora_A, lora_B, dropout p, scaling) of a peft LoRA Linear4bit with exactly one active
     plain LoRA adapter, else None."""
-    try:
-        from peft.tuners.lora.bnb import Linear4bit as LoraLinear4bit
-    except Exception:  # noqa: BLE001
-        return None
-    if type(module) is not LoraLinear4bit or not _no_hooks(module):
+    lora_linear4bit = _imported("lora")
+    if lora_linear4bit is None or type(module) is not lora_linear4bit or not _no_hooks(module):
         return None
     if module.disable_adapters or module.merged or getattr(module, "fan_in_fan_out", False):
         return None
@@ -409,8 +630,9 @@ def _attention_plan(attn, x, position_embeddings, attention_mask, past_key_value
     if kv_heads == 0 or heads % kv_heads or heads // kv_heads != getattr(attn, "num_key_value_groups", 1) \
             or o_base.in_features != heads * head_dim:
         return None
-    if any(t.device != x.device for t in (q_base.weight, k_base.weight, v_base.weight, o_base.weight,
-                                           a_q.weight, b_q.weight, a_v.weight, b_v.weight)):
+    if any(_flags(t)[2] != x.device for t in (q_base.weight, k_base.weight, v_base.weight,
+                                               o_base.weight, a_q.weight, b_q.weight, a_v.weight,
+                                               b_v.weight)):
         return None
     if not isinstance(position_embeddings, (tuple, list)) or len(position_embeddings) != 2:
         return None
@@ -564,6 +786,28 @@ class _AdapterHalves:
 _ADAPTERS = _AdapterHalves()
 
 
+def _generator(device):
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.default_generators[index]
+
+
+def _get_rng_state(device):
+    """torch.cuda.get_rng_state(device): with SOUP_SOLUTION_DEQUANT_REUSE the generator's own call,
+    without the wrapper's device lookups (the same state)."""
+    if _CPU["reuse"]:
+        return _generator(device).get_state()
+    return torch.cuda.get_rng_state(device)
+
+
+def _set_rng_state(state, device):
+    """torch.cuda.set_rng_state(state, device): with SOUP_SOLUTION_DEQUANT_REUSE the generator's own
+    call, without the wrapper's defensive clone of `state` (set_state copies the values)."""
+    if _CPU["reuse"]:
+        _generator(device).set_state(state)
+    else:
+        torch.cuda.set_rng_state(state, device)
+
+
 class _QKVRope(torch.autograd.Function):
     """x (1, N, D) -> q, k, v (1, H, N, Dh) in half: q and k rotated, LoRA added to q and v."""
 
@@ -576,7 +820,8 @@ class _QKVRope(torch.autograd.Function):
         x16 = x.reshape(n, d)
         x16 = x16 if x16.dtype == half else x16.to(half)
 
-        w = _weights(plan.bases, half, x.device)
+        pair = _attn_weights(plan, x.device)  # q|k|v and o in one launch (o_proj reads it later)
+        w = pair[0] if pair is not None else _weights(plan.bases, half, x.device)
         qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
 
         # the four adapter matrices in half: kept per layer and refreshed for every layer in one
@@ -589,7 +834,7 @@ class _QKVRope(torch.autograd.Function):
             torch._foreach_copy_([a16[:r], a16[r:], b16[:nq], b16[nq:]], [a_q, a_v, b_q, b_v])
         rng = None
         if plan.p > 0.0:
-            rng = torch.cuda.get_rng_state(x.device)
+            rng = _get_rng_state(x.device)
             dropped, _ = torch.native_dropout(x16.expand(2, n, d), plan.p, True)
             h = torch.bmm(dropped, a16.view(2, r, d).transpose(1, 2))  # (2, N, r)
             h_q, h_v = h[0], h[1]
@@ -662,12 +907,12 @@ class _QKVRope(torch.autograd.Function):
             gh = torch.empty((2, n, r), dtype=half, device=device)
             _scaled_mm(g_q, b16[:nq], s, gh[0])
             _scaled_mm(g_v, b16[nq:], s, gh[1])
-            current = torch.cuda.get_rng_state(device)
-            torch.cuda.set_rng_state(ctx.rng, device)
+            current = _get_rng_state(device)
+            _set_rng_state(ctx.rng, device)
             try:
                 dropped, mask = torch.native_dropout(x16.expand(2, n, d), p, True)
             finally:
-                torch.cuda.set_rng_state(current, device)
+                _set_rng_state(current, device)
             grad_a = torch.bmm(gh.transpose(1, 2), dropped, out_dtype=torch.float32) if need_a else None
             del dropped
             if need_x:
@@ -695,7 +940,8 @@ class _QKVRope(torch.autograd.Function):
 
         grad_x = None
         if need_x:
-            w = _weights(plan.bases, half, device)
+            pair = _attn_weights(plan, device)  # the recompute's or the o_proj backward's launch
+            w = pair[0] if pair is not None else _weights(plan.bases, half, device)
             # one GEMM for the three projections, the adapters' share added as C (in place, fp32)
             grad_x = torch.addmm(lora_x, g, w, beta=beta, out_dtype=torch.float32, out=lora_x)
             grad_x = grad_x.view(ctx.x_shape)
@@ -810,7 +1056,8 @@ class _AttnRecompute:
         nq, nk = q_base.out_features, k_base.out_features
         x16 = self.x16 if self.x16 is not None else rebuild(self.source, half)
         x16 = x16.view(n, -1)
-        w = _weights(plan.bases, half, x16.device)
+        pair = _attn_weights(plan, x16.device)  # read again by the o_proj and q/k/v backward
+        w = pair[0] if pair is not None else _weights(plan.bases, half, x16.device)
         qkv = torch.addmm(plan.bias, x16, w.t()) if plan.bias is not None else torch.mm(x16, w.t())
         h, b16, r = self.h, self.b16, plan.lora_q[0].weight.shape[0]
         h_q, h_v = (h[0], h[1]) if h.dim() == 3 else (h[:, :r], h[:, r:])
@@ -829,7 +1076,7 @@ class _AttnRecompute:
         self.x16 = x16
         if with_branch:
             o = out.reshape(n, plan.heads * plan.head_dim)
-            w = _weights((plan.o_base,), half, x16.device)
+            w = pair[1] if pair is not None else _weights((plan.o_base,), half, x16.device)
             bias = _cached_bias(plan.o_base, (plan.o_base,), half)
             self.branch_out = torch.addmm(bias, o, w.t()) if bias is not None else torch.mm(o, w.t())
         if self.check is not None:
@@ -874,22 +1121,26 @@ class _AttnRecompute:
 
 
 class _Linear4bitHalf(torch.autograd.Function):
-    """x16 (M, K) @ W.T (+ bias) for a frozen 4-bit layer, W rebuilt in the shared buffer each way."""
+    """x16 (M, K) @ W.T (+ bias) for a frozen 4-bit layer, W rebuilt in the shared buffer each way.
+    `plan`: the attention plan whose o_proj this is: W from _attn_weights (the forward's q|k|v launch
+    made it already; in the backward, the recompute's launch)."""
 
     @staticmethod
-    def forward(ctx, x16, base, bias):
-        w = _weights((base,), x16.dtype, x16.device)
+    def forward(ctx, x16, base, bias, plan=None):
+        pair = _attn_weights(plan, x16.device) if plan is not None and x16.dtype == plan.half else None
+        w = pair[1] if pair is not None else _weights((base,), x16.dtype, x16.device)
         out = torch.addmm(bias, x16, w.t()) if bias is not None else torch.mm(x16, w.t())
-        ctx.base = base
+        ctx.base, ctx.plan = base, plan
         return out
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        half = ctx.base.compute_dtype
+        half, plan = ctx.base.compute_dtype, ctx.plan
         grad = grad if grad.dtype == half else grad.to(half)
-        w = _weights((ctx.base,), half, grad.device)
-        return torch.mm(grad, w), None, None
+        pair = _attn_weights(plan, grad.device) if plan is not None and half == plan.half else None
+        w = pair[1] if pair is not None else _weights((ctx.base,), half, grad.device)
+        return torch.mm(grad, w), None, None, None
 
 
 def _fused_attention(attn, x, position_embeddings, plan):
@@ -904,7 +1155,8 @@ def _fused_attention(attn, x, position_embeddings, plan):
     out = packed_attention(query, key, value, plan.bounds, attn.scaling, dropout,
                            recompute)  # (1, N, H, Dh)
     out = out.reshape(n, plan.heads * plan.head_dim)
-    out = _Linear4bitHalf.apply(out, plan.o_base, _cached_bias(plan.o_base, (plan.o_base,), plan.half))
+    out = _Linear4bitHalf.apply(out, plan.o_base, _cached_bias(plan.o_base, (plan.o_base,), plan.half),
+                                plan)
     out = out.view(1, n, -1)
     if recompute is not None and recompute.armed:
         # the post-attention norm (rmsnorm.post_attention_addends) finds it here and keeps the
@@ -959,7 +1211,7 @@ def _mlp_plan(mlp, x):
         return None
     if any(b.bias is not None for b in (gate, up, down)):
         return None
-    if any(m.weight.device != x.device for m in (gate, up, down)):
+    if any(_flags(m.weight)[2] != x.device for m in (gate, up, down)):
         return None
     m = x.numel() // hidden
     if any(_bnb_would_fuse(m, b, half, x.device) for b in (gate, up, down)):
@@ -1174,7 +1426,10 @@ def _register_warmups():
         register(warm_rebuild, name="fused_proj_x16_rebuild")
     register(_warm_masked_pair_sum, name="fused_proj_masked_pair_sum")
     if _CPU["diet"]:
-        register(_warm_dequant3, name="fused_proj_nf4_dequant3")
+        if _CPU["reuse"]:
+            register(_warm_dequant4, name="fused_proj_nf4_dequant4")
+        else:
+            register(_warm_dequant3, name="fused_proj_nf4_dequant3")
 
 
 def patch_qwen2_mlp_fused():

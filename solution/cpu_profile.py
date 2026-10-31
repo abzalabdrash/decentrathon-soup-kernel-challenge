@@ -139,18 +139,52 @@ def _report_cprofile(profile, steps):
              f"{_short(filename)}:{line} {name}")
 
 
+class _Stacks:
+    """Sampled time charged to Python stacks: self (innermost frame), inclusive, innermost frame of
+    solution/, self by package."""
+
+    def __init__(self, codes):
+        self.codes = codes
+        self.self_t = collections.Counter()
+        self.incl = collections.Counter()
+        self.ours = collections.Counter()
+        self.package_self = collections.Counter()
+        self.seconds = 0.0
+
+    def charge(self, frame, dt):
+        self.seconds += dt
+        seen, leaf, mine, depth = set(), None, None, 0
+        while frame is not None and depth < MAX_DEPTH:
+            code = frame.f_code
+            key = id(code)
+            if key not in self.codes:
+                self.codes[key] = code
+            if leaf is None:
+                leaf = key
+            if mine is None and "/solution/" in code.co_filename.replace("\\", "/"):
+                mine = key
+            seen.add(key)
+            frame = frame.f_back
+            depth += 1
+        self.self_t[leaf] += dt
+        self.package_self[_package(self.codes[leaf].co_filename)] += dt
+        for key in seen:
+            self.incl[key] += dt
+        self.ours[mine] += dt
+
+
 class _Sampler:
-    """The main thread's stack every INTERVAL s while `active` (see the module doc)."""
+    """The stacks of the main thread and of the threads Python did not start (autograd's device
+    thread, where the CUDA backward's Python runs) every INTERVAL s while `active`; threads started
+    by `threading` (pinning, tqdm's monitor) are left out."""
 
     def __init__(self, ident):
         self.ident = ident
         self.active = False
         self.stop = threading.Event()
         self.codes = {}  # id(code) -> code (kept alive)
-        self.self_t = collections.Counter()
-        self.incl = collections.Counter()
-        self.ours = collections.Counter()
-        self.package_self = collections.Counter()
+        self.main = _Stacks(self.codes)
+        self.native = _Stacks(self.codes)  # threads not started by Python: the autograd engine's
         self.ticks = 0
         self.seconds = 0.0
         self.thread = threading.Thread(target=self._run, name="soup-cpu-profile", daemon=True)
@@ -158,38 +192,23 @@ class _Sampler:
 
     def _run(self):
         last = time.perf_counter()
+        me = threading.get_ident()
         while not self.stop.is_set():
             time.sleep(INTERVAL)
-            frame = sys._current_frames().get(self.ident)
+            frames = sys._current_frames()
             now = time.perf_counter()
             dt, last = now - last, now
-            if not self.active or frame is None:
+            if not self.active:
                 continue
             self.ticks += 1
             self.seconds += dt
-            seen = set()
-            leaf = None
-            mine = None
-            depth = 0
-            while frame is not None and depth < MAX_DEPTH:
-                code = frame.f_code
-                key = id(code)
-                if key not in self.codes:
-                    self.codes[key] = code
-                if leaf is None:
-                    leaf = key
-                if mine is None and "solution" in code.co_filename and (
-                        "/solution/" in code.co_filename.replace("\\", "/")):
-                    mine = key
-                seen.add(key)
-                frame = frame.f_back
-                depth += 1
-            del frame
-            self.self_t[leaf] += dt
-            self.package_self[_package(self.codes[leaf].co_filename)] += dt
-            for key in seen:
-                self.incl[key] += dt
-            self.ours[mine] += dt
+            python_threads = threading._active  # noqa: SLF001 - idents of the threads Python started
+            for ident, frame in frames.items():
+                if ident == self.ident:
+                    self.main.charge(frame, dt)
+                elif ident != me and ident not in python_threads:
+                    self.native.charge(frame, dt)
+            del frames
 
     def _name(self, key):
         if key is None:
@@ -201,18 +220,123 @@ class _Sampler:
         self.stop.set()
         _log(f"sampler over {steps} steps: {self.ticks} ticks, {self.seconds / steps * 1e3:.1f} ms per "
              f"step sampled ({self.seconds / max(self.ticks, 1) * 1e3:.2f} ms per tick)")
-        for package, t in self.package_self.most_common():
-            _log(f"  sampled self by package of the innermost Python frame: {package:14s} "
-                 f"{t / steps * 1e3:8.2f} ms/step")
-        _log("  sampled self (ms/step, innermost Python frame; includes the C calls it makes):")
-        for key, t in self.self_t.most_common(TOP):
-            _log(f"    self {t / steps * 1e3:8.2f}  {self._name(key)}")
-        _log("  sampled inclusive (ms/step):")
-        for key, t in self.incl.most_common(TOP * 2):
-            _log(f"    incl {t / steps * 1e3:8.2f}  {self._name(key)}")
-        _log("  sampled time by the innermost solution/ function on the stack (ms/step):")
-        for key, t in self.ours.most_common(TOP):
-            _log(f"    ours {t / steps * 1e3:8.2f}  {self._name(key)}")
+        for label, stacks in (("main thread", self.main), ("autograd thread (backward)", self.native)):
+            _log(f"  {label}: {stacks.seconds / steps * 1e3:.1f} ms/step with a Python frame")
+            for package, t in stacks.package_self.most_common():
+                _log(f"  [{label}] sampled self by package of the innermost Python frame: {package:14s} "
+                     f"{t / steps * 1e3:8.2f} ms/step")
+            _log(f"  [{label}] sampled self (ms/step, innermost Python frame; includes the C calls it makes):")
+            for key, t in stacks.self_t.most_common(TOP):
+                _log(f"    self {t / steps * 1e3:8.2f}  {self._name(key)}")
+            _log(f"  [{label}] sampled inclusive (ms/step):")
+            for key, t in stacks.incl.most_common(TOP * 2):
+                _log(f"    incl {t / steps * 1e3:8.2f}  {self._name(key)}")
+            _log(f"  [{label}] sampled time by the innermost solution/ function on the stack (ms/step):")
+            for key, t in stacks.ours.most_common(TOP):
+                _log(f"    ours {t / steps * 1e3:8.2f}  {self._name(key)}")
+
+
+class _Timeline:
+    """A CUDA event and a CPU time stamp at points of a step (`mark`); after the step's synchronize,
+    for each point: when the CPU passed it and when the GPU did, from the step's start (the GPU is
+    idle there). lag = GPU - CPU: about 0 where the GPU waits for the CPU (a CPU-bound stretch), large
+    where it is behind (a GPU-bound one). Averaged by step size."""
+
+    BUCKETS = ((0, 600, "<600"), (600, 900, "600-900"), (900, 10 ** 9, ">=900"))
+
+    def __init__(self):
+        self.active = False
+        self.marks = []
+        self.pool = []
+        self.order = []
+        self.sums = collections.defaultdict(lambda: [0, 0.0, 0.0])  # (bucket, name) -> n, cpu, gpu
+
+    def begin(self):
+        self.marks = []
+        self.active = True
+        self.mark("step begin")
+
+    def mark(self, name):
+        if not self.active:
+            return
+        import torch
+
+        event = self.pool.pop() if self.pool else torch.cuda.Event(enable_timing=True)
+        event.record()
+        self.marks.append((name, time.perf_counter(), event))
+
+    def end(self, tokens):
+        """After the step's synchronize."""
+        self.active = False
+        if not self.marks or tokens is None:
+            return
+        bucket = next(label for lo, hi, label in self.BUCKETS if lo <= tokens < hi)
+        _, t0, e0 = self.marks[0]
+        for name, t, event in self.marks:
+            if name not in self.order:
+                self.order.append(name)
+            entry = self.sums[(bucket, name)]
+            entry[0] += 1
+            entry[1] += (t - t0) * 1e3
+            entry[2] += e0.elapsed_time(event)
+        self.pool += [event for _, _, event in self.marks]
+        self.marks = []
+
+    def report(self):
+        if not self.sums:
+            return
+        labels = [label for _, _, label in self.BUCKETS]
+        _log("timeline (steps outside the profile window, mean per step size): point: CPU ms / GPU ms "
+             "/ lag ms (GPU behind the CPU; ~0: the GPU waits for the CPU) for " + ", ".join(
+                 f"{label} tokens ({self.sums[(label, 'step begin')][0]} steps)" for label in labels))
+        for name in self.order:
+            cells = []
+            for label in labels:
+                n, cpu, gpu = self.sums.get((label, name), (0, 0.0, 0.0))
+                cells.append(f"{cpu / n:7.1f} {gpu / n:7.1f} {(gpu - cpu) / n:6.1f}" if n else " " * 22)
+            _log(f"  {name:22s} | " + " | ".join(cells))
+
+
+_TIMELINE = _Timeline()
+
+
+def _install_marks(trainer):
+    """The timeline's points: every decoder layer's forward (pre-hook) and backward (weight_stream's
+    _LayerExit), the head (head_stream), the start of the backward (the head loss's backward)."""
+    from . import head_stream, weight_stream
+
+    marks = _TIMELINE
+    layers = weight_stream.find_decoder_layers(trainer.model)
+    handles = []
+    for i, layer in enumerate(layers):
+        def pre(module, args, i=i):
+            import torch
+
+            if torch.is_grad_enabled():
+                marks.mark(f"fwd layer {i}")
+        handles.append(layer.register_forward_pre_hook(pre))
+    head = head_stream.HeadStreamer.head
+
+    def timed_head(self, *args, **kwargs):
+        marks.mark("head begin")
+        try:
+            return head(self, *args, **kwargs)
+        finally:
+            marks.mark("head end")
+    head_stream.HeadStreamer.head = timed_head
+    loss_backward = head_stream.StreamedLMHeadLoss.backward
+
+    def timed_loss_backward(ctx, *grads):
+        marks.mark("backward begin")
+        return loss_backward(ctx, *grads)
+    head_stream.StreamedLMHeadLoss.backward = staticmethod(timed_loss_backward)
+    exit_backward = weight_stream._LayerExit.backward
+
+    def timed_exit_backward(ctx, grad):
+        marks.mark(f"bwd layer {ctx.index}")
+        return exit_backward(ctx, grad)
+    weight_stream._LayerExit.backward = staticmethod(timed_exit_backward)
+    return handles
 
 
 class _SyncWatch:
@@ -269,6 +393,7 @@ def make_callback(trainer):
             self.sampler = None
             self.sync = None
             self.hook = None
+            self.handles = []
 
         def _tokens_hook(self, module, args, kwargs=None):
             hidden = args[0] if args else (kwargs or {}).get("hidden_states")
@@ -282,8 +407,9 @@ def make_callback(trainer):
                 layers = find_decoder_layers(trainer.model)
                 if layers:
                     self.hook = layers[0].register_forward_pre_hook(self._tokens_hook)
+                self.handles = _install_marks(trainer)
             except Exception as exc:  # noqa: BLE001 - diagnostics only
-                _log(f"token hook not installed: {exc!r}")
+                _log(f"token hook or timeline marks not installed: {exc!r}")
             _log(f"window: cProfile steps {first}-{middle - 1}, sampler {middle}-{last}, "
                  f"sync watch step {last + 1}")
 
@@ -301,12 +427,23 @@ def make_callback(trainer):
                 self.sync = _SyncWatch()
                 self.sync.start()
             self.tokens = None
+            if step >= 2 and not first <= step <= last + 1:
+                _TIMELINE.begin()
             self.cpu0 = time.thread_time()
+            self.proc0 = time.process_time()
             self.t0 = time.perf_counter()
 
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            _TIMELINE.mark("optimizer begin")
+
+        def on_optimizer_step(self, args, state, control, **kwargs):
+            _TIMELINE.mark("optimizer end")
+
         def on_step_end(self, args, state, control, **kwargs):
+            _TIMELINE.mark("step end")
             issued = time.perf_counter()
             cpu = time.thread_time() - self.cpu0
+            proc = time.process_time() - self.proc0
             step = self.step
             if step == middle - 1 and self.profile is not None:
                 self.profile.disable()
@@ -314,7 +451,8 @@ def make_callback(trainer):
                 self.sampler.active = False
             torch.cuda.synchronize()
             end = time.perf_counter()
-            self.rows.append((step, self.tokens, end - self.t0, issued - self.t0, cpu))
+            _TIMELINE.end(self.tokens)
+            self.rows.append((step, self.tokens, end - self.t0, issued - self.t0, cpu, proc))
             if step == middle - 1 and self.profile is not None:
                 _report_cprofile(self.profile, middle - first)
                 self.profile = None
@@ -328,11 +466,15 @@ def make_callback(trainer):
         def on_train_end(self, args, state, control, **kwargs):
             if self.hook is not None:
                 self.hook.remove()
-            _log("per step: step, tokens, wall ms, issue ms (CPU queued the step), main-thread CPU ms")
-            for step, tokens, wall, issue, cpu in self.rows:
+            for handle in self.handles:
+                handle.remove()
+            _TIMELINE.report()
+            _log("per step: step, tokens, wall ms, issue ms (CPU queued the step), main-thread CPU ms, "
+                 "process CPU ms (all threads; a blocking CUDA wait spins and counts)")
+            for step, tokens, wall, issue, cpu, proc in self.rows:
                 tag = " profiled" if first <= step <= last + 1 else ""
                 _log(f"  step {step:3d} {tokens if tokens is not None else '?':>5} {wall * 1e3:8.1f} "
-                     f"{issue * 1e3:8.1f} {cpu * 1e3:8.1f}{tag}")
+                     f"{issue * 1e3:8.1f} {cpu * 1e3:8.1f} {proc * 1e3:8.1f}{tag}")
             plain = [r for r in self.rows if not (first <= r[0] <= last + 1) and r[0] >= 2]
             if plain:
                 short = [r for r in plain if r[1] is not None and r[1] < 600]
@@ -341,7 +483,8 @@ def make_callback(trainer):
                         n = len(rows)
                         _log(f"  {label}: {n} steps, mean wall {sum(r[2] for r in rows) / n * 1e3:.1f} ms, "
                              f"issue {sum(r[3] for r in rows) / n * 1e3:.1f} ms, "
-                             f"CPU {sum(r[4] for r in rows) / n * 1e3:.1f} ms")
+                             f"main-thread CPU {sum(r[4] for r in rows) / n * 1e3:.1f} ms, "
+                             f"process CPU {sum(r[5] for r in rows) / n * 1e3:.1f} ms")
 
     return CpuProfileCallback()
 

@@ -248,13 +248,14 @@ class HeadStreamer:
             raise HeadSkip("not a contiguous 2-D weight")
         if _registered(param) is not None:
             raise HeadSkip("the weight is streamed already")
-        from .weight_stream import pinned_host_buffer
+        from .weight_stream import _RING, CurrentStream, SideStream, pinned_host_buffer
 
         started = time.perf_counter()
         self.vocab, self.hidden = data.shape
         self.dtype, self.virtual_dtype = data.dtype, virtual_dtype
         self.device = data.device if source is None else torch.device(device)
         self._ring = None
+        self.host = None
         self.configure(rows, slots)
         nbytes = data.numel() * data.element_size()
         self._pinned = pinned if pinned is not None and pinned.buffer is not None and pinned.nbytes >= nbytes \
@@ -271,6 +272,11 @@ class HeadStreamer:
         # whether it helps against the other streams moving data at the end of the forward)
         high = os.environ.get("SOUP_SOLUTION_HEAD_COPY_PRIORITY", "").strip().lower() == "high"
         self._copy_stream = torch.cuda.Stream(device=self.device, priority=-1 if high else 0)
+        self._side = SideStream(self._copy_stream)
+        self._compute = CurrentStream(self.device)
+        # SOUP_SOLUTION_STREAM_TIMING=1 (weight_stream.py): the chunks' copies and the head's waits
+        # for them are timed with CUDA events (stats(), the log line at exit)
+        self.timing = _RING["stream_timing"]
         self._staging, self._staging_done = None, None
         self._spans = collections.deque()
         self._spare_events = []
@@ -312,6 +318,8 @@ class HeadStreamer:
         self._ready = [torch.cuda.Event() for _ in range(slots)]
         self._free = [torch.cuda.Event() for _ in range(slots)]
         self._owner = [-1] * slots
+        self._host_chunks = None  # host[c0:c0 + vc] of every chunk, made once (_chunk_views)
+        self._slot_views = None  # the ring's views per chunk, made once per ring
 
     @property
     def host_bytes(self):
@@ -362,21 +370,43 @@ class HeadStreamer:
         c0 = c * self.rows
         return c0, min(self.rows, self.vocab - c0)
 
-    def _load(self, c):
+    def _host_chunk(self, c):
+        """host[c0:c0 + vc] of chunk c (the views of all chunks made once)."""
+        if self._host_chunks is None:
+            self._host_chunks = [self.host[c0:c0 + vc]
+                                 for c0, vc in (self._chunk(j) for j in range(self.n_chunks))]
+        return self._host_chunks[c]
+
+    def _slot_view(self, c):
+        """(ring view that chunk c is copied into, its transpose): every chunk but the last fills
+        its slot, so a ring has slots + 1 distinct views, made once per ring."""
+        views = self._slot_views
+        if views is None:
+            full = [(self._ring[s], self._ring[s].t()) for s in range(self.slots)]
+            last = self.n_chunks - 1
+            tail = self._ring[last % self.slots, :self._chunk(last)[1]]
+            views = self._slot_views = (full, (tail, tail.t()))
+        return views[1] if c == self.n_chunks - 1 else views[0][c % self.slots]
+
+    def _load(self, c, compute=None):
         """Starts the copy of chunk c into its slot on the copy stream, after the compute queued so
         far (which includes every use of the slot's previous chunk, and the ring's allocation)."""
         s = c % self.slots
-        c0, vc = self._chunk(c)
-        compute = torch.cuda.current_stream(self.device)
-        self._free[s].record(compute)
-        begin, end = self._event(), self._event()
-        with torch.cuda.stream(self._copy_stream):
-            self._copy_stream.wait_event(self._free[s])
-            begin.record(self._copy_stream)
-            self._ring[s, :vc].copy_(self.host[c0:c0 + vc], non_blocking=True)
-            end.record(self._copy_stream)
-            self._ready[s].record(self._copy_stream)
-        self._spans.append(("copy", begin, end, vc * self.hidden * self.host.element_size()))
+        copy_stream = self._copy_stream
+        self._free[s].record(self._compute() if compute is None else compute)
+        dst, src = self._slot_view(c)[0], self._host_chunk(c)
+        timed = self.timing
+        with self._side():
+            copy_stream.wait_event(self._free[s])
+            if timed:
+                begin, end = self._event(), self._event()
+                begin.record(copy_stream)
+            dst.copy_(src, non_blocking=True)
+            if timed:
+                end.record(copy_stream)
+            self._ready[s].record(copy_stream)
+        if timed:
+            self._spans.append(("copy", begin, end, src.numel() * src.element_size()))
         self._owner[s] = c
         self.loads += 1
 
@@ -386,28 +416,31 @@ class HeadStreamer:
             self._ring = torch.empty(self.slots, self.rows, self.hidden, dtype=self.dtype,
                                      device=self.device)
             self._owner = [-1] * self.slots
+            self._slot_views = None
         for c in range(min(self.slots, self.n_chunks)):
             if self._owner[c % self.slots] != c:
                 self._load(c)
 
-    def _acquire(self, c):
-        """Chunk c on the GPU: the compute stream waits for its copy."""
+    def _acquire(self, c, compute):
+        """Chunk c on the GPU, (W_c, W_c^T): the compute stream waits for its copy."""
         s = c % self.slots
         if self._owner[s] != c:
-            self._load(c)
+            self._load(c, compute)
             self.late_loads += 1
-        compute = torch.cuda.current_stream(self.device)
-        begin, end = self._event(), self._event()
-        begin.record(compute)
-        compute.wait_event(self._ready[s])
-        end.record(compute)
-        self._spans.append(("wait", begin, end, 0))
-        return self._ring[s, :self._chunk(c)[1]]
+        if self.timing:
+            begin, end = self._event(), self._event()
+            begin.record(compute)
+            compute.wait_event(self._ready[s])
+            end.record(compute)
+            self._spans.append(("wait", begin, end, 0))
+        else:
+            compute.wait_event(self._ready[s])
+        return self._slot_view(c)
 
-    def _release(self, c):
+    def _release(self, c, compute):
         """Chunk c's GEMMs are queued: its slot takes chunk c + K."""
         if c + self.slots < self.n_chunks:
-            self._load(c + self.slots)
+            self._load(c + self.slots, compute)
 
     # ---- the head --------------------------------------------------------------------------
 
@@ -434,29 +467,39 @@ class HeadStreamer:
         if self.fp32_out is None:
             self.fp32_out = _fp32_out_gemm_works(self.device)
         self.prefetch()  # a no-op for the chunks prefetched at the final norm (or the embedding)
+        compute = self._compute()
+        cast = self.dtype != dtype
+        grid, rows, vocab = (n,), self.rows, self.vocab
+        stride_acc, stride_wt, out = acc.stride(0), wt.stride(0), acc[:n_lab]
+        views = {}  # chunk rows -> (logits view, its labelled rows): two sizes at most
         with torch.autocast("cuda", enabled=False):
             for c in range(self.n_chunks):
-                c0, vc = self._chunk(c)
-                w = self._acquire(c)
-                if w.dtype != dtype:
+                c0 = c * rows
+                vc = min(rows, vocab - c0)
+                w, w_t = self._acquire(c, compute)
+                if cast:
                     w = w.to(dtype)
-                logits = buffer[:n * vc].view(n, vc)
-                torch.mm(hidden16, w.t(), out=logits)
-                head_chunk_kernel[(n,)](
-                    logits, logits.stride(0), targets, m, s, e, best, x_t, idx,
-                    acc, acc.stride(0), w, w.stride(0), wt, wt.stride(0), c0, vc, n_lab, d,
+                    w_t = w.t()
+                chunk = views.get(vc)
+                if chunk is None:
+                    logits = buffer[:n * vc].view(n, vc)
+                    chunk = views[vc] = (logits, logits[:n_lab])
+                logits, p = chunk
+                torch.mm(hidden16, w_t, out=logits)
+                head_chunk_kernel[grid](
+                    logits, vc, targets, m, s, e, best, x_t, idx,
+                    acc, stride_acc, w, w.stride(0), wt, stride_wt, c0, vc, n_lab, d,
                     FIRST=c == 0, IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D,
                     num_warps=self.num_warps,
                 )
                 if n_lab > 0:
-                    p, out = logits[:n_lab], acc[:n_lab]
                     if self.fp32_out:
                         torch.addmm(out, p, w, beta=0 if c == 0 else 1, out_dtype=torch.float32, out=out)
                     elif c == 0:
                         out.copy_(torch.mm(p, w))
                     else:
                         out.add_(torch.mm(p, w))
-                self._release(c)
+                self._release(c, compute)
         head_finish_kernel[(n,)](
             targets, m, s, e, x_t, idx, loss, entropy, correct,
             acc, acc.stride(0), wt, wt.stride(0), grad_scale, n_lab, d,
@@ -466,9 +509,10 @@ class HeadStreamer:
             acc.zero_()
         # every copy into the ring has been waited for by the compute stream: freeing it on the
         # compute stream needs no record_stream
-        self._ring, self._owner = None, [-1] * self.slots
+        self._ring, self._owner, self._slot_views = None, [-1] * self.slots, None
         self.heads += 1
-        self._harvest()
+        if self._spans:
+            self._harvest()
         return loss, entropy, correct, acc
 
     # ---- the module overrides --------------------------------------------------------------
@@ -491,7 +535,8 @@ class HeadStreamer:
         rows.copy_(staging, non_blocking=True)
         if self._staging_done is None:
             self._staging_done = torch.cuda.Event()
-        self._staging_done.record(torch.cuda.current_stream(device))
+        self._staging_done.record(self._compute() if device == self.device
+                                  else torch.cuda.current_stream(device))
         return rows.to(self.virtual_dtype).view(*ids.shape, self.hidden)
 
     def linear(self, x, bias=None):
@@ -540,7 +585,7 @@ class HeadStreamer:
         return {"heads": self.heads, "loads": self.loads, "late_loads": self.late_loads,
                 "copies_timed": self.copies_timed, "copy_ms": self.copy_ms,
                 "copy_gbps": self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None,
-                "wait_ms": self.wait_ms}
+                "wait_ms": self.wait_ms, "timing": self.timing}
 
 
 def _deepcopy_param(streamer_ref, param_ref, memo):
@@ -821,6 +866,10 @@ def _report(ref, log):
         st = streamer.stats()
     except Exception as exc:  # noqa: BLE001 - CUDA may be gone at exit
         log(f"[solution] head stream: {streamer.heads} heads ({exc!r})")
+        return
+    if not st["timing"]:
+        log(f"[solution] head stream: {st['heads']} heads, {st['loads']} chunk copies ({st['late_loads']} "
+            f"not prefetched); copies and waits untimed (SOUP_SOLUTION_STREAM_TIMING=1 times them)")
         return
     copy = (f"{st['copy_ms'] / st['copies_timed']:.2f} ms per chunk at {st['copy_gbps']:.1f} GB/s"
             if st["copies_timed"] and st["copy_gbps"] else "no timed copies")

@@ -831,7 +831,7 @@ def test_weights_are_the_same_with_the_cpu_diet(layer_1p5b, cpu_diet):
         cpu_diet["diet"] = True
         got = fused_proj._weights(bases, torch.float16, torch.device("cuda"))
         assert torch.equal(got, ref), [b.out_features for b in bases]
-        assert all("_soup_nf4_packed" in vars(b) and vars(b)["_soup_nf4_packed"][1] for b in bases)
+        assert all("_soup_nf4_args" in vars(b) and vars(b)["_soup_nf4_args"][1] for b in bases)
 
 
 def test_adapter_halves_refresh_every_layer_in_one_copy(monkeypatch):
@@ -898,18 +898,60 @@ def test_attention_is_the_same_with_the_cpu_diet(layer_1p5b, cpu_diet, dropout):
             proj.lora_dropout["default"] = torch.nn.Identity()
 
 
-def test_dequant3_kernel_is_warmed_up(layer_1p5b, cpu_diet):
+def test_dequant4_kernel_is_warmed_up(layer_1p5b, cpu_diet):
+    from types import SimpleNamespace
+
     from solution import fused_proj, warmup
 
     _, attn, _, _ = layer_1p5b
     cpu_diet["diet"] = True
     compiles = warmup.watch_compiles(log=False)
-    fused_proj.nf4_dequant3_kernel.device_caches.clear()
+    fused_proj.nf4_dequant4_kernel.device_caches.clear()
     compiles.clear()
-    fused_proj._warm_dequant3()
-    assert [c["kernel"] for c in compiles] == ["nf4_dequant3_kernel"]
+    fused_proj._warm_dequant4()
+    assert [c["kernel"] for c in compiles] == ["nf4_dequant4_kernel"]
     compiles.clear()
-    fused_proj._weights((attn.q_proj.base_layer, attn.k_proj, attn.v_proj.base_layer),
-                        warmup.training_half_dtype(), torch.device("cuda"))
-    assert [c for c in compiles if c["kernel"] == "nf4_dequant3_kernel"] == []
-    assert "fused_proj_nf4_dequant3" in [name for name, _ in warmup.WARMUPS]
+    plan = SimpleNamespace(half=warmup.training_half_dtype(), o_base=attn.o_proj,
+                           bases=(attn.q_proj.base_layer, attn.k_proj, attn.v_proj.base_layer))
+    fused_proj._attn_weights(plan, torch.device("cuda"))
+    assert [c for c in compiles if c["kernel"] == "nf4_dequant4_kernel"] == []
+    assert "fused_proj_nf4_dequant4" in [name for name, _ in warmup.WARMUPS]
+
+
+def test_attention_weights_one_launch_and_reuse(layer_1p5b, cpu_diet, monkeypatch):
+    """q, k, v and o in one launch, bitwise the four dequantizations; asked again with nothing
+    written into the buffer since: no launch, the same views; after another weight went into the
+    buffer: launched again. _weights skips a repeat of exactly what the buffer holds the same way."""
+    from types import SimpleNamespace
+
+    from solution import fused_proj
+    from solution.nf4 import dequantize_nf4
+
+    _, attn, mlp, _ = layer_1p5b
+    cpu_diet["diet"] = True
+    launches = []
+    many, one = fused_proj._launch_many, fused_proj._launch_one
+    monkeypatch.setattr(fused_proj, "_launch_many", lambda ops, out: (launches.append(len(ops)),
+                                                                     many(ops, out)))
+    monkeypatch.setattr(fused_proj, "_launch_one", lambda ops, out: (launches.append(1), one(ops, out)))
+    bases = (attn.q_proj.base_layer, attn.k_proj, attn.v_proj.base_layer)
+    plan = SimpleNamespace(half=torch.float16, bases=bases, o_base=attn.o_proj)
+    device = torch.device("cuda")
+    ref_qkv = torch.cat([dequantize_nf4(b.weight, b.weight.quant_state, torch.float16) for b in bases])
+    ref_o = dequantize_nf4(attn.o_proj.weight, attn.o_proj.weight.quant_state, torch.float16)
+    qkv, o = fused_proj._attn_weights(plan, device)
+    assert launches == [4] and torch.equal(qkv, ref_qkv) and torch.equal(o, ref_o)
+    again = fused_proj._attn_weights(plan, device)
+    assert launches == [4] and again[0] is qkv and again[1] is o
+    down = fused_proj._weights((mlp.down_proj,), torch.float16, device)
+    assert launches == [4, 1]
+    assert fused_proj._weights((mlp.down_proj,), torch.float16, device) is down and launches == [4, 1]
+    assert torch.equal(down, dequantize_nf4(mlp.down_proj.weight, mlp.down_proj.weight.quant_state,
+                                            torch.float16))
+    qkv, o = fused_proj._attn_weights(plan, device)
+    assert launches == [4, 1, 4] and torch.equal(qkv, ref_qkv) and torch.equal(o, ref_o)
+    fused_proj._buffer(device, torch.float16, 16)  # any other writer of the buffer
+    fused_proj._attn_weights(plan, device)
+    assert launches == [4, 1, 4, 4]
+    cpu_diet["diet"] = False
+    assert fused_proj._attn_weights(plan, device) is None

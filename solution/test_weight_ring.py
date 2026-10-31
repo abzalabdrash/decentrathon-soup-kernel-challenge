@@ -92,6 +92,14 @@ def test_type_ring_matches_layer_ring(layer_shaped_qwen_dir, night, monkeypatch,
         return rebuild(bases, dtype, device, offset)
 
     monkeypatch.setattr(fused_proj, "_weights", slow_weights)
+    attn_rebuild = fused_proj._attn_weights  # q, k, v and o in one launch (SOUP_SOLUTION_CPU_DIET)
+
+    def slow_attn_weights(plan, device):
+        if sleep[0]:
+            torch.cuda._sleep(sleep[0])
+        return attn_rebuild(plan, device)
+
+    monkeypatch.setattr(fused_proj, "_attn_weights", slow_attn_weights)
 
     def step():
         if attention == "math":
@@ -130,6 +138,7 @@ def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night, monkey
     from solution.weight_stream import find_decoder_layers, stream_model_weights
 
     monkeypatch.setitem(weight_stream._RING, "timing", timing)
+    monkeypatch.setitem(weight_stream._RING, "stream_timing", True)  # the attention group's
     model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
     layers = find_decoder_layers(model)
     streamer = stream_model_weights(model, slots=2, ring="type")
