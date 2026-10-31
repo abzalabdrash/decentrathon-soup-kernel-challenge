@@ -341,6 +341,7 @@ class Offloader:
         self.host = _HostStack(host_limit)
         self.inflight = collections.deque()
         self.early = {}  # data_ptr -> handle of a tensor whose copy offload_early started
+        self.pending = None  # weak reference to the tensor offload_early noted for int8
         self.reads = []  # events after H2D reads on a current stream, not yet waited for by side
         self.by_index = weakref.WeakValueDictionary()
         self.count = 0
@@ -392,8 +393,9 @@ class Offloader:
                 self.stats["residuals" if keep else "marked"] += 1
             return saved
 
-    def _offload(self, tensor, int8=False):
-        """`int8`: the tensor (2-D, offload_int8.applies) goes as offload_int8's buffer."""
+    def _offload(self, tensor, int8=False, spare=None):
+        """`int8`: the tensor (2-D, offload_int8.applies) goes in offload_int8's int8 form (its values
+        in `spare`'s storage when given)."""
         if tensor.device != self.device:
             return tensor
         inflight = self.inflight
@@ -412,15 +414,20 @@ class Offloader:
         side = self.stream
         home = self._current()
         # the quantization runs on home before the copy's order event: the copy reads its output
-        wire, codec = offload_int8.encode(tensor) if int8 else (tensor, None)
+        wire, codec = offload_int8.encode(tensor, spare) if int8 else (tensor, None)
         self._order.record(home)
         side.wait_event(self._order)
         for event in self.reads:
             side.wait_event(event)
         self.reads.clear()
-        host = host.view(wire.dtype).view(wire.shape)
+        if codec is None:
+            host = host.view(wire.dtype).view(wire.shape)
         with self._side():
-            host.copy_(wire, non_blocking=True)
+            if type(wire) is tuple:  # (q, s): into the halves of the one host buffer the H2D brings back
+                for part, dest in zip(wire, offload_int8.views(host, *tensor.shape)):
+                    dest.copy_(part, non_blocking=True)
+            else:
+                host.copy_(wire, non_blocking=True)
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
         saved.slot, saved.host, saved.copied = slot, host, side.record_event()
@@ -465,7 +472,8 @@ class Offloader:
             else:
                 saved.home.wait_event(saved.copied)  # the D2H may still be reading it
                 if saved.home != current:
-                    tensor.record_stream(current)
+                    for part in tensor if type(tensor) is tuple else (tensor,):
+                        part.record_stream(current)
                 saved.gpu = None
                 try:
                     self.inflight.remove(saved)
@@ -551,18 +559,27 @@ EARLY = os.environ.get("SOUP_SOLUTION_OFFLOAD_EARLY", "1").strip().lower() not i
     "0", "false", "no", "")
 
 
-def offload_early(tensor):
+def offload_early(tensor, spare=None):
     """Starts the D2H copy of `tensor` now when the active Offloader would offload it on its pack
-    (the MLP's (gate|up), still in the custom Function's forward), as int8 when offload_int8 applies;
-    the pack of the same tensor right after the forward returns this handle."""
+    (the MLP's (gate|up), still in the custom Function's forward); the pack of the same tensor right
+    after the forward returns this handle. When offload_int8 applies, the first call only notes the
+    tensor, and the second, with `spare` (the MLP's hidden activation after its last reader, the down
+    GEMM), quantizes it into spare's storage and starts that copy: no new buffer of its size."""
     offloader = _ACTIVE["offloader"]
     if offloader is None:
         return
     from . import offload_int8
 
-    if offloader.eligible(tensor) and offload_int8.applies(tensor):
+    if spare is not None:
+        pending = offloader.pending
+        offloader.pending = None
+        if pending is None or pending() is not tensor:
+            return  # went half (or not at all) at the first call
         with offloader.lock:
-            saved = offloader._offload(tensor, int8=True)
+            saved = offloader._offload(tensor, int8=True, spare=spare)
+    elif offloader.eligible(tensor) and offload_int8.applies(tensor):
+        offloader.pending = weakref.ref(tensor)
+        return
     else:
         saved = offloader.pack(tensor)
     if saved is not tensor:

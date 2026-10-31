@@ -79,9 +79,18 @@ class Keep(torch.autograd.Function):
         return grad * saved, None
 
 
-def _chain(values, early, delay):
-    """x through one Keep per tensor of `values` (each made fresh on the GPU, offload_early first when
-    `early`), with GPU sleeps between, inside offload_saved_tensors; returns x.grad and the stats."""
+def _spare(t, kind):
+    """What the fused MLP passes as offload_early's spare: its hidden activation ((rows / 2, tokens)
+    half, exactly the int8 size), or a tensor too small to hold it (an int8 buffer is allocated)."""
+    rows, tokens = t.shape
+    return torch.empty((rows // 2, tokens) if kind == "hidden" else (8, tokens), dtype=t.dtype,
+                       device=t.device)
+
+
+def _chain(values, early, delay, spare="hidden"):
+    """x through one Keep per tensor of `values` (each made fresh on the GPU, offload_early's two
+    calls first, as the fused MLP makes them), with GPU sleeps between, inside offload_saved_tensors;
+    returns x.grad and the stats."""
     from solution.offload import offload_early, offload_saved_tensors
 
     x = torch.ones(values[0].shape, device="cuda", dtype=torch.float16, requires_grad=True)
@@ -92,6 +101,7 @@ def _chain(values, early, delay):
             offload_early(t)
             if delay:
                 torch.cuda._sleep(SLEEP // 4)
+            offload_early(t, spare=_spare(t, spare))
             h = Keep.apply(h, t)
             del t
         if delay:
@@ -101,8 +111,9 @@ def _chain(values, early, delay):
     return x.grad, off.stats
 
 
+@pytest.mark.parametrize("spare", ["hidden", "small"])
 @pytest.mark.parametrize("knobs", [{}, {"prefetch": 0}, {"max_inflight": 4}])
-def test_int8_handles_through_every_way_back(int8_on, knobs):
+def test_int8_handles_through_every_way_back(int8_on, knobs, spare):
     """Six (gate|up)-shaped tensors offloaded early as int8: the backward gets each one rebuilt from
     its int8 form (the product of all of them, exactly), whichever way it came back."""
     tokens = 256
@@ -114,7 +125,7 @@ def test_int8_handles_through_every_way_back(int8_on, knobs):
     for r in reversed(rebuilt):  # the backward multiplies from the last Keep to the first
         expected = expected * r
     knobs = {"min_numel": 1, **knobs}
-    grad, stats = _chain(values, knobs, delay=True)
+    grad, stats = _chain(values, knobs, delay=True, spare=spare)
     assert stats["int8"] == 6 and stats["early"] == 6
     back = stats["still_on_gpu"] + stats["prefetch_hits"] + stats["fetched"]
     assert back == 6
@@ -134,6 +145,7 @@ def test_written_after_quantization_goes_half(int8_on):
     t = (torch.randn(2 * 8960, 64, device="cuda") * 0.3).half()
     with offload_saved_tensors(min_numel=1) as off:
         offload_early(t)
+        offload_early(t, spare=_spare(t, "hidden"))
         t.add_(1)
         h = Keep.apply(x, t)
         h.backward(torch.ones_like(h))
@@ -262,6 +274,7 @@ def test_no_record_stream_and_no_cpu_wait_on_the_int8_path(int8_on, monkeypatch)
         for x, v in zip(xs, values):
             t = v.clone()
             offload.offload_early(t)
+            offload.offload_early(t, spare=_spare(t, "hidden"))
             ys.append(Keep.apply(x, t))
             del t
         torch.cuda._sleep(SLEEP)  # the copies are still queued when the backward starts
@@ -322,9 +335,11 @@ def test_raw_unpack_feeds_the_int8_backward_directly(int8_on, monkeypatch, resto
             h.backward(grad)
         torch.cuda.synchronize()
         assert off.stats["int8"] == len(layers)
-        return x.grad, len(decoded)
+        return x.grad, len(decoded), off.stats["still_on_gpu"]
 
-    ref, rebuilt = go(False)
-    got, rebuilt_fused = go(True)
-    assert rebuilt == len(layers) and rebuilt_fused == 0
+    ref, rebuilt, _ = go(False)
+    got, rebuilt_fused, on_gpu = go(True)
+    # a layer whose int8 pair is still on the GPU (q in its hidden's storage) is rebuilt: autograd
+    # takes a tensor from the unpack
+    assert rebuilt == len(layers) and rebuilt_fused == on_gpu < len(layers)
     assert torch.equal(got, ref)

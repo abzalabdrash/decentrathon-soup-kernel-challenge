@@ -92,7 +92,10 @@ def wire_bytes(rows, tokens):
 
 
 def views(wire, rows, tokens):
-    """(q (rows, tokens) int8, s (rows // GROUP, tokens) fp32) inside a uint8 buffer of wire_bytes."""
+    """(q (rows, tokens) int8, s (rows // GROUP, tokens) fp32) inside a uint8 buffer of wire_bytes, or
+    the pair itself (encode with a spare tensor)."""
+    if isinstance(wire, tuple):
+        return wire
     off = _scales_offset(rows, tokens)
     q = wire[:rows * tokens].view(torch.int8).view(rows, tokens)
     s = wire[off:off + 4 * (rows // GROUP) * tokens].view(torch.float32).view(rows // GROUP, tokens)
@@ -104,8 +107,8 @@ def _grid(rows, tokens):
 
 
 class Codec:
-    """What the offload keeps to rebuild one tensor: its shape and dtype (the int8 buffer itself is
-    the offload's GPU or host copy)."""
+    """What the offload keeps to rebuild one tensor: its shape and dtype (the int8 form itself is the
+    offload's GPU or host copy: one uint8 buffer of wire_bytes, or the (q, s) pair encode made)."""
 
     __slots__ = ("shape", "dtype")
 
@@ -113,14 +116,15 @@ class Codec:
         self.shape, self.dtype = shape, dtype
 
     def unpacked(self, wire):
-        """What the unpack hands over: the uint8 buffer itself inside raw(True), else decode(wire)."""
-        return wire if RAW["now"] else self.decode(wire)
+        """What the unpack hands over: the uint8 buffer itself inside raw(True), else decode(wire) (a
+        (q, s) pair still on the GPU is rebuilt too: autograd takes a tensor)."""
+        return wire if RAW["now"] and not isinstance(wire, tuple) else self.decode(wire)
 
     def decode(self, wire):
-        """The half (rows, tokens) tensor from its int8 buffer on the GPU, on the current stream."""
+        """The half (rows, tokens) tensor from its int8 form on the GPU, on the current stream."""
         rows, tokens = self.shape
         q, s = views(wire, rows, tokens)
-        out = torch.empty(self.shape, dtype=self.dtype, device=wire.device)
+        out = torch.empty(self.shape, dtype=self.dtype, device=q.device)
         gu_dequant_kernel[_grid(rows, tokens)](q, s, out, tokens, GROUP=GROUP, TM=TILE_M, num_warps=4)
         return out
 
@@ -129,6 +133,8 @@ class Codec:
 def raw(on):
     """While active with `on` (and SOUP_SOLUTION_OFFLOAD_INT8_FUSED), the unpack of an int8 handle
     returns its uint8 buffer (wire_bytes of its shape) instead of the rebuilt half tensor."""
+    if _STATE["on"] and _STATE["thread"] is None and not _READY.is_set():
+        _start_compile()  # at the first MLP backward, as int8_bwd.py: not in the first forward
     previous = RAW["now"]
     RAW["now"] = bool(on) and RAW["on"]
     try:
@@ -137,12 +143,30 @@ def raw(on):
         RAW["now"] = previous
 
 
-def encode(tensor):
-    """(uint8 buffer of wire_bytes on the tensor's device, Codec), the quantization queued on the
-    current stream."""
+def _spare_q(spare, rows, tokens, device):
+    """A (rows, tokens) int8 view of `spare`'s storage when it is a contiguous CUDA tensor on `device`
+    owning at least that many bytes, else None."""
+    if spare is None or not spare.is_cuda or spare.device != device or not spare.is_contiguous():
+        return None
+    flat = spare.view(-1)
+    if flat.numel() * flat.element_size() < rows * tokens:
+        return None
+    return flat.view(torch.uint8)[:rows * tokens].view(torch.int8).view(rows, tokens)
+
+
+def encode(tensor, spare=None):
+    """(int8 form, Codec), the quantization queued on the current stream. The int8 form is one uint8
+    buffer of wire_bytes, or with `spare` (a tensor nobody reads any more, of at least rows * tokens
+    bytes: the MLP's hidden activation after the down GEMM) the pair (q in spare's storage, s): only
+    the scales are allocated."""
     rows, tokens = tensor.shape
-    wire = torch.empty(wire_bytes(rows, tokens), dtype=torch.uint8, device=tensor.device)
-    q, s = views(wire, rows, tokens)
+    q = _spare_q(spare, rows, tokens, tensor.device)
+    if q is not None:
+        s = torch.empty((rows // GROUP, tokens), dtype=torch.float32, device=tensor.device)
+        wire = (q, s)
+    else:
+        wire = torch.empty(wire_bytes(rows, tokens), dtype=torch.uint8, device=tensor.device)
+        q, s = views(wire, rows, tokens)
     gu_quant_kernel[_grid(rows, tokens)](tensor, q, s, tokens, GROUP=GROUP, TM=TILE_M, num_warps=4)
     return wire, Codec(tensor.shape, tensor.dtype)
 
@@ -156,11 +180,10 @@ def applies(tensor):
             or not tensor.is_contiguous() or tensor.shape[0] % GROUP or tensor.shape[1] < 1):
         return False
     _STATE["calls"] += 1
-    if not _READY.is_set():
-        _start_compile()
     if _STATE["calls"] <= START_CALLS:
         return False  # half for the first START_CALLS, compiled or not: the switch point is fixed
     if not _READY.is_set():
+        _start_compile()  # raw() starts it at the first MLP backward; here only without one
         _STATE["thread"].join()
     return _READY.is_set()
 
