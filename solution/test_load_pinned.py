@@ -1139,6 +1139,25 @@ def test_tiny_load_spec_bit_equal(patched, tiny_dir, monkeypatch):
 
 
 @cuda
+def test_tiny_load_spec_through_symlinks(patched, tiny_dir, monkeypatch, tmp_path):
+    """A checkpoint opened through symlinks (as in the Hugging Face cache: snapshot -> blob): handed over."""
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    for name in os.listdir(tiny_dir):
+        (snapshot / name).symlink_to(os.path.join(str(tiny_dir), name))
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_spec)
+    _early_read(monkeypatch, tiny_dir)  # read from the real files
+    load_spec = _spec_on(monkeypatch, torch.float16)
+    ours = _load_in_setup(patched, snapshot, _with_spec)  # transformers opens the symlinks
+    snapshot_, (handed, planned, early, fallbacks, reason) = ours["result"]
+    assert handed == LAYERS * 7, load_spec.LAST
+    _compare(snapshot_, without["result"][0])
+
+
+@cuda
 def test_tiny_load_spec_mismatch_falls_back(patched, tiny_dir, monkeypatch):
     """Speculated in another dtype than the load's: dropped at the first weight, the loop does it all."""
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")

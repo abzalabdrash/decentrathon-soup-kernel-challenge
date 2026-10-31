@@ -199,7 +199,13 @@ def stand_in(path, key, shape, dtype, device, model):
     """For the loop's job of checkpoint tensor `key`: a stand-in carrying the thread's result when every
     check passes, else None (the job runs as usual)."""
     spec = _STATE["spec"]
-    if spec is None or spec.stop or (path, key) not in spec.keys:
+    if spec is None or spec.stop:
+        return None
+    from .load_early import _covered
+
+    read = _covered(path)  # the file read ahead that `path` is (transformers opens the cache's symlinks)
+    path = read.path if read is not None else path
+    if (path, key) not in spec.keys:
         return None  # not one of the weights it quantizes (norms, biases, the embedding): the job as usual
     try:
         import bitsandbytes as bnb
