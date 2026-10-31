@@ -437,9 +437,14 @@ def _ring_aware(mlp):
     return getattr(type(mlp).forward, "_soup_weight_ring", False) is True
 
 
+def _layer_backward(streamer, index):
+    """The gradient reached layer `index`'s output: its own backward comes next."""
+    streamer._use(index, -1)
+
+
 class _LayerExit(torch.autograd.Function):
     """Identity on a layer's output; its backward runs right before the layer's own backward and
-    brings the layer's weights into its slot."""
+    brings the layer's weights into its slot (SOUP_SOLUTION_LAYER_EXIT_HOOK=0)."""
 
     @staticmethod
     def forward(ctx, hidden, streamer, index):
@@ -448,8 +453,20 @@ class _LayerExit(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        ctx.streamer._use(ctx.index, -1)
+        _layer_backward(ctx.streamer, ctx.index)
         return grad, None, None
+
+
+# SOUP_SOLUTION_LAYER_EXIT_HOOK=1 (the default since task C1): the layer's backward marker is a hook
+# on its output tensor instead of _LayerExit. autograd calls a tensor's hooks when that tensor's
+# gradient is complete, right before the node that made it runs its backward, which is where
+# _LayerExit's backward ran (it consumed exactly that gradient and handed it on): the same order of
+# work, one Python autograd node less per layer each way
+_EXIT = {"hook": _env_on("SOUP_SOLUTION_LAYER_EXIT_HOOK", "1")}
+
+
+def _exit_hook(streamer, index, grad):
+    _layer_backward(streamer, index)
 
 
 class WeightStreamer:
@@ -779,6 +796,13 @@ class WeightStreamer:
 
     def _after(self, index, module, args, output):
         if not self.active:
+            return None
+        if _EXIT["hook"]:
+            target = output if torch.is_tensor(output) else (
+                output[0] if isinstance(output, tuple) and output and torch.is_tensor(output[0])
+                else None)
+            if target is not None and target.requires_grad:
+                target.register_hook(functools.partial(_exit_hook, self, index))
             return None
         if torch.is_tensor(output):
             return _LayerExit.apply(output, self, index) if output.requires_grad else None

@@ -302,7 +302,7 @@ _TIMELINE = _Timeline()
 
 def _install_marks(trainer):
     """The timeline's points: every decoder layer's forward (pre-hook) and backward (weight_stream's
-    _LayerExit), the head (head_stream), the start of the backward (the head loss's backward)."""
+    _layer_backward), the head (head_stream), the start of the backward (the head loss's backward)."""
     from . import head_stream, weight_stream
 
     marks = _TIMELINE
@@ -330,12 +330,12 @@ def _install_marks(trainer):
         marks.mark("backward begin")
         return loss_backward(ctx, *grads)
     head_stream.StreamedLMHeadLoss.backward = staticmethod(timed_loss_backward)
-    exit_backward = weight_stream._LayerExit.backward
+    layer_backward = weight_stream._layer_backward
 
-    def timed_exit_backward(ctx, grad):
-        marks.mark(f"bwd layer {ctx.index}")
-        return exit_backward(ctx, grad)
-    weight_stream._LayerExit.backward = staticmethod(timed_exit_backward)
+    def timed_layer_backward(streamer, index):
+        marks.mark(f"bwd layer {index}")
+        return layer_backward(streamer, index)
+    weight_stream._layer_backward = timed_layer_backward
     return handles
 
 

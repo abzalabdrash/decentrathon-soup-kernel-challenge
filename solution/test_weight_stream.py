@@ -664,8 +664,7 @@ def test_fused_proj_backward_after_marker(layer_shaped_qwen_dir, monkeypatch):
         checked = list(events)
         # the check sees a backward without the marker's loads: the forward still matches, the
         # gradients of the layers whose slots hold later layers at the end of the forward do not
-        monkeypatch.setattr(weight_stream._LayerExit, "backward",
-                            staticmethod(lambda ctx, grad: (grad, None, None)))
+        monkeypatch.setattr(weight_stream, "_layer_backward", lambda streamer, index: None)
         broken = step()
         assert torch.equal(broken[0], reference[0]) and not _same(reference, broken)
     finally:

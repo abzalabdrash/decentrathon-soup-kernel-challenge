@@ -955,3 +955,61 @@ def test_attention_weights_one_launch_and_reuse(layer_1p5b, cpu_diet, monkeypatc
     assert launches == [4, 1, 4, 4]
     cpu_diet["diet"] = False
     assert fused_proj._attn_weights(plan, device) is None
+
+
+@pytest.mark.parametrize("dropout", [0.0, 0.05])
+def test_attention_one_function_is_bitwise(layer_1p5b, monkeypatch, dropout):
+    """A recomputing layer's attention as one autograd node (SOUP_SOLUTION_ATTN_ONE_FUNCTION) against
+    the three nodes it replaces: output, input gradient and LoRA gradients bit for bit (one key
+    split in the attention backward, so that dq is reproducible run to run)."""
+    from solution import fused_proj, unpad
+
+    _, attn, _, rotary = layer_1p5b
+    monkeypatch.setitem(fused_proj._RECOMPUTE, "mode", "all")
+    monkeypatch.setitem(unpad._STATE, "splits_key", 1)
+    for proj in (attn.q_proj, attn.v_proj):
+        proj.lora_dropout["default"] = torch.nn.Dropout(dropout).train() if dropout else \
+            torch.nn.Identity()
+    x, pe, grad = _attention_inputs(rotary, seed=44)
+    _fused(True)
+    nodes = []
+    try:
+        results = []
+        for one in (False, True):
+            monkeypatch.setitem(fused_proj._ATTN, "one_function", one)
+            torch.cuda.manual_seed(7)
+            with torch.autocast("cuda", dtype=torch.float16), unpad.varlen(_spans(LENGTHS)):
+                probe, _ = attn(x.detach().requires_grad_(True), pe, None)
+            nodes.append(type(probe.grad_fn.next_functions[0][0]).__name__)  # below the view
+            del probe
+            torch.cuda.manual_seed(7)
+            results.append(_attention_step(attn, x, pe, grad))
+        (out0, dx0, g0), (out1, dx1, g1) = results
+        assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
+        assert all(torch.equal(a, b) for a, b in zip(g1, g0))
+        assert nodes == ["_Linear4bitHalfBackward", "_AttnBlockBackward"], nodes
+    finally:
+        for proj in (attn.q_proj, attn.v_proj):
+            proj.lora_dropout["default"] = torch.nn.Identity()
+
+
+@pytest.mark.parametrize("mlp_recompute", [False, True])
+def test_mlp_addmm_in_place_is_bitwise(layer_1p5b, monkeypatch, mlp_recompute):
+    """The MLP's input gradient with its second GEMM adding into the first one's fp32 result in place
+    (SOUP_SOLUTION_MLP_ADDMM_INPLACE) against the out-of-place addmm: bit for bit, both MLP modes,
+    and on a token count that is not a multiple of 8 (the padded rows)."""
+    from solution import fused_proj
+
+    monkeypatch.setenv("SOUP_SOLUTION_FUSED_GU_SPLIT", "1")
+    monkeypatch.setitem(fused_proj._MLP_MEMORY, "recompute", mlp_recompute)
+    _, _, mlp, _ = layer_1p5b
+    g = torch.Generator("cuda").manual_seed(9)
+    x = torch.randn(1, 821, 1536, device="cuda", generator=g)
+    grad = torch.randn(1, 821, 1536, device="cuda", generator=g, dtype=torch.float16)
+    _fused(True)
+    results = []
+    for inplace in (False, True):
+        monkeypatch.setitem(fused_proj._MLP_MEMORY, "addmm_inplace", inplace)
+        results.append(_mlp_step(mlp, x, grad))
+    (out0, dx0), (out1, dx1) = results
+    assert torch.equal(out1, out0) and torch.equal(dx1, dx0)
