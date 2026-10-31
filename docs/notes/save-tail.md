@@ -40,4 +40,22 @@ equal), so the replayed files are what the original would write.
 
 ## T4
 
-(filled below)
+In flight (31 Oct ~12:45 Astana): Kaggle account 3 (slerfas), kernel `soup-e1-tail1`, commit e4b9f3c
+(= main d2ab23e+ merged), `--mode variants` ABBA 2 rounds + warm run: `base:` / `once:SOUP_SOLUTION_SAVE_ONCE=1`
+/ `half:SOUP_SOLUTION_NORM_HALF=1`. Fetch without a slot:
+`bash tools/kaggle_win.sh 3 --attach --slug soup-e1-tail1 --mode variants`. What to read: per run
+`phase train end` minus (`phase first step begin` + metrics.json `train_loop_s`) = the save tail (last
+step end -> SFTTrainerWrapper.train return, which holds all three tokenizer saves); `phase exit` minus
+`phase train end`; the wall; and the exit line `[solution] save tail: tokenizer written 1x ..., replayed
+2x ...; adapter saved 2x in N ms` (the adapter saves are only timed, never replayed). Reference
+(soup-c1-abba4, main path): save tail 0.50-0.56 s, train end -> exit 0.12-0.19 s.
+
+## State and what is left
+
+- Merge rule (orchestrator): ABBA in one session >= 0.1 s, peak unchanged (371 MiB), bitwise. If it
+  passes: `os.environ.setdefault("SOUP_SOLUTION_SAVE_ONCE", "1")` next to the exit release in
+  `apply()`, then full + jury.
+- Not done: the adapter's second save (`PeftModel.save_pretrained`, checkpoint and output directory)
+  is not replayed: its README.md (peft's model card) is merged with whatever README the target
+  directory holds, so equal bytes are not guaranteed without a test per directory; decide from the
+  timed `adapter saved 2x in N ms` of the T4 run (worth it only if N/2 >= 0.1 s).

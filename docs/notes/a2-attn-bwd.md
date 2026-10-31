@@ -133,3 +133,9 @@ Laptop (RTX 3050 Ti, per norm at 830 / 1,440 rows): norm + cast 157 / 230 us (pl
 (with the add) against 110 / 169 and 165 / 250 us: -35..-70 us per norm, 56 norms per step, plus 56
 cast launches less. Warm-up: `rms_norm_rows_fwd_half` registered by `patch_qwen2_rmsnorm` (two
 classes, as rms_norm_rows_fwd).
+
+NORM_HALF on the T4: the orchestrator allowed the ABBA after all (31 Oct ~12:40); it runs in the same
+session as the save tail (`soup-e1-tail1`, account 3, commit e4b9f3c, variant `half:`; see
+`docs/notes/save-tail.md` for how to fetch it). Merge rule: >= 0.1 s in that session, peak unchanged
+(371 MiB), bitwise (tested locally). To turn it on: `os.environ.setdefault("SOUP_SOLUTION_NORM_HALF", "1")`
+in `apply()`; its two consumer lines in fused_proj.py may conflict with C1's edits (only those lines).
