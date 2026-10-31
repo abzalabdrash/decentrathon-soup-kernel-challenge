@@ -302,7 +302,13 @@ def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkey
     monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
     monkeypatch.setattr(torch.cuda.Event, "synchronize", synchronize)
     with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
-        ys = [Keep.apply(x, activation(v)) for x, v in zip(xs, values)]
+        ys = []
+        for x, v in zip(xs, values):
+            # the compute stream is busy when the tensor is packed, so its copy (ordered after it) is
+            # still queued at the next pack: the stream-wait path runs whatever the card's timing
+            # (soup-p1-full2: without it all six copies were done in time and `waited` was 0)
+            torch.cuda._sleep(SLEEP // 20)
+            ys.append(Keep.apply(x, activation(v)))
         torch.cuda._sleep(SLEEP)  # the copies are still queued when the backward starts
         sum(y.float().sum() for y in ys).backward()
     assert calls == []

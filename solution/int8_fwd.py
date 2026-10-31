@@ -103,6 +103,8 @@ QX_ROWS = 4  # token rows per program of the x quantization
 # (soup-i1-sweep1, us at 832 / 1440 / 2048 tokens): (32, 64, 224) 498 / 935 / 1212, (32, 64, 448)
 # 512 / 1023 / 1223, (32, 128, 448) 562 / 919 / 1138, (64, 32, 448) 598 / 1060 / 1481
 TI, TM, PG = 32, 64, 224
+# the epilogue writing offload_int8's int8 form (features per program = its GROUP): tokens, warps
+WIRE_TM, WIRE_WARPS = 32, 4
 TR, TH = 64, 64  # hidden quantization: (features, tokens) tile
 OUT_ROWS, OUT_BLOCK = 8, 512  # down epilogue tile
 
@@ -246,13 +248,18 @@ def _silu_mul(g, u):
 
 @triton.jit(do_not_specialize=["feat0", "group0"])  # one compiled variant for every chunk
 def int8_gate_up_kernel(acc_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, pmax_ptr, xk_ptr, wk_ptr,
-                        chunk, inter, tokens, feat0, per_group, group0, TI: tl.constexpr,
-                        TM: tl.constexpr, HIDDEN: tl.constexpr, K: tl.constexpr):
+                        ws_ptr, chunk, inter, tokens, feat0, per_group, group0, TI: tl.constexpr,
+                        TM: tl.constexpr, HIDDEN: tl.constexpr, K: tl.constexpr,
+                        WIRE: tl.constexpr):
     # program (t, grp) of one chunk: tokens [t*TM, +TM) over the chunk's features
     # [grp*per_group, +per_group), TI at a time. acc (2 * chunk, tokens) int32: gate rows then up
     # rows; w_scale the chunk's 2 * chunk row scales in the same order. HIDDEN: pmax_ptr is the
     # SwiGLU output (I, tokens) in half, written here (MODE "gu"), instead of the group maxima.
-    # With K: + wk (2 * chunk, K) @ xk (tokens, K)^T in fp32, the top-k input channels' share
+    # With K: + wk (2 * chunk, K) @ xk (tokens, K)^T in fp32, the top-k input channels' share.
+    # WIRE (TI = per_group = offload_int8.GROUP): instead of the half (gate|up), its int8 form as
+    # offload_int8.gu_quant_kernel makes it from those half values: gate_up_ptr is the int16 view
+    # (I, tokens) of the gate half (low byte gate, high byte up), ws (2I // TI, tokens) the fp32
+    # scales per token and group (gate groups, then up groups)
     tok = tl.program_id(0) * TM + tl.arange(0, TM)
     grp = tl.program_id(1)
     live = tok < tokens
@@ -276,14 +283,34 @@ def int8_gate_up_kernel(acc_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, pmax_ptr
             wu = tl.load(wk_ptr + (chunk + feat)[:, None].to(tl.int64) * K + kk[None, :])
             g = g + tl.dot(wg, xkt, input_precision="ieee")
             u = u + tl.dot(wu, xkt, input_precision="ieee")
-        g = g.to(gate_up_ptr.dtype.element_ty)
-        u = u.to(gate_up_ptr.dtype.element_ty)
+        if WIRE:  # the half values the int8 form is made of (pmax_ptr: the half SwiGLU output)
+            g = g.to(pmax_ptr.dtype.element_ty)
+            u = u.to(pmax_ptr.dtype.element_ty)
+        else:
+            g = g.to(gate_up_ptr.dtype.element_ty)
+            u = u.to(gate_up_ptr.dtype.element_ty)
         dest = (feat0 + feat)[:, None].to(tl.int64) * tokens + tok[None, :]
-        tl.store(gate_up_ptr + dest, g, mask=live[None, :])
-        tl.store(gate_up_ptr + up_out + dest, u, mask=live[None, :])
+        if WIRE:
+            gf, uf = g.to(tl.float32), u.to(tl.float32)
+            amax_g = tl.max(tl.abs(gf), axis=0)
+            amax_u = tl.max(tl.abs(uf), axis=0)
+            inv_g = tl.where(amax_g > 0.0, 127.0 / amax_g, 0.0)
+            inv_u = tl.where(amax_u > 0.0, 127.0 / amax_u, 0.0)
+            q_g = tl.minimum(tl.maximum(tl.floor(gf * inv_g[None, :] + 0.5), -127.0),
+                             127.0).to(tl.int32)
+            q_u = tl.minimum(tl.maximum(tl.floor(uf * inv_u[None, :] + 0.5), -127.0),
+                             127.0).to(tl.int32)
+            tl.store(gate_up_ptr + dest, ((q_u << 8) | (q_g & 255)).to(tl.int16),
+                     mask=live[None, :])
+            wg = (feat0 + grp * per_group + f0) // TI
+            tl.store(ws_ptr + wg * tokens + tok, amax_g / 127.0, mask=live)
+            tl.store(ws_ptr + (inter // TI + wg) * tokens + tok, amax_u / 127.0, mask=live)
+        else:
+            tl.store(gate_up_ptr + dest, g, mask=live[None, :])
+            tl.store(gate_up_ptr + up_out + dest, u, mask=live[None, :])
         h = _silu_mul(g.to(tl.float32), u.to(tl.float32))
         if HIDDEN:
-            tl.store(pmax_ptr + dest, h.to(gate_up_ptr.dtype.element_ty), mask=live[None, :])
+            tl.store(pmax_ptr + dest, h.to(pmax_ptr.dtype.element_ty), mask=live[None, :])
         else:
             peak = tl.maximum(peak, tl.abs(h))
     if not HIDDEN:
@@ -499,14 +526,17 @@ def channels(mlp, x2):
 
 
 def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=None, release=None,
-                    hidden=False, idx=None, x_k=None, before_alloc=None):
+                    hidden=False, idx=None, x_k=None, before_alloc=None, wire_for=None):
     """(gate|up) (2I, M) in `half` from the quantized input, and the per-group maxima of
     silu(gate) * up (GROUPS, M) for `down_forward`, or with `hidden` silu(gate) * up itself (I, M) in
     `half` (MODE "gu"). `buffer` is fused_proj's flat half buffer of one (I, D) weight (taken as int8
     bytes); acquire / release: weight_stream ring hooks around the decode (or None). idx / x_k: the
     top-k channels (`channels`) and their values (`quantize_tokens`), added in fp32. before_alloc:
     called once the decode and the first int8 product are queued, right before (gate|up) is
-    allocated (fused_proj.py lets the previous layer's (gate|up) copy to the host finish there)."""
+    allocated (fused_proj.py lets the previous layer's (gate|up) copy to the host finish there).
+    wire_for(gate_up): called right after (gate|up) is allocated; when it returns (q, s) (q the int16
+    view of its gate half, s the scales: offload_int8's form, `hidden` mode only) the epilogue writes
+    that form instead of the half values, and the result is (gate_up, hidden, (q, s))."""
     padded, d = x_q.shape
     device = x_q.device
     chunk = inter // CHUNKS
@@ -522,7 +552,7 @@ def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=Non
     x_t = x_q.t()
     if not k:
         x_k, w_k = _dummy(device, torch.float32), _dummy(device, torch.float32)
-    acc = gate_up = pmax = None
+    acc = gate_up = pmax = wire = None
     for c in range(CHUNKS):
         rows = w[2 * chunk * c:2 * chunk * (c + 1)]
         acc = torch._int_mm(rows, x_t) if acc is None else torch._int_mm(rows, x_t, out=acc)
@@ -532,11 +562,21 @@ def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=Non
             gate_up = torch.empty((2 * inter, padded), dtype=half, device=device)
             pmax = (torch.empty((inter, padded), dtype=half, device=device) if hidden else
                     torch.empty((inter // PG, padded), dtype=torch.float32, device=device))
-        int8_gate_up_kernel[(triton.cdiv(padded, TM), chunk // PG)](
-            acc, s_w[2 * chunk * c:], s_x, gate_up, pmax, x_k, w_k[2 * chunk * c:] if k else w_k,
-            chunk, inter, padded, c * chunk, PG, c * (chunk // PG), TI=TI, TM=TM, HIDDEN=hidden,
-            K=k)
-    return gate_up, pmax
+            if wire_for is not None and hidden:
+                wire = wire_for(gate_up)
+        if wire is not None:
+            group = 2 * inter // wire[1].shape[0]  # offload_int8.GROUP
+            int8_gate_up_kernel[(triton.cdiv(padded, WIRE_TM), chunk // group)](
+                acc, s_w[2 * chunk * c:], s_x, wire[0], pmax, x_k,
+                w_k[2 * chunk * c:] if k else w_k, wire[1], chunk, inter, padded, c * chunk, group,
+                c * (chunk // group), TI=group, TM=WIRE_TM, HIDDEN=True, K=k, WIRE=True,
+                num_warps=WIRE_WARPS)
+        else:
+            int8_gate_up_kernel[(triton.cdiv(padded, TM), chunk // PG)](
+                acc, s_w[2 * chunk * c:], s_x, gate_up, pmax, x_k,
+                w_k[2 * chunk * c:] if k else w_k, s_w, chunk, inter, padded, c * chunk, PG,
+                c * (chunk // PG), TI=TI, TM=TM, HIDDEN=hidden, K=k, WIRE=False)
+    return (gate_up, pmax, wire) if wire is not None else (gate_up, pmax)
 
 
 def down_forward(gate_up, pmax, down_ops, buffer, half, hidden, acquire=None, release=None):
@@ -583,7 +623,15 @@ def _warm():
                    KROWS=KC_ROWS, num_warps=4, enable_fp_fusion=False)
     gu_only = MODE == "gu"
     compile_kernel(int8_gate_up_kernel, i32, f32, f32, half, half if gu_only else f32, f32, f32,
-                   chunk, INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only, K=k)
+                   f32, chunk, INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only, K=k,
+                   WIRE=False)
+    from . import offload_int8
+
+    if gu_only and offload_int8._STATE["on"]:  # the epilogue that writes the int8 offload form
+        group = offload_int8.GROUP
+        compile_kernel(int8_gate_up_kernel, i32, f32, f32, torch.int16, half, f32, f32, f32, chunk,
+                       INTERMEDIATE, tokens, 0, group, 0, TI=group, TM=WIRE_TM, HIDDEN=True, K=k,
+                       WIRE=True, num_warps=WIRE_WARPS)
     if gu_only:
         return None
     compile_kernel(int8_hidden_kernel, half, f32, f32, i8, INTERMEDIATE, tokens,

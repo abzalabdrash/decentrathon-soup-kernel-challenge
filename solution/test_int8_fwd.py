@@ -316,3 +316,83 @@ def test_channels_from_the_fp16_forwards(int8_on, monkeypatch):
     peak = torch.maximum(xs[0].detach().abs().amax((0, 1)), xs[1].detach().abs().amax((0, 1)))
     assert set(idx.tolist()) == set(peak.topk(int8_on.TOPK).indices.tolist())
     assert {7, 9} <= set(idx.tolist()) and int(pos[7]) >= 0 and int(pos[9]) >= 0
+
+
+def test_epilogue_writes_the_int8_offload_form(int8_on):
+    """With wire_for, the gate|up epilogue writes offload_int8.py's int8 form (the int16 view of the
+    gate half, the per-token per-GROUP scales) of exactly the half values it writes otherwise, and the
+    same SwiGLU output: what offload_int8.encode makes from the half (gate|up), bit for bit."""
+    from solution import offload_int8
+
+    gate, up = _linear4bit(1536, 8960, seed=26), _linear4bit(1536, 8960, seed=27)
+    x = torch.randn(830, 1536, device="cuda")
+    buffer = torch.empty(8960 * 1536, dtype=torch.float16, device="cuda")
+    idx = torch.arange(16, dtype=torch.int32, device="cuda") * 90 + 3
+    pos = torch.full((1536,), -1, dtype=torch.int32, device="cuda")
+    pos[idx.long()] = torch.arange(16, dtype=torch.int32, device="cuda")
+    x_q, s_x, x_k = int8_on.quantize_tokens(x, 830, 832, pos)
+    gate_up, hidden = int8_on.gate_up_forward(x_q, s_x, _ops(gate), _ops(up), buffer,
+                                              torch.float16, 8960, hidden=True, idx=idx, x_k=x_k)
+    ref_wire, _ = offload_int8.encode(gate_up)
+    ref_q, ref_s = offload_int8.views(ref_wire, *gate_up.shape)
+
+    def wire_for(gu):
+        group = offload_int8.GROUP
+        return gu[:8960].view(torch.int16), torch.empty((2 * 8960 // group, 832),
+                                                        dtype=torch.float32, device="cuda")
+
+    made = int8_on.gate_up_forward(x_q, s_x, _ops(gate), _ops(up), buffer, torch.float16, 8960,
+                                   hidden=True, idx=idx, x_k=x_k, wire_for=wire_for)
+    assert len(made) == 3
+    _, hidden2, (q, s) = made
+    assert torch.equal(hidden2, hidden) and torch.equal(q, ref_q) and torch.equal(s, ref_s)
+
+
+def test_int8_forward_with_the_int8_offload(int8_on, monkeypatch):
+    """The training path (offload_saved_tensors, early offload) of three fused MLPs: with the int8
+    forward and offload_int8 on, every layer's (gate|up) crosses as the int8 form that the int8
+    epilogue wrote itself (reserve_int8, then offload_early(wire=...)); the forward is bit for bit
+    the one with the half offload, and the input gradient moves from the half offload's as much as it
+    does on the fp16 forward with offload_int8's own quantization (the same int8 form), for both MLP
+    backwards."""
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    from solution import int8_bwd, offload, offload_int8
+
+    monkeypatch.setattr(offload, "EARLY", True)
+    monkeypatch.setitem(offload_int8._STATE, "on", True)
+    offload_int8.compile_now()
+    int8_bwd.compile_now()
+    mlps = [_quantize_mlp(mq.Qwen2MLP(_config()), seed=30 + 3 * i).cuda().train() for i in range(3)]
+    x0 = torch.randn(1, 826, 1536, device="cuda")
+    grad = torch.randn_like(x0) * 1e-2
+
+    def go(fwd_int8, wire, bwd_int8):
+        monkeypatch.setitem(int8_on._STATE, "on", fwd_int8)
+        monkeypatch.setitem(offload_int8._STATE, "on", wire)
+        monkeypatch.setitem(int8_bwd._STATE, "on", bwd_int8)
+        calls = int8_on._STATE["calls"]
+        x = x0.clone().requires_grad_(True)
+        with offload.offload_saved_tensors(weights=[p for m in mlps for p in m.parameters()]) as off,                 torch.autocast("cuda", dtype=torch.float16):
+            h = x
+            for mlp in mlps:
+                h = h + mlp(h)
+            h.backward(grad)
+        torch.cuda.synchronize()
+        assert int8_on._STATE["calls"] == calls + (3 if fwd_int8 else 0)
+        assert off.stats["int8"] == (3 if wire else 0) and off.stats["early"] == 3
+        return h.detach(), x.grad
+
+    def rel(a, b):
+        return ((a - b).norm() / b.norm()).item()
+
+    for bwd_int8 in (False, True):
+        ref_out, ref_gx = go(True, False, bwd_int8)
+        out, gx = go(True, True, bwd_int8)
+        assert torch.equal(out, ref_out)
+        _, half_gx = go(False, False, bwd_int8)
+        _, p1_gx = go(False, True, bwd_int8)
+        err, p1_err = rel(gx, ref_gx), rel(p1_gx, half_gx)
+        print(f"\nint8 backward {bwd_int8}: dL/dx error of the int8 offload against the half one: "
+              f"int8 forward {err:.4f}, fp16 forward {p1_err:.4f}")
+        assert err < 1.2 * p1_err + 1e-3
