@@ -92,3 +92,19 @@ soup-h1-abba1 (e50b06b: 8-warp chunk kernel, 64 x 64 transpose, five kernels com
 switch at head 3; peagverr, ABBA 2 rounds + warm): fp16 47.10 s / steps 3+ 26.32 / step 0 0.503; int8 47.97 /
 26.52 / 0.632; peak 395 MiB both; own kernels 17.1 -> 20.2 %. The thread took 5.58 s in training and finished at
 step 2 (head 3 waited for it); setup end -> train begin 3.89 -> 4.23 s. No gain with those kernels.
+
+soup-h1-abba2 (2e5e2ac: 16-warp kernel, 128 x 128 transpose, three kernels, switch at head 5; the build with
+torch ops on the default stream; ABBA 2 rounds + warm, peagverr):
+
+| variant | wall | steps 3+ | step 0 | setup end -> train begin | train begin -> end | peak | own kernels |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fp16 | 48.75 | 27.93 | 0.500 | 4.05 / 3.94 | 30.39 | 395 | 16.6 % |
+| int8, build at setup end | 48.60 (-0.15) | 27.21 (-0.71) | 0.575 | 4.24 / 4.44 | 29.80 (-0.59) | 395 | 19.0 % |
+| int8, build at the first head | 48.47 (-0.28) | 27.22 (-0.70) | 0.599 | 4.05 / 4.08 | 29.87 (-0.52) | 395 | 19.0 % |
+
+The steps gain 0.7 s; the build ate it back: at setup end its quantization (about 1,500 small torch ops, each
+waiting for the GIL behind the trainer build, and synchronous copies on the default stream) took 3.4-3.6 s and
+delayed train begin by 0.35 s; at the first head it took 2.1 s (ready after 4-5 heads) and cost step 0 +0.1 s.
+fe361ac: the quantization is one own kernel (int8_rows_kernel, also used for the hidden rows) per 1,024 rows on a
+stream of its own, all asynchronous with one synchronize (bench process: compilation 0.32 s, pinning 0.03,
+quantization 0.07 locally), the build at the first head by default.

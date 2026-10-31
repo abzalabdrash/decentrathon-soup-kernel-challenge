@@ -628,14 +628,16 @@ class HeadStreamer:
             log(f"[solution] head pack off: {exc}")
         return self._pack
 
-    def start_int8(self, log=print):
-        """Builds the int8 copy of the weight in a thread (head_int8.py); heads take it from START_HEADS on."""
+    def start_int8(self, log=print, defer=None):
+        """Builds the int8 copy of the weight in a thread (head_int8.py); heads take it from START_HEADS on.
+        `defer`: start the thread at the first head (default: head_int8.BUILD_AT == "head")."""
         from .head_int8 import BUILD_AT, HeadInt8, HeadSkipInt8, smoothing
 
         if self._int8 is not None:
             return self._int8
         try:
-            self._int8 = HeadInt8(self, log=log, smooth=smoothing(self)).start(defer=BUILD_AT == "head")
+            self._int8 = HeadInt8(self, log=log, smooth=smoothing(self)).start(
+                defer=BUILD_AT == "head" if defer is None else defer)
         except HeadSkipInt8 as exc:
             log(f"[solution] head int8 off: {exc}")
         return self._int8
@@ -1092,3 +1094,7 @@ def patch_head_stream(rows=None, slots=None, load=None):
         from .head_pack import warm_kernels
 
         register(warm_kernels, name="head_pack_kernels")
+    from . import head_int8
+
+    if head_int8.enabled() and head_int8.WARM_AT == "warmup":
+        register(head_int8.warm_kernels, name="head_int8_kernels")

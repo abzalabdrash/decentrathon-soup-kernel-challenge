@@ -265,7 +265,7 @@ def main():
     del param
     torch.cuda.empty_cache()
     started = time.perf_counter()
-    int8 = streamer.start_int8(log=print)
+    int8 = streamer.start_int8(log=print, defer=False)
     int8.join()
     print(f"int8 copy ready {int8.ready} ({int8.error}) in {time.perf_counter() - started:.2f} s "
           f"(build + compile in the thread {int8.seconds:.2f} s), smoothing {int8.col is not None}", flush=True)

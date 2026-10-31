@@ -19,7 +19,7 @@ def streamed():
     weight = (torch.randn(V, D, device="cuda") * 0.02 * torch.rand(V, 1, device="cuda").add_(0.3)).half()
     param = torch.nn.Parameter(weight.clone(), requires_grad=False)
     streamer = HeadStreamer(param, rows=ROWS, slots=2)
-    int8 = streamer.start_int8()
+    int8 = streamer.start_int8(defer=False)
     int8.join()
     assert int8.ready, int8.error
     yield weight, streamer, int8

@@ -51,6 +51,7 @@ fp16 path; head START_HEADS + 1 waits for the thread if it is not done. Switches
 SOUP_SOLUTION_HEAD_INT8 (on by default in the `soup train` process only, as int8_bwd.py; pytest
 keeps the fp16 head), SOUP_SOLUTION_HEAD_INT8_START (START_HEADS), SOUP_SOLUTION_HEAD_INT8_AT
 (where the build thread starts: "setup", the end of Soup's setup, or "head", the run's first head),
+SOUP_SOLUTION_HEAD_INT8_WARM (where the kernels compile: "thread" or "warmup"),
 SOUP_SOLUTION_HEAD_INT8_SMOOTH / _ALPHA (smoothing()), SOUP_SOLUTION_HEAD_INT8_FWD_ROWS,
 SOUP_SOLUTION_HEAD_INT8_WARPS.
 """
@@ -72,6 +73,9 @@ START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "4"))
 # where the build thread starts: "head" (the first head; soup-h1-abba2: setup end -> train begin +0.07 s against
 # +0.35 s for "setup", the end of Soup's setup, where the thread fought the trainer build for the GIL)
 BUILD_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_AT", "head").strip().lower()
+# where the four kernels compile: "thread" (the build thread, first) or "warmup" (warmup.py's threads during the
+# model load; the build thread then finds them compiled)
+WARM_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARM", "thread").strip().lower()
 # int8_transpose_kernel's square tile and warps: T4, one head's 38 transposes, 2.47 ms against 2.77 for 64 x 64
 # with 4 warps (soup-h1-kern1)
 T_TILE, T_WARPS = 128, 8
