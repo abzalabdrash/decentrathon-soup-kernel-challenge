@@ -147,4 +147,18 @@ bytes (int8 form) and the shorter D2H/H2D contention with the weight stream.
 
 ## 6. Full + jury
 
-TODO
+**Full, bbc1001** (soup-p1-full, peagverr; int8 on in `soup train`, as the measured process runs it):
+**all 10 checks**; base 83.1 s / 14,345 MiB, ours **46.4 s / 395 MiB** (s = 1.79 in a slow session; the
+same code without int8 is ~0.5 s slower by the ABBA above), eval +0.010 %, loss curve 0.01 % first step
+/ 0.06 % mean, own kernels 20.3 % (gu_quant_kernel, gu_dequant_kernel, quant_t_int8_il_kernel and the
+INT8_IN variant of int8_swiglu_bwd_kernel count). T4 `pytest solution`: 455 passed, 5 skipped, 1 failed:
+`test_recompute::test_decoder_layer_recompute_bitwise_and_memory[lengths0]`, the order-dependent
+memory test that also fails on main (m7, m9 in STATUS; locally on 8387938 too).
+
+**Merged with main 0100e3a** (fd27547; clean) and aligned with bc18d4b's rule (same behaviour when
+measured and tested): `SOUP_SOLUTION_OFFLOAD_INT8` now defaults on in every process; `solution/conftest.py`
+pins it off together with the int8 backward for the bitwise tests of the half path (test_offload_int8
+switches it on). a00105a: locally test_fused_proj, test_int8_bwd, test_jury_offload_marks, test_offload,
+test_offload_int8, test_xoffload 86 passed; Soup's 79 with SOUP_APPLY_SOLUTION=1 passed.
+
+**Jury, a00105a** (seed 157, train 42000:42256, eval 51800:52056): TODO
