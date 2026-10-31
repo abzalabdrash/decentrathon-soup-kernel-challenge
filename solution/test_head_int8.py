@@ -346,14 +346,13 @@ def test_build_allocates_nothing_on_its_stream(streamed):
 
     _, streamer, _ = streamed
     torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    default = torch.cuda.current_stream().cuda_stream
+    before = {seg["stream"] for seg in torch.cuda.memory_snapshot()}  # other tests' streams may have pools
     other = HeadInt8(streamer, smooth=torch.rand(D) + 0.5).start()
     other.join()
     assert other.ready, other.error
-    streams = {seg["stream"] for seg in torch.cuda.memory_snapshot()}
+    after = {seg["stream"] for seg in torch.cuda.memory_snapshot()}
     other.stop()
-    assert streams <= {default, 0}, streams
+    assert after <= before | {torch.cuda.current_stream().cuda_stream, 0}, after - before
 
 
 def test_eval_logits_stay_fp16(streamed):
