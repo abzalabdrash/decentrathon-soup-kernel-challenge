@@ -14,7 +14,9 @@ tokenizer state that call serialized (the init kwargs and the attributes they na
 and added tokens, the chat template, the backend's identity, size, truncation and padding, ...).
 A later call on the same tokenizer object with the same arguments and the same fingerprint writes
 the same bytes into its directory (makedirs, then each file, as the original's) and returns the same
-tuple with its directory, the original's two info log lines included; anything else (another
+tuple with its directory, the original's two info log lines included. A file that already holds
+these bytes because this module (or the first save) wrote them there and nobody touched it since
+(same inode, mtime and size: Soup's third save, into the directory of the second) is left as it is; anything else (another
 object, a changed state, other arguments, push_to_hub, a file path as the directory) runs the
 original. Every file is bit for bit what the original would write: two saves of one unchanged
 tokenizer give the same bytes (tested, also on the real Qwen2.5 tokenizer).
@@ -29,7 +31,8 @@ import time
 import weakref
 
 _STATE = {"patched": False, "entry": None, "written": 0, "replayed": 0, "write_s": 0.0,
-          "replay_s": 0.0, "reported": False, "adapter": [0, 0.0]}
+          "replay_s": 0.0, "reported": False, "adapter": [0, 0.0], "files": [0, 0],
+          "own": {}}  # path -> its stat key right after a replay wrote it
 CONFIG_SUFFIX = "tokenizer_config.json"
 
 
@@ -70,6 +73,16 @@ def _listing(directory):
     return found
 
 
+def _stat_key(path):
+    """(inode, device, mtime_ns, size) of `path`, None when it is missing: an equal key means nobody
+    wrote the file in between."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_dev, st.st_mtime_ns, st.st_size)
+
+
 def _args_key(save_directory, legacy_format, filename_prefix, kwargs):
     return (type(save_directory), legacy_format, filename_prefix, repr(sorted(kwargs.items())))
 
@@ -93,8 +106,9 @@ def _remember(tok, save_directory, key, result, before):
     for rel in rels:
         with open(os.path.join(directory, rel), "rb") as f:
             contents.append(f.read())
-    return {"ref": weakref.ref(tok), "fingerprint": _fingerprint(tok), "key": key,
-            "rels": tuple(rels), "contents": tuple(contents)}
+    return {"ref": weakref.ref(tok), "fingerprint": _fingerprint(tok), "key": key, "dir": directory,
+            "rels": tuple(rels), "contents": tuple(contents),
+            "stats": tuple(_stat_key(os.path.join(directory, rel)) for rel in rels)}
 
 
 def _replay(entry, save_directory):
@@ -102,11 +116,19 @@ def _replay(entry, save_directory):
 
     os.makedirs(save_directory, exist_ok=True)
     paths = []
-    for rel, data in zip(entry["rels"], entry["contents"]):
+    counts = _STATE["files"]  # written, already in place
+    for rel, data, first_key in zip(entry["rels"], entry["contents"], entry["stats"]):
         path = os.path.join(save_directory, rel)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "wb") as f:
-            f.write(data)
+        now = _stat_key(path)
+        first = os.path.abspath(path) == os.path.abspath(os.path.join(entry["dir"], rel))
+        if now is not None and (now == _STATE["own"].get(path) or (first and now == first_key)):
+            counts[1] += 1  # these very bytes are there, untouched since they were written
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            counts[0] += 1
+            _STATE["own"][path] = _stat_key(path)
         if rel.endswith(CONFIG_SUFFIX):
             logger.info(f"tokenizer config file saved in {path}")
         elif rel.endswith(".jinja"):
@@ -172,16 +194,17 @@ def unpatch_tokenizer_save():
         cls.save_pretrained = cls._soup_original_save_pretrained
         del cls._soup_original_save_pretrained
         cls._soup_save_once = False
-    _STATE.update(patched=False, entry=None)
+    _STATE.update(patched=False, entry=None, own={}, files=[0, 0])
 
 
 def _report():
     if _STATE["written"] or _STATE["replayed"]:
         calls, seconds = _STATE["adapter"]
+        written, kept = _STATE["files"]
         print(f"[solution] save tail: tokenizer written {_STATE['written']}x in "
               f"{_STATE['write_s'] * 1e3:.0f} ms, replayed {_STATE['replayed']}x in "
-              f"{_STATE['replay_s'] * 1e3:.0f} ms; adapter saved {calls}x in {seconds * 1e3:.0f} ms",
-              flush=True)
+              f"{_STATE['replay_s'] * 1e3:.0f} ms (files: {written} written, {kept} already in place); "
+              f"adapter saved {calls}x in {seconds * 1e3:.0f} ms", flush=True)
 
 
 def _time_adapter_saves():

@@ -53,6 +53,7 @@ def test_tail_same_files_and_results(tmp_path, patched):
     save_tail.patch_tokenizer_save()
     got = _tail(tok, str(tmp_path / "once"))
     assert save_tail._STATE["written"] == 1 and save_tail._STATE["replayed"] == 2
+    assert save_tail._STATE["files"] == [3, 3]  # the 2nd save writes 3 files, the 3rd finds them
     assert _relative(got, str(tmp_path / "once")) == _relative(want, str(tmp_path / "orig"))
     assert all(isinstance(p, str) for r in got for p in r)
     orig, once = _files(tmp_path / "orig"), _files(tmp_path / "once")
@@ -98,3 +99,19 @@ def test_only_in_the_soup_train_process(patched):
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     assert not getattr(PreTrainedTokenizerBase, "_soup_save_once", False)
+
+
+def test_a_touched_file_is_written_again(tmp_path, patched):
+    tok = _tokenizer()
+    save_tail.patch_tokenizer_save()
+    ckpt, final = str(tmp_path / "ckpt"), str(tmp_path / "final")
+    tok.save_pretrained(ckpt)
+    tok.save_pretrained(final)
+    with open(os.path.join(final, "tokenizer_config.json"), "w") as f:
+        f.write("{}")  # someone changed it after the replay
+    os.remove(os.path.join(final, "chat_template.jinja"))  # or removed it
+    tok.save_pretrained(final)
+    assert _files(final) == _files(ckpt)
+    assert save_tail._STATE["files"] == [5, 1]
+    tok.save_pretrained(ckpt)  # into the first save's own directory: its files are untouched
+    assert save_tail._STATE["files"] == [5, 4]
