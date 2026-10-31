@@ -93,7 +93,9 @@ Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_e
 (the thread starts when Soup's model setup begins: Soup's command line, config and data reading
 after apply() run without the workers' GIL contention),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
-SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
+SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS),
+SOUP_SOLUTION_INT8_WARMUP=1 (the int8 kernels the training's own threads compile in steps 1-5 join
+the warm-up; see INT8_WARMUPS).
 Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
 the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
 launch is compile time the first step never needed.
@@ -167,11 +169,29 @@ WARMUPS = []  # [(name, fn)]: run in this order by the background thread
 # warm-ups stay first (FIRST): sorted to the end they met the trainer build and the offload's
 # pinning and took 0.95 s instead of 0.27 (session 5, cublas).
 FIRST = ("cublas", "step_ops")
-COSTS = {"rms_norm_rows_fwd": 1.45, "head_stream_kernels": 1.35, "rope_qk_kernel": 1.12,
-         "nf4_dequant_kernel": 0.75, "fused_proj_nf4_dequant3": 0.70, "rms_norm_rows_bwd": 0.64,
-         "fused_ce_rows_kernel": 0.60, "rms_norm_rows_bwd_split": 0.53, "step_ops": 0.49,
-         "example_swiglu_fwd_kernel": 0.50, "example_swiglu_bwd_kernel": 0.40,
-         "fused_proj_x16_rebuild": 0.41, "cublas": 0.27, "fused_proj_masked_pair_sum": 0.13}
+# Updated 31 Oct from the T4 (main da895ed with -O0 launchers in one build): medians of the
+# "warmup done" lines of nine runs (soup-recon-pub cpuprof/plain/sprof, soup-b4-early2 base, early,
+# earlyfq x2). The old table named fused_proj_nf4_dequant3 (now nf4_dequant4: 0.5 s by default) and
+# sorted the warm-up to 4.51 s in the two-worker simulation against 4.39 s in registration order; this
+# one gives 3.83 s. fused_ce_rows_kernel (off in these runs) and fused_proj_nf4_dequant3 keep their old
+# values. The three int8 registrations (SOUP_SOLUTION_INT8_WARMUP) are the sums of their kernels'
+# "triton compile outside warmup" medians in the same eleven logs (int8_bwd_kernels: nf4_int8_t 0.39 +
+# int8_swiglu_bwd 0.25 + quant_t_int8 0.26; offload_int8_kernels: gu_quant 0.77 + gu_dequant 0.21;
+# int8_in_kernels: int8_swiglu_bwd INT8_IN 0.33 + quant_t_int8_il 0.31).
+COSTS = {"fused_proj_nf4_dequant4": 1.60, "head_stream_kernels": 1.00, "step_ops": 0.91,
+         "rope_qk_kernel": 0.69, "rms_norm_rows_bwd": 0.66, "rms_norm_rows_fwd": 0.63, "cublas": 0.61,
+         "nf4_dequant_kernel": 0.32, "rms_norm_rows_bwd_split": 0.31, "example_swiglu_bwd_kernel": 0.25,
+         "example_swiglu_fwd_kernel": 0.23, "fused_proj_x16_rebuild": 0.17,
+         "fused_proj_masked_pair_sum": 0.16, "fused_proj_nf4_dequant3": 0.70, "fused_ce_rows_kernel": 0.60,
+         "offload_int8_kernels": 0.98, "int8_bwd_kernels": 0.90, "int8_in_kernels": 0.64}
+# SOUP_SOLUTION_INT8_WARMUP=1 (off by default): the int8 kernels of int8_bwd.py and offload_int8.py, which
+# their own threads otherwise compile during steps 1-5 (seven compiles, 2.5-2.7 s on the T4), join the
+# warm-up as these registrations (see _register_int8). In registration order they go after every
+# other registration (the late ones of fused_proj.py and head_stream.py included); with
+# SOUP_SOLUTION_WARMUP_ORDER=longest they sort by COSTS with the rest (longest processing time first
+# over all of them: 5.10 s in the two-worker simulation against 5.33 s with them last, and train
+# begin waits for the whole warm-up).
+INT8_WARMUPS = ("int8_bwd_kernels", "offload_int8_kernels", "int8_in_kernels")
 COMPILES = []  # every compile seen by `watch_compiles`, as dicts (see there)
 
 _LOCK = threading.Lock()
@@ -436,6 +456,53 @@ def warm_rmsnorm_bwd():
                        ADD_GRAD=fused, SECOND=fused, DW=False, ROWS=BWD_ROWS, BLOCK=block,
                        num_warps=BWD_WARPS)
 
+
+# SOUP_SOLUTION_INT8_WARMUP=1 (see INT8_WARMUPS): the registrations compile exactly what the modules'
+# own compile threads compile (int8_bwd._warm, offload_int8._warm), split in three for the two workers.
+# Those threads still start where they did and run their `_warm` again, which now finds every variant
+# in triton's in-memory cache; the switch points stay the call counters (START_CALLS), so which
+# backwards and offloads run int8 does not change. Defined here, they are compile-only registrations
+# of solution.warmup for launcher_one's probe (their launchers go into the one build).
+
+def _warm_int8_bwd():
+    from . import int8_bwd
+
+    return int8_bwd._warm()  # SKIPPED when SOUP_SOLUTION_INT8_BWD is off
+
+
+def _warm_offload_int8():
+    from . import offload_int8
+
+    if not offload_int8._STATE["on"]:
+        return SKIPPED
+    offload_int8._warm_codec()
+    return None
+
+
+def _warm_int8_in():
+    from . import int8_bwd, offload_int8
+
+    if not (offload_int8._STATE["on"] and offload_int8.raw_in_use()):
+        return SKIPPED
+    int8_bwd.warm_int8_in(offload_int8.GROUP)
+    return None
+
+
+def int8_warmup_on():
+    return os.environ.get("SOUP_SOLUTION_INT8_WARMUP", "0").strip().lower() not in ("0", "false", "no", "")
+
+
+def _register_int8():
+    """Adds the three int8 registrations when SOUP_SOLUTION_INT8_WARMUP is on (read at import, before
+    apply() starts the warm-up); returns whether it did."""
+    if not int8_warmup_on():
+        return False
+    for name, fn in zip(INT8_WARMUPS, (_warm_int8_bwd, _warm_offload_int8, _warm_int8_in)):
+        register(fn, name=name)
+    return True
+
+
+_register_int8()
 
 _KEY_LOCK = threading.Lock()
 
@@ -986,6 +1053,10 @@ def start_background_warmup(log=True, final=True, release=False):
             # stable: ties keep their order; FIRST stays in front in its own order
             batch.sort(key=lambda item: (item[0] not in FIRST, 0.0 if item[0] in FIRST
                                          else -COSTS.get(item[0], 0.5)))
+        else:  # the int8 registrations after the late ones (stable; see INT8_WARMUPS)
+            batch.sort(key=lambda item: item[0] in INT8_WARMUPS)
+        if not final:  # an early start: the int8 registrations wait for the final call (apply end)
+            batch = [item for item in batch if item[0] not in INT8_WARMUPS]
         for name, fn in batch:
             _STATE["queued"].add(name)
             _STATE["queue"].put((name, fn))
