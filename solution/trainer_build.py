@@ -25,15 +25,6 @@ messages from them, so each row has two renders and tokenizations instead of fou
 it hashes through the module's globals are these two (a fingerprint only names cache files of
 datasets backed by files, and this one is built in memory; the organizers allow even a random one).
 
-SOUP_SOLUTION_FAST_FINGERPRINT=1: datasets fingerprints each map by pickling the function with dill
-and `recurse=True` (datasets/utils/_dill.py), and dill finds the globals a function uses with
-`dill.detect.nestedglobals`, which prints `dis.dis` of the code to a captured stdout and parses the
-lines that name a `*_GLOBAL*` instruction (dill/detect.py:138-160). Here the same names come from a
-scan of the raw bytecode (the same instructions, their name operands, the nested code objects too):
-the same names that can be globals (dill's text parsing also returns quoted string constants that
-contain "_GLOBAL", which no module has as a global), so the same fingerprint (checked against dill
-over the functions of soup_cli, trl, transformers and datasets in test_trainer_build.py), cheaper.
-
 SOUP_SOLUTION_EARLY_ROWS=1: the tokenization of the training rows needs only the tokenizer and the
 rows, and the tokenizer is ready before the model load starts (soup_cli/trainer/sft.py:1661-1666,
 then from_pretrained at :1719). So when Soup's setup has loaded the tokenizer, a thread of this
@@ -65,13 +56,10 @@ tokens, word ids, overflow: checked on the 256 training rows); anything else, an
 attribute, goes to the tokenizer itself. The stand-in lives only for that one call.
 """
 
-import dis
 import os
 import re
-import sys
 import threading
 import time
-import types
 
 _GENERATION = re.compile(r"\{\%-?\s*generation\s*-?\%\}")  # transformers' check (chat_template_utils.py:508)
 
@@ -157,57 +145,6 @@ def _fast_int_list(original):
     return _coerce_int_list
 
 
-# ---------------------------------------------------------------- SOUP_SOLUTION_FAST_FINGERPRINT
-
-_GLOBAL_OPS = frozenset(op for name, op in dis.opmap.items() if "_GLOBAL" in name)
-_LOAD_GLOBAL = dis.opmap.get("LOAD_GLOBAL")
-_EXTENDED_ARG = dis.EXTENDED_ARG
-_LOAD_GLOBAL_SHIFT = sys.version_info >= (3, 11)  # LOAD_GLOBAL's oparg is namei << 1 | push_null
-
-
-def global_names(code):
-    """The names of the `*_GLOBAL*` instructions of `code` and of every code object nested in its
-    constants: what dill.detect.nestedglobals reads from `dis.dis` (see the module docstring)."""
-    names = set()
-    stack = [code]
-    while stack:
-        co = stack.pop()
-        raw = co.co_code
-        table = co.co_names
-        ext = 0
-        for i in range(0, len(raw), 2):
-            op = raw[i]
-            arg = raw[i + 1] | ext
-            if op == _EXTENDED_ARG:
-                ext = arg << 8
-                continue
-            ext = 0
-            if op in _GLOBAL_OPS:
-                names.add(table[arg >> 1 if (op == _LOAD_GLOBAL and _LOAD_GLOBAL_SHIFT) else arg])
-        for const in co.co_consts:
-            if isinstance(const, types.CodeType):
-                stack.append(const)
-    return names
-
-
-def _fast_nestedglobals(original):
-    def nestedglobals(func, recurse=True):
-        if not recurse:
-            return original(func, recurse)
-        try:
-            from dill.detect import code as code_of
-
-            code = code_of(func)
-            if code is None:
-                return list()
-            return list(global_names(code))
-        except Exception:  # noqa: BLE001 - dill's own way then
-            return original(func, recurse)
-
-    nestedglobals._soup_original = original
-    return nestedglobals
-
-
 # ---------------------------------------------------------------- SOUP_SOLUTION_EARLY_ROWS
 
 EARLY_TIMEOUT = 300.0  # seconds Soup's setup waits for the thread before it tokenizes itself
@@ -267,12 +204,6 @@ class _Early:
     def _work(self):
         begin = time.perf_counter()
         try:
-            from . import _on
-
-            if _on("SOUP_SOLUTION_DATASET_HASH"):
-                from .startup import install_fast_tokenizer_reducer
-
-                install_fast_tokenizer_reducer(self.tokenizer)  # removed when Soup's setup returns
             self.format_row = self.build_format_row(tokenizer=self.tokenizer, data_cfg=self.data_cfg,
                                                     console=self.console, training_cfg=self.tcfg)
         except BaseException as exc:  # noqa: BLE001 - Soup's own call then
@@ -493,13 +424,6 @@ def _replacements():
             out.append((loss_mask, "_tokenize_only", _fast_tokenize_only))
         except Exception:  # noqa: BLE001
             pass
-    if _flag("SOUP_SOLUTION_FAST_FINGERPRINT"):
-        try:
-            import dill.detect
-
-            out.append((dill.detect, "nestedglobals", _fast_nestedglobals))
-        except Exception:  # noqa: BLE001
-            pass
     return out
 
 
@@ -527,10 +451,8 @@ def install():
 def patch_soup_trainer_build():
     """SFTTrainerWrapper.setup runs with the replacements of the switches that are on and the early
     tokenization (SOUP_SOLUTION_EARLY_ROWS); with none of them nothing is wrapped."""
-    from . import tokenizer_pickle
-
     early = _flag("SOUP_SOLUTION_EARLY_ROWS")
-    if not _replacements() and not early and not tokenizer_pickle.enabled():
+    if not _replacements() and not early:
         return
     from soup_cli.trainer import sft as soup_sft
 
@@ -541,17 +463,12 @@ def patch_soup_trainer_build():
 
     def setup(self, *args, **kwargs):
         undo = install()
-        # SOUP_SOLUTION_TOKENIZER_PICKLE: datasets' fingerprint of the tokenization map, the same bytes
-        # written faster (tokenizer_pickle.py)
-        undo_pickle = tokenizer_pickle.install() if tokenizer_pickle.enabled() else None
         undo_early = _install_early(self, args, kwargs) if early else None
         try:
             return original_setup(self, *args, **kwargs)
         finally:
             if undo_early is not None:
                 undo_early()
-            if undo_pickle is not None:
-                undo_pickle()
             undo()
 
     cls.setup = setup

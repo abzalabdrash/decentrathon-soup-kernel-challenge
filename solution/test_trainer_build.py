@@ -3,8 +3,6 @@
 CPU only; the tokenizer is a small byte-level BPE built here (no download) with a ChatML template
 without a `{% generation %}` block, as Qwen2.5's."""
 
-import importlib
-import sys
 
 import pytest
 
@@ -135,56 +133,6 @@ def test_fast_int_list_matches_loop(monkeypatch):
         undo()
 
 
-def _functions():
-    names = ("soup_cli.data.loss_mask", "soup_cli.data.sft_format", "soup_cli.trainer.sft",
-             "transformers.tokenization_utils_base", "trl.trainer.sft_trainer", "datasets.arrow_dataset",
-             "datasets.fingerprint", "json", "inspect")
-    for name in names:
-        try:
-            module = importlib.import_module(name)
-        except Exception:  # noqa: BLE001 - an optional module that does not import here
-            continue
-        for value in list(vars(module).values()):
-            candidates = [value]
-            if isinstance(value, type):
-                candidates = [v for v in vars(value).values() if callable(v)]
-            for fn in candidates:
-                if getattr(fn, "__code__", None) is not None:
-                    yield fn
-
-
-def test_global_names_match_dill():
-    detect = pytest.importorskip("dill.detect")
-    compared = 0
-    for fn in _functions():
-        # dill parses the text of dis.dis: a quoted string constant that contains "_GLOBAL" (e.g.
-        # inspect.getclosurevars' 'LOAD_GLOBAL') comes out as a "name" too, which is never a key of a
-        # module's globals; the names that can be globals are the same
-        found = {name for name in detect.nestedglobals(fn) if name.isidentifier()}
-        assert trainer_build.global_names(fn.__code__) == found, fn
-        compared += 1
-    assert compared > 200
-
-
-def test_fast_fingerprint_same_hash(monkeypatch):
-    fingerprint = pytest.importorskip("datasets.fingerprint")
-    import json
-
-    def transform(example, row_index):
-        return {"text": json.dumps(example) + str(row_index) + str(sys.maxsize)}
-
-    expected = fingerprint.Hasher.hash(transform)
-    monkeypatch.setenv("SOUP_SOLUTION_FAST_FINGERPRINT", "1")
-    undo = trainer_build.install()
-    try:
-        import dill.detect
-
-        assert getattr(dill.detect.nestedglobals, "_soup_original", None) is not None
-        assert fingerprint.Hasher.hash(transform) == expected
-    finally:
-        undo()
-
-
 TASK_YAML = """
 base: Qwen/Qwen2.5-1.5B-Instruct
 task: sft
@@ -222,8 +170,9 @@ def test_early_rows_same_dataset(tokenizer, tmp_path, monkeypatch):
     reference_tok = transformers.AutoTokenizer.from_pretrained(tmp_path)
     reference_fr = sft_format.build_format_row(tokenizer=reference_tok, data_cfg=cfg.data,
                                                console=soup_sft.console, training_cfg=cfg.training)
-    expected = soup_sft._map_text_sft_rows(rows, format_row=reference_fr, split="train",
-                                           max_length=cfg.data.max_length).to_list()
+    reference = soup_sft._map_text_sft_rows(rows, format_row=reference_fr, split="train",
+                                            max_length=cfg.data.max_length)
+    expected = reference.to_list()
 
     undo = trainer_build._install_early(Wrapper(), ({"train": rows},), {})
     assert undo is not None
@@ -237,6 +186,7 @@ def test_early_rows_same_dataset(tokenizer, tmp_path, monkeypatch):
         got = soup_sft._map_text_sft_rows(rows, format_row=fr, split="train", max_length=cfg.data.max_length)
         assert got is early.result
         assert got.to_list() == expected
+        assert got._fingerprint == reference._fingerprint  # datasets' own fingerprint of Soup's map
         masked = soup_sft._ensure_assistant_masks(got)
         assert masked is early.masked
         assert masked.to_list() == soup_sft._ensure_assistant_masks._soup_original(got).to_list()

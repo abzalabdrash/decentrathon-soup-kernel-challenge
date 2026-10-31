@@ -4,7 +4,6 @@ the tokenizer's fast fingerprint is deterministic and follows its content, the h
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -147,84 +146,6 @@ def tokenizer():
                                                           local_files_only=True)
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Qwen2.5 tokenizer not in the local cache: {exc!r}")
-
-
-def test_fast_tokenizer_fingerprint(tokenizer):
-    import transformers
-    from datasets.fingerprint import Hasher
-    from datasets.utils import _dill
-
-    from solution.startup import _fast_tokenizer_reducer
-
-    kind = type(tokenizer)
-    assert kind not in _dill.Pickler.dispatch or not getattr(
-        _dill.Pickler.dispatch[kind], "_soup_fast_tokenizer", False)
-    slow = Hasher.hash(tokenizer)
-    _dill.Pickler.dispatch[kind] = _fast_tokenizer_reducer(
-        _dill._save_transformersPreTrainedTokenizerBase)
-    try:
-        start = time.perf_counter()
-        fast = Hasher.hash(tokenizer)
-        seconds = time.perf_counter() - start
-        assert Hasher.hash(tokenizer) == fast  # deterministic
-        fresh = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct",
-                                                           local_files_only=True)
-        assert Hasher.hash(fresh) == fast  # the same for another load of the same files
-        fresh._merges = fresh._merges[:-1]  # the bulky containers are part of it
-        assert Hasher.hash(fresh) != fast
-        fresh = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct",
-                                                           local_files_only=True)
-        fresh.add_tokens(["<soup_test_token>"])  # and so is the rest of the tokenizer
-        assert Hasher.hash(fresh) != fast
-    finally:
-        _dill.Pickler.dispatch.pop(kind, None)
-    assert Hasher.hash(tokenizer) == slow  # datasets' own reducer again
-    print(f"fast fingerprint {seconds:.3f} s")
-    assert seconds < 0.5
-
-
-def test_dataset_hashing_hook_scope(tokenizer, monkeypatch):
-    """Installed once Soup's `_setup_transformers` has the tokenizer, used by the maps of `setup`,
-    gone when `setup` returns, even when it raises."""
-    from datasets import Dataset
-    from datasets.utils import _dill
-    from soup_cli.trainer import sft as soup_sft
-
-    from solution.startup import patch_soup_dataset_hashing
-
-    cls = soup_sft.SFTTrainerWrapper
-    kind = type(tokenizer)
-    seen = {}
-
-    def fake_setup_transformers(self, *args, **kwargs):
-        self.tokenizer = tokenizer
-
-    def fake_setup(self, fail=False):
-        self._setup_transformers()
-        entry = _dill.Pickler.dispatch.get(kind)
-        seen["during"] = getattr(entry, "_soup_fast_tokenizer", False)
-        tok = self.tokenizer
-
-        def format_row(example):
-            return {"n": len(tok(example["text"])["input_ids"])}
-
-        start = time.perf_counter()
-        seen["rows"] = Dataset.from_list([{"text": "hello world"}]).map(format_row)["n"]
-        seen["seconds"] = time.perf_counter() - start
-        if fail:
-            raise RuntimeError("setup failed")
-
-    monkeypatch.setattr(cls, "_soup_dataset_hashing", False, raising=False)
-    monkeypatch.setattr(cls, "_setup_transformers", fake_setup_transformers)
-    monkeypatch.setattr(cls, "setup", fake_setup)
-    patch_soup_dataset_hashing()
-    wrapper = object.__new__(cls)
-    wrapper.setup()
-    assert seen["during"] and seen["rows"] == [2] and seen["seconds"] < 0.5, seen
-    assert not getattr(_dill.Pickler.dispatch.get(kind), "_soup_fast_tokenizer", False)
-    with pytest.raises(RuntimeError):
-        wrapper.setup(fail=True)
-    assert not getattr(_dill.Pickler.dispatch.get(kind), "_soup_fast_tokenizer", False)
 
 
 def test_shared_entry_points_same_answers(monkeypatch):

@@ -70,22 +70,6 @@ is installed during a run (the rules forbid it; the harness compares `pip freeze
 are the ones the calls would compute; the organizers allow the same for packages_distributions().
 This replacement stays for the whole run.
 
-The trainer build (`patch_soup_dataset_hashing`)
-------------------------------------------------
-Soup tokenizes the training rows with `Dataset.from_list(rows).map(checked_format_row, ...)`
-(soup_cli/trainer/sft.py:143-178), and datasets fingerprints every map: it pickles the transform
-with its closure to hash it (datasets/fingerprint.py:253, `Hasher.hash`). The closure holds the
-tokenizer, and the tokenizer keeps Python copies of its vocabulary and merges (`_vocab`, 151,643
-entries; `_merges`, 151,387 pairs), which datasets' pickler, dill in pure Python, walks one object
-at a time: 0.9-1.0 s on the RTX 3050 Ti box, the largest part of the 3.1 s between the model
-setup and `train` on Kaggle (cProfile there: 8.0 of 9.4 s in that pickling). While Soup's `setup`
-runs, the reducer datasets uses for the tokenizer's type gets the tokenizer with those two
-containers already pickled by the C pickler (the same content, so the fingerprint still changes
-with any change of the vocabulary or merges, and is the same in every run): 0.09 s. datasets'
-pickler only ever feeds the hasher (datasets/fingerprint.py:214, builder.py:475); nothing it
-writes is unpickled. The fingerprint differs from the one datasets would compute; it names cache
-files only for datasets backed by files, and this one is built in memory.
-
 Diagnostics (off by default)
 ----------------------------
 SOUP_SOLUTION_PROFILE_STARTUP=1: cProfile of Soup's model setup (SFTTrainerWrapper.
@@ -268,101 +252,6 @@ def prepare_imports(log=True):
     return seconds
 
 
-# ---------------------------------------------------------------- the trainer build
-
-_BULKY = ("_vocab", "_merges")  # TokenizersBackend's Python copies of the vocabulary and merges
-
-
-def _fast_tokenizer_reducer(original):
-    """datasets' reducer `original` given a copy of the tokenizer whose bulky containers are
-    already C-pickled bytes (see the module docstring)."""
-    import pickle
-
-    def save(pickler, obj):
-        try:
-            state = obj.__dict__
-            bulky = [key for key in _BULKY if isinstance(state.get(key), (dict, list))]
-            if not bulky:
-                return original(pickler, obj)
-            view = object.__new__(type(obj))  # no __init__: a plain carrier of the state
-            view.__dict__.update(state)
-            for key in bulky:
-                view.__dict__[key] = pickle.dumps(state[key], protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:  # noqa: BLE001 - datasets' own path then
-            return original(pickler, obj)
-        return original(pickler, view)
-
-    save._soup_fast_tokenizer = True
-    return save
-
-
-_REDUCERS = []  # (dispatch, type, previous entry or None): installed by install_fast_tokenizer_reducer
-
-
-def install_fast_tokenizer_reducer(tokenizer):
-    """datasets' pickler hashes `type(tokenizer)` with `_fast_tokenizer_reducer` until
-    `uninstall_fast_tokenizer_reducers()`. Also called by trainer_build.py when it tokenizes the rows
-    early (during the model load). A no-op when already installed or not a transformers tokenizer."""
-    try:
-        from datasets.utils import _dill
-        from transformers import PreTrainedTokenizerBase
-
-        if not isinstance(tokenizer, PreTrainedTokenizerBase):
-            return
-        original = getattr(_dill, "_save_transformersPreTrainedTokenizerBase", None)
-        dispatch = _dill.Pickler.dispatch
-        kind = type(tokenizer)
-        previous = dispatch.get(kind)
-        if original is None or getattr(previous, "_soup_fast_tokenizer", False):
-            return
-        if previous is not None and previous is not original:
-            return  # someone else's reducer for this type: leave it
-        dispatch[kind] = _fast_tokenizer_reducer(original)
-        _REDUCERS.append((dispatch, kind, previous))
-    except Exception:  # noqa: BLE001 - datasets' own hashing then
-        pass
-
-
-def uninstall_fast_tokenizer_reducers():
-    while _REDUCERS:
-        dispatch, kind, previous = _REDUCERS.pop()
-        if getattr(dispatch.get(kind), "_soup_fast_tokenizer", False):
-            if previous is None:
-                dispatch.pop(kind, None)
-            else:
-                dispatch[kind] = previous
-
-
-def patch_soup_dataset_hashing():
-    """SFTTrainerWrapper hooks: once `_setup_transformers` has loaded the tokenizer, datasets'
-    pickler hashes its type with `_fast_tokenizer_reducer`; when `setup` returns (or raises), the
-    previous entry is back."""
-    from soup_cli.trainer import sft as soup_sft
-
-    cls = soup_sft.SFTTrainerWrapper
-    if getattr(cls, "_soup_dataset_hashing", False):
-        return
-    original_setup = cls.setup
-    original_setup_transformers = cls._setup_transformers
-    install = install_fast_tokenizer_reducer
-    uninstall = uninstall_fast_tokenizer_reducers
-
-    def _setup_transformers(self, *args, **kwargs):
-        result = original_setup_transformers(self, *args, **kwargs)
-        install(getattr(self, "tokenizer", None))
-        return result
-
-    def setup(self, *args, **kwargs):
-        try:
-            return original_setup(self, *args, **kwargs)
-        finally:
-            uninstall()
-
-    cls._setup_transformers = _setup_transformers
-    cls.setup = setup
-    cls._soup_dataset_hashing = True
-
-
 # ---------------------------------------------------------------- diagnostics: profile of the setup
 
 def _top_packages(names):
@@ -470,7 +359,7 @@ def patch_soup_first_step_mark():
 
     install_marks()  # SOUP_SOLUTION_STARTUP_PROFILE=1 only: marks inside the trainer build
     # apply() calls this function unconditionally, so the trainer-build switches hook in here
-    # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_FAST_FINGERPRINT, ...: all off by default)
+    # (SOUP_SOLUTION_FAST_ROWS, SOUP_SOLUTION_EARLY_ROWS, ...)
     patch_soup_trainer_build()
     original_train = cls.train
 
