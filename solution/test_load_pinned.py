@@ -628,6 +628,7 @@ def test_tiny_load_embedding_fill_bit_equal(patched, tiny_dir, monkeypatch, copi
     thread gives the load without it bit for bit (and transformers' own load), with and without the
     pinned copies of the other tensors, and no higher GPU peak."""
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", copies)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
     monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
     without = _load_in_setup(patched, tiny_dir, _with_fill)  # first: the process's first load peaks higher
     assert without["result"][1] is None
@@ -695,6 +696,7 @@ def test_tiny_load_pread_bit_equal(patched, tiny_dir, monkeypatch):
     """SOUP_SOLUTION_LOAD_PREAD=1: every planned tensor staged with preadv from its file; the load is
     the one with the mmap copies and transformers' own, bit for bit."""
     monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
     without = _load_in_setup(patched, tiny_dir, _with_reads)
     assert without["result"][1][0] == 0
     _pread_on(monkeypatch)
