@@ -47,7 +47,7 @@ def _targets(n, pattern, seed):
     return targets
 
 
-def _reference(hidden, weight, targets, num_items, chunk=256):
+def _reference(hidden, weight, targets, num_items, chunk=256, detach_metrics=False):
     """The base's head (fused_ce.reference_lm_head_loss) in blocks of rows, with the AMP scale on the
     backward as in a real fp16 step."""
     from solution.fused_ce import reference_lm_head_loss
@@ -62,9 +62,11 @@ def _reference(hidden, weight, targets, num_items, chunk=256):
         (loss * SCALE).backward()
         grad[start:start + chunk] = rows.grad / SCALE
         total += loss.item()
-        token_loss.append(tl)
-        entropy.append(en)
-        correct.append(co)
+        # The long case needs values only. Keeping entropy's unused autograd branch
+        # would retain the full-vocabulary intermediates of every reference chunk.
+        token_loss.append(tl.detach() if detach_metrics else tl)
+        entropy.append(en.detach() if detach_metrics else en)
+        correct.append(co.detach() if detach_metrics else co)
     return total, torch.cat(token_loss), torch.cat(entropy), torch.cat(correct), grad
 
 
@@ -123,7 +125,8 @@ def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items
     (loss * SCALE).backward()
     grad = hidden.grad / SCALE
     ref_loss, ref_token_loss, ref_entropy, ref_correct, ref_grad = _reference(
-        hidden, weight, targets, num_items, chunk=64 if n == 2048 else 256)
+        hidden, weight, targets, num_items, chunk=64 if n == 2048 else 256,
+        detach_metrics=n == 2048)
 
     # statistics from the same fp16 logits: fp32 both ways, only the summation order differs
     chunk_logits, sorted_targets, order = _chunked_logits(hidden, weight, targets, rows)
