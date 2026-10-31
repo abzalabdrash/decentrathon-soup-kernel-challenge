@@ -1,5 +1,6 @@
 """The run's pinned host memory handed back while Soup saves, not at the process exit
-(SOUP_SOLUTION_EXIT_RELEASE=1; SOUP_SOLUTION_EXIT_NOGC=1 also stops the garbage collector there).
+(SOUP_SOLUTION_EXIT_RELEASE=1, or =all to also hand back the caching allocator's free GPU blocks;
+SOUP_SOLUTION_EXIT_NOGC=1 also stops the garbage collector there).
 
 The harness times the whole process, its exit included. Measured on the T4 (solution/bench_exit.py,
 soup-e1-exit1, two runs each), from Trainer.train's end to the process's end: base 2.39 s, ours 1.75 s,
@@ -34,7 +35,7 @@ import os
 import threading
 import time
 
-_STATE = {"thread": None, "seconds": None, "released": 0, "unpinned": 0, "error": None}
+_STATE = {"thread": None, "seconds": None, "released": 0, "unpinned": 0, "device": 0, "error": None}
 
 
 def _on(name):
@@ -52,6 +53,11 @@ def _release(device):
         torch.cuda.synchronize(device)  # no copy in flight reads or writes what goes now
         _STATE["released"] = release_host_memory()
         _STATE["unpinned"] = unpin_all()
+        if os.environ.get("SOUP_SOLUTION_EXIT_RELEASE", "").strip().lower() == "all":
+            # the caching allocator's free blocks too: the CUDA context teardown at exit has less to unmap
+            reserved = torch.cuda.memory_reserved(device)
+            torch.cuda.empty_cache()
+            _STATE["device"] = reserved - torch.cuda.memory_reserved(device)
     except Exception as exc:  # noqa: BLE001 - an optimisation must not break the end of a run
         _STATE["error"] = repr(exc)
     _STATE["seconds"] = time.perf_counter() - started
@@ -74,8 +80,9 @@ def report():
         return "not started"
     if _STATE["seconds"] is None:
         return "still running"
+    device = f", {_STATE['device'] / 2**20:.0f} MiB of cached GPU memory released" if _STATE["device"] else ""
     return (f"{_STATE['released'] / 2**20:.0f} MiB of offload slabs freed, {_STATE['unpinned'] / 2**20:.0f} MiB "
-            f"unregistered in {_STATE['seconds']:.2f} s" + (f" ({_STATE['error']})" if _STATE["error"] else ""))
+            f"unregistered{device} in {_STATE['seconds']:.2f} s" + (f" ({_STATE['error']})" if _STATE["error"] else ""))
 
 
 def patch_soup_exit_release():
