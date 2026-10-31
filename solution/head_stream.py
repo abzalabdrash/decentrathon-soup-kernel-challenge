@@ -20,8 +20,8 @@ returns, the setup is checked: if the head or the embedding became trainable, wr
 replaced, the real weight goes back on the GPU in fp32 (the base's state) and every override is
 removed. The saved adapter holds only the LoRA tensors, as before.
 
-Embedding lookup: the ids come to the host (one synchronization; the packed path synchronizes right
-before anyway), the rows are gathered from the host copy into a pinned staging buffer and copied to
+Embedding lookup: the ids come to the host (one synchronization), or their CPU copy when the host plan
+recorded one for them (step_pipeline.host_ids, SOUP_SOLUTION_HOST_IDS: no wait), the rows are gathered from the host copy into a pinned staging buffer and copied to
 the GPU (2.5 MB for 826 tokens), then cast to fp32: the base's lookup in its fp32 weight gives the
 same values bit for bit (the fp16 -> fp32 round trip is exact). A training forward allocates the
 ring and starts the copies of the first K chunks of the head right after the lookup, while the PCIe
