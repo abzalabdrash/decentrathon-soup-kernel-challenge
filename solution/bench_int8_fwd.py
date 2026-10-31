@@ -110,6 +110,71 @@ def timing(args):
     print("JSON " + json.dumps(results))
 
 
+def _time_fn(fn, iters, rounds):
+    fn()
+    torch.cuda.synchronize()
+    out = []
+    for _ in range(rounds):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iters):
+            fn()
+        end.record()
+        end.synchronize()
+        out.append(start.elapsed_time(end) * 1000.0 / iters)
+    return statistics.median(out)
+
+
+def sweep(args):
+    """Tiles of the two bandwidth-bound int8 kernels: the gate|up epilogue (TI, TM, PG, warps; mode
+    gu, the SwiGLU output written) at each M of --m, and the NF4 -> int8 decode of gate|up (ROWS,
+    CB, warps). us per launch and the effective bandwidth."""
+    import triton
+
+    from solution import int8_fwd
+    from solution.test_fused_proj import _linear4bit
+
+    inter, d = 8960, 1536
+    for m in args.m:
+        acc = torch.randint(-2 ** 20, 2 ** 20, (2 * inter, m), dtype=torch.int32, device="cuda")
+        s_w = torch.rand(2 * inter, device="cuda") * 1e-4
+        s_x = torch.rand(m, device="cuda") * 1e-2
+        gate_up = torch.empty((2 * inter, m), dtype=torch.float16, device="cuda")
+        hidden = torch.empty((inter, m), dtype=torch.float16, device="cuda")
+        moved = acc.numel() * 4 + gate_up.numel() * 2 + hidden.numel() * 2
+        for ti, tm, pg, warps in [(32, 64, 448, 4), (32, 64, 896, 4), (16, 64, 448, 4),
+                                  (64, 64, 448, 4), (32, 128, 448, 4), (32, 128, 448, 8),
+                                  (16, 128, 448, 4), (64, 32, 448, 4), (32, 64, 448, 8),
+                                  (32, 64, 224, 4), (16, 64, 224, 2), (64, 64, 448, 8)]:
+            grid = (triton.cdiv(m, tm), inter // pg)
+
+            def fn():
+                int8_fwd.int8_gate_up_kernel[grid](acc, s_w, s_x, gate_up, hidden, inter, inter, m,
+                                                   0, pg, 0, TI=ti, TM=tm, HIDDEN=True,
+                                                   num_warps=warps)
+
+            us = _time_fn(fn, args.iters, args.rounds)
+            print(f"epilogue M={m} TI={ti} TM={tm} PG={pg} warps={warps}: {us:7.1f} us "
+                  f"({moved / us / 1e3:.0f} GB/s)", flush=True)
+    gate, up = _linear4bit(d, inter, seed=4), _linear4bit(d, inter, seed=5)
+    ops = _ops(gate, up)
+    out = torch.empty((2 * inter, d), dtype=torch.int8, device="cuda")
+    scales = torch.empty(2 * inter, dtype=torch.float32, device="cuda")
+    moved = out.numel() + out.numel() // 2 + out.numel() // 64
+    for rows, cb, warps in [(8, 8, 4), (4, 8, 4), (16, 8, 4), (8, 8, 2), (8, 8, 8), (16, 8, 8),
+                            (4, 8, 2), (8, 4, 4), (32, 8, 8), (2, 8, 1)]:
+        programs = inter // rows
+
+        def fn():
+            int8_fwd.nf4_int8_gu_kernel[(2 * programs,)](
+                *ops[0][:6], *ops[1][:6], out, scales, programs, d // 64, d, inter,
+                ROWS=rows, CB=cb, QBLOCK=64, ABLOCK=256, num_warps=warps, enable_fp_fusion=False)
+
+        us = _time_fn(fn, args.iters, args.rounds)
+        print(f"decode ROWS={rows} CB={cb} warps={warps}: {us:7.1f} us "
+              f"({moved / us / 1e3:.0f} GB/s)", flush=True)
+
+
 # ---------------------------------------------------------------------------------------------
 
 
@@ -312,6 +377,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--profile", type=int, nargs="*", default=[832, 2048])
     parser.add_argument("--errors", action="store_true")
+    parser.add_argument("--sweep", action="store_true", help="tiles of the epilogue and the decode")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--data", default="data/train.jsonl")
     parser.add_argument("--rows", type=int, default=32)
@@ -323,6 +389,8 @@ def main():
     args = parser.parse_args()
     if args.errors:
         errors(args)
+    elif args.sweep:
+        sweep(args)
     else:
         timing(args)
 
