@@ -8,8 +8,8 @@ Decentrathon 6.0, трек 01 Soup Kernel Challenge. Описание решен
   (код заморожен на 0b2cb75; папка `solution/` совпадает с 6c426d1)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in
   README.md): https://www.kaggle.com/code/slerfas/soup-final-public
-- Demo video (up to 3 minutes): `<VIDEO_URL>` (сценарий: [docs/PRESENTATION.md](docs/PRESENTATION.md))
-- Presentation: `<PRESENTATION_URL>` (план слайдов: [docs/PRESENTATION.md](docs/PRESENTATION.md))
+- Demo video (up to 3 minutes): https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/blob/main/docs/presentation/soup-null-pointers-demo.mp4 (2:56; тот же файл загружен на платформу) (сценарий: [docs/PRESENTATION.md](docs/PRESENTATION.md))
+- Presentation: https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers/blob/main/docs/presentation/soup-null-pointers-slides.pdf (8 слайдов) (план слайдов: [docs/PRESENTATION.md](docs/PRESENTATION.md))
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
