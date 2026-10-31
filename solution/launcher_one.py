@@ -75,7 +75,28 @@ def _key(text):
 # the modules whose warm-up registrations only compile (compile_kernel with dtypes and sizes: nothing
 # allocated, launched or drawn), so running one once more in the probe changes nothing
 COMPILE_ONLY_MODULES = frozenset(f"solution.{name}" for name in (
-    "warmup", "rmsnorm", "nf4", "rope", "swiglu", "fused_ce", "fused_proj", "head_stream", "head_pack", "int8_bwd"))
+    "warmup", "rmsnorm", "nf4", "rope", "swiglu", "fused_ce", "fused_proj", "head_stream", "head_pack", "int8_bwd",
+    "int8_fwd"))
+# kernel modules that compile in a thread of their own during training (not through the warm-up's
+# queue): their `_warm` (compile_kernel only) is probed too, so their launchers are in the one build and
+# their own compile finds them there instead of running the C compiler during the first steps
+OWN_THREAD_MODULES = ("int8_bwd", "int8_fwd")
+
+
+def extra_probes():
+    """[(name, fn)] of the `_warm` of OWN_THREAD_MODULES that are present (a module may be absent)."""
+    import importlib
+
+    out = []
+    for name in OWN_THREAD_MODULES:
+        try:
+            module = importlib.import_module(f"solution.{name}")
+        except Exception:  # noqa: BLE001 - not in this tree
+            continue
+        fn = getattr(module, "_warm", None)
+        if callable(fn) and probe_safe(fn):
+            out.append((f"{name}._warm", fn))
+    return out
 
 
 def probe_safe(fn):

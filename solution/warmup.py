@@ -623,7 +623,7 @@ def _run(device, log, workers):
             torch.cuda.set_stream(stream)  # as in the workers (the probed registrations only compile)
             impl = _triton_knob("build", "impl")  # the -O0 launcher build when it is ours, else triton's
             launcher_one.start([(name, fn) for name, fn in list(_STATE["queue"].queue)
-                                if name not in FIRST and launcher_one.probe_safe(fn)],
+                                if name not in FIRST and launcher_one.probe_safe(fn)] + launcher_one.extra_probes(),
                                build=impl if getattr(impl, "_soup_launcher_build", None) else None)
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any

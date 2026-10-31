@@ -158,3 +158,9 @@ def test_probe_takes_the_kernel_modules_warmups_only():
         pass
 
     assert not launcher_one.probe_safe(elsewhere)  # this module: not one of the kernel modules
+
+
+def test_extra_probes_include_the_int8_kernels_when_present():
+    names = [name for name, _ in launcher_one.extra_probes()]
+    assert "int8_bwd._warm" in names
+    assert all(launcher_one.probe_safe(fn) for _, fn in launcher_one.extra_probes())
