@@ -122,6 +122,10 @@ def apply():
         from .exit_release import patch_soup_exit_release
 
         patch_soup_exit_release()  # off by default: pinned host memory released at the last step's end
+    if os.environ.get("SOUP_SOLUTION_SAVE_ONCE", "0") not in ("0", "false", "no", ""):
+        from .save_tail import patch_soup_save_tail
+
+        patch_soup_save_tail()  # off by default: the tail's 2nd and 3rd tokenizer saves from the 1st's bytes
     from .startup import (patch_soup_dataset_hashing, patch_soup_first_step_mark,
                           patch_soup_startup_profile)
 
