@@ -6,6 +6,8 @@ the GPU kept far behind the CPU at every dequantization; calls out of the traini
 wait counters; slots and memory; the switch and its fallbacks; an MLP that reads its matrices
 without acquire()."""
 
+import gc
+
 import pytest
 import torch
 
@@ -171,24 +173,33 @@ def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night):
         streamer.restore()
 
 
+def _settled_allocated():
+    """memory_allocated() without garbage of earlier tests freed in the middle of a measurement."""
+    gc.collect()
+    torch.cuda.synchronize()
+    return torch.cuda.memory_allocated()
+
+
 def test_type_ring_memory(layer_shaped_qwen_dir, night):
     """The type ring holds 2 x 2.84 + 3 x 7.1 MB of slots instead of 2 x 24.1 MB: what the GPU holds
-    after the setup drops by the difference."""
+    after the setup drops by the difference. Both rings are measured from the same state (the
+    layers restored into tensors of their own by a first streaming)."""
     from solution.weight_stream import stream_model_weights
 
     model = _soup_like(layer_shaped_qwen_dir)
+    _quiet_gpu()
+    stream_model_weights(model, slots=2, ring="layer").restore()
     held = {}
     for ring in ("layer", "type"):
-        _quiet_gpu()
+        before = _settled_allocated()
         streamer = stream_model_weights(model, slots=2, ring=ring)
         try:
-            torch.cuda.synchronize()
-            held[ring] = (torch.cuda.memory_allocated(), streamer.ring_bytes)
+            held[ring] = (before - _settled_allocated(), streamer.ring_bytes)
         finally:
             streamer.restore()
-    (layer_alloc, layer_ring), (type_alloc, type_ring) = held["layer"], held["type"]
+    (layer_freed, layer_ring), (type_freed, type_ring) = held["layer"], held["type"]
     assert 48_000_000 < layer_ring < 48_600_000 and 26_800_000 < type_ring < 27_200_000
-    saved = layer_alloc - type_alloc
+    saved = type_freed - layer_freed
     assert abs(saved - (layer_ring - type_ring)) <= 64 * 1024, (saved, layer_ring - type_ring)
     print(f"\nring {layer_ring / 2**20:.1f} -> {type_ring / 2**20:.1f} MiB, allocated "
           f"{saved / 2**20:.1f} MiB less")
@@ -224,7 +235,8 @@ def test_type_ring_out_of_order(layer_shaped_qwen_dir, night):
         out += [y.detach(), xg.grad]
         return [t.clone() for t in out]
 
-    def evaluate():
+    def evaluate():  # in training mode: the LoRA dropout draws its masks from a fixed seed
+        torch.manual_seed(13)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             return [model(input_ids=ids, attention_mask=mask).logits.float().clone()]
 
