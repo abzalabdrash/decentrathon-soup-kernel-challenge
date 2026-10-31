@@ -84,11 +84,13 @@ DEFAULT_MODE = "offload"
 MIN_NUMEL = 4_000_000  # gate/up from 447 tokens on, (gate|up) from 224; nothing else saved is this big
 MAX_NUMEL = 64_000_000  # (gate|up) up to 3571 tokens; the 151936 x 1536 embedding is far above
 SLAB_BYTES = 256 << 20  # holds a MAX_NUMEL half tensor
-# pinned ahead (patch_soup_setup_prepin) once Soup has built a real CUDA model: the stack of the
-# task's largest step (1427 tokens, 6 slabs); a larger step pins more on demand. On the T4 a slab
-# takes 130 ms of cudaHostAlloc, which holds the forward up when the stack grows during training
-# (the "stalls in torch.empty" of the d9f60bb trace): 6 of them per run.
-PREPIN_MB = 1536
+# pinned ahead (patch_soup_setup_prepin) once Soup has built a real CUDA model; a larger step pins
+# more on demand. On the T4 a slab takes 130 ms of cudaHostAlloc, which holds the forward up when the
+# stack grows during training (the "stalls in torch.empty" of the d9f60bb trace). With the layer
+# inputs offloaded too a step stacks ~42 KB per token per layer: 7 slabs at the public data's 1,427
+# tokens (one pinned on demand with 6 ahead), 10 at the ~1,970-token steps of jury-style rows (four
+# on demand: soup-night-ejury2 / fjury logs). 10 slabs cover steps up to ~2,100 tokens.
+PREPIN_MB = 2560
 ALIGN = 4096
 HOST_LIMIT_BYTES = 6 << 30  # pinned memory cap; past it tensors stay on the GPU
 
@@ -283,8 +285,10 @@ class Offloader:
     def pack(self, tensor):
         if self.early:
             saved = self.early.pop(tensor.data_ptr(), None)
-            if saved is not None and saved.shape == tensor.shape and saved.dtype == tensor.dtype:
-                return saved
+            if (saved is not None and saved.gpu is not None
+                    and saved.gpu.data_ptr() == tensor.data_ptr()
+                    and saved.shape == tensor.shape and saved.dtype == tensor.dtype):
+                return saved  # the copy offload_early started for this very storage
         if _RESIDUAL["marked"]:
             saved = self._pack_marked(tensor)
             if saved is not None:
@@ -390,6 +394,9 @@ class Offloader:
                 self.stats["still_on_gpu"] += 1
             if saved.keep:  # its other readers in this layer's backward get the same tensor
                 saved.gpu, saved.unpacked = tensor, True
+            else:  # read: out of the prefetch window (a node unpacking several handles in
+                # ascending order would otherwise copy the ones it already read back again)
+                self.by_index.pop(saved.index, None)
             self._prefetch_before(saved.index, current)
         return tensor
 
@@ -411,6 +418,7 @@ class Offloader:
 
     def close(self):
         with self.lock:
+            self.early.clear()
             while self.inflight:
                 oldest = self.inflight.popleft()
                 oldest.copied.synchronize()
@@ -440,6 +448,12 @@ DRAIN_LAST = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_LAST", "0").strip().low
     "0", "false", "no", "")
 
 
+# SOUP_SOLUTION_OFFLOAD_DRAIN_HEAD=1: at the final norm (head_stream.py's prefetch hook, before the
+# head's ring and logits buffer are allocated: the run's peak on the T4 after EARLY, soup-night-wdiag)
+# the copies in flight finish on the GPU and the last layer's (gate|up) (47 MiB at ~1,400 tokens)
+# leaves; its backward fetches it back on demand
+DRAIN_HEAD = os.environ.get("SOUP_SOLUTION_OFFLOAD_DRAIN_HEAD", "0").strip().lower() not in (
+    "0", "false", "no", "")
 # SOUP_SOLUTION_OFFLOAD_EARLY=1: the fused MLP starts the copy of its (gate|up) to the host right after
 # the gate|up GEMM (offload_early) instead of when autograd packs it after the MLP's forward (after
 # SwiGLU and the down GEMM), and every MLP forward first lets the copies in flight finish
@@ -476,6 +490,7 @@ def drain_inflight():
     if offloader is None:
         return
     with offloader.lock:
+        offloader.early.clear()  # any handle not packed by now is stale
         while offloader.inflight:
             oldest = offloader.inflight.popleft()
             oldest.home.wait_event(oldest.copied)
