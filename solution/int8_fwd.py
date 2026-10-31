@@ -47,7 +47,7 @@ import torch
 import triton
 import triton.language as tl
 
-from . import nf4
+from . import mma_gemm, nf4
 from .int8_bwd import _soup_train_process
 
 
@@ -82,6 +82,16 @@ FP16_LAYERS = _layers(os.environ.get("SOUP_SOLUTION_INT8_FWD_FP16_LAYERS", ""))
 TOPK = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_TOPK", "16"))
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
+# SOUP_SOLUTION_MMA_INT8_FWD=1 (B3, off until the organizers answer the wave-3 question): in MODE
+# "gu" the CHUNKS int8 products and int8_gate_up_kernel become one tensor-core kernel of
+# mma_gemm.py: bit-for-bit the same (gate|up) and SwiGLU output, no int32 product in memory
+MMA_FWD = _env_on("SOUP_SOLUTION_MMA_INT8_FWD", "0")
+
+
+def _mma_fwd(inter, hidden, chunk):
+    """Whether gate|up takes mma_gemm.py's tensor-core kernel (switch, MODE "gu", sm_75, its tiles)."""
+    return (MMA_FWD and MODE == "gu" and torch.cuda.get_device_capability() == (7, 5)
+            and mma_gemm.int8_gate_up_usable(inter, hidden, chunk))
 GU_ROWS, GU_CB = 8, 8  # gate/up decode: rows per program, 64-element blocks per row per iteration
 KC_ROWS = 64  # weight rows per program of the top-k column extraction (same launch as the decode)
 DN_ROWS, DN_CB = 4, 16  # down decode (rows of 8960: 140 blocks)
@@ -498,6 +508,11 @@ def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=Non
     _decode_gate_up(gate_ops, up_ops, w, s_w, inter, d, chunk, idx, w_k)
     if release is not None:
         release()
+    if hidden and _mma_fwd(inter, d, chunk):
+        # products and epilogue in one kernel: (gate|up) is written by it, so it is allocated now
+        if before_alloc is not None:
+            before_alloc()
+        return mma_gemm.int8_gate_up(w, s_w, x_q, s_x, inter, chunk, half, w_k, x_k if k else None)
     x_t = x_q.t()
     if not k:
         x_k, w_k = _dummy(device, torch.float32), _dummy(device, torch.float32)
@@ -561,8 +576,15 @@ def _warm():
                    HIDDEN, chunk, ROWS=GU_ROWS, CB=GU_CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK, K=k,
                    KROWS=KC_ROWS, num_warps=4, enable_fp_fusion=False)
     gu_only = MODE == "gu"
-    compile_kernel(int8_gate_up_kernel, i32, f32, f32, half, half if gu_only else f32, f32, f32,
-                   chunk, INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only, K=k)
+    if _mma_fwd(INTERMEDIATE, HIDDEN, chunk):
+        mma_gemm.install()
+        bf, bt, bk, warps, group = mma_gemm.GATE_UP_CFG
+        compile_kernel(mma_gemm.tc_int8_gate_up_kernel, i8, i8, f32, f32, half, half, f32, f32,
+                       INTERMEDIATE, tokens, chunk, HIDDEN, BLOCK_F=bf, BLOCK_T=bt, BLOCK_K=bk,
+                       GROUP_F=group, K=k, num_warps=warps, num_stages=1)
+    else:
+        compile_kernel(int8_gate_up_kernel, i32, f32, f32, half, half if gu_only else f32, f32, f32,
+                       chunk, INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only, K=k)
     if gu_only:
         return None
     compile_kernel(int8_hidden_kernel, half, f32, f32, i8, INTERMEDIATE, tokens,
