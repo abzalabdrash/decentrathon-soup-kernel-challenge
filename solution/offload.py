@@ -551,6 +551,11 @@ def offload_saved_tensors(**knobs):
     """While active, large saved activations live in pinned host memory between the forward and
     the backward. Yields the Offloader (stats, summary())."""
     offloader = Offloader(**knobs)
+    # a mark is taken by the pack that follows it inside the same forward, so a mark made before this
+    # context began is stale (a forward without a graph, another context): left in place, it would
+    # send an unrelated fp32 tensor that later gets its address to host memory too (the values stay
+    # right, the counts do not: test_offload saw 13 offloaded tensors instead of 12 after other tests)
+    _RESIDUAL["marked"].clear()
     previous = _ACTIVE["offloader"]
     _ACTIVE["offloader"] = offloader
     try:
