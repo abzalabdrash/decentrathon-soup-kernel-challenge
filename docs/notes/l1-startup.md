@@ -145,6 +145,11 @@ Decision (1e91696): LAUNCHERS_ONE and LOAD_CODE_TABLE on by default (together fi
 -0.70 s in v4). Off, with their numbers: META_INIT (-0.03 s), LOAD_EARLY (-0.06 s, 2.9 GB pinned host
 memory during the load), TRACKER_THREAD (wall -0.13 s, one session), EARLY_ROWS (+0.5 s).
 
+soup-l1-full2 (1e91696, the new defaults, no `--env`): all 10 checks; 46.4 s / 395 MiB against the base
+80.2 s / 14 345 MiB (speedup 1.73 in a fast base session, memory 36.3), eval +0.004 %, own kernels 17.0 %,
+Soup 79 passed; pytest solution 443 passed, 1 failed (test_recompute[lengths0], as in P1's runs; the
+boundary test passed this time).
+
 ## Lines for README (switches on by default)
 
 - Лаунчеры ядер Triton собираются одним запуском компилятора C: поток прогрева один раз прогоняет
