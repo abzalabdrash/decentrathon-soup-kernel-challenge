@@ -18,9 +18,10 @@ T4, ABBA, 3 rounds each, solution-only runs:
   instead of 401 (one cuBLAS workspace fewer: alloc -9.1, reserved -22).
 - var4 (hot session): base 44.89; all 44.08 (-0.8). Peak unchanged except for the single-thread -30.
 
-Boundary idle (trace, profiled): ~31 ms down to ~13 ms. What is left: Soup's tracker SQLite commit,
-3.3-3.6 ms per log (~0.22 s per run, Soup's code, needs the organizers); AdamW's CPU after
-`found_inf.item()`, ~3 ms (it stays).
+Boundary idle (trace, profiled): 29.8 ms down to 13.4-16.8 ms. What is left: Soup's tracker SQLite
+commit, 3.3-17 ms per log depending on the Kaggle disk (0.2-1.1 s per run, Soup's code, needs the
+organizers); AdamW's CPU after `found_inf.item()`, ~3-4 ms (it stays). Kaggle pytest on 5f2f302:
+375 passed, 5 skipped.
 
 Full run (1be9e55): all 10 checks, 42.5 s / 371 MiB against 80.0 s / 14,345 MiB, eval -0.012 %.
 Jury run (seed 57, rows 20000/35000): all 10 checks, 46.2 / 47.9 s against 88.3 s, 411 MiB,
@@ -117,7 +118,15 @@ solution / solution / base): **all 10 checks**, solution 46.18 / 47.94 s against
 peak 411 MiB (base 14,407), eval +0.008 %, loss curve 0.02 % / 0.04 %, check 5 identical within
 tolerance.
 
-(a last diag trace with pytest on 5f2f302, soup-b1-diag2, was queued behind other sessions' runs)
+Final diag (soup-b1-diag2, 5f2f302, all defaults + timing): Kaggle pytest **375 passed, 5 skipped**
+(the test fix holds on the notebook's two T4s). Boundary GPU idle, from the backward's last compute
+kernel to the next forward's first norm (steps 8-9 under the profiler): main 29.8 ms (diag0),
+27e3d4b 13.4 ms (diag1), 5f2f302 16.8 ms (diag2: AdamW 4.0, scale update 1.4, log 5.6 with
+Soup's tracker, forward start ~3). One CPU thread now runs the whole step; the CPU waits 103 ms
+at `found_inf.item()` in the long step. Timing: boundary.py's lists built once per run, the FLOP
+counter 0.12 ms per step (was 8.8 ms with the rebuilds), clip 1.7 ms; Soup's
+`ExperimentTracker.log_metrics` took 17 ms per log in this session (1.1 s per run; 3.3-3.6 ms in
+var3): the SQLite commit's cost follows the Kaggle disk, worth raising with the organizers.
 
 ## Not done / follow-ups
 
