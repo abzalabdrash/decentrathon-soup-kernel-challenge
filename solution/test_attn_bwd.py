@@ -223,3 +223,18 @@ def test_guards(math_on):
 def test_warmup_compiles(math_on):
     attn_bwd._STATE.update(min_tokens=600, max_len=256)
     attn_bwd._warm()
+
+
+def test_layout_ratio_and_the_ratio_filter(math_on):
+    assert attn_bwd.layout([250, 175, 125, 90], 2)[:2] == (256, 3)
+    assert attn_bwd.layout([250, 175, 125, 90], 2)[2] == ((0, 0), (1, 0), (2, 0), (2, 125))
+    assert attn_bwd.work_ratio([256], 1) == 2.0 and attn_bwd.work_ratio([256], 2) == 1.5
+    lengths = PATTERNS["4 rows of ~200 and the tail"]
+    q, k, v, dout, cu, bounds, n_seq = _batch(lengths)
+    ratio = attn_bwd.work_ratio(lengths, attn_bwd._STATE["blocks"])
+    attn_bwd._STATE.update(max_ratio=ratio - 0.01, calls=0)
+    _through_varlen(lengths, q, k, v, dout)
+    assert attn_bwd._STATE["calls"] == 0
+    attn_bwd._STATE.update(max_ratio=ratio + 0.01)
+    _through_varlen(lengths, q, k, v, dout)
+    assert attn_bwd._STATE["calls"] == 1

@@ -70,6 +70,8 @@ _STATE = {
     "scratch_mb": _env_int("SOUP_SOLUTION_ATTN_BWD_SCRATCH_MB", 16),
     # query-row blocks per bin (the products skip the causal square's upper right part above them)
     "blocks": max(1, _env_int("SOUP_SOLUTION_ATTN_BWD_BLOCKS", 2)),
+    # the step's work_ratio at most this (the math path's score entries over the fmha's causal ones)
+    "max_ratio": float(os.environ.get("SOUP_SOLUTION_ATTN_BWD_MAX_RATIO", "1e9") or "1e9"),
     "calls": 0, "fallbacks": 0, "shared": 0, "error": None,
 }
 ALIGN = 16  # a block of query rows: a multiple of this (16-byte aligned fp16 rows for cuBLAS)
@@ -234,33 +236,47 @@ def _scratch(device, half, per_entry, entries):
             torch.empty(m * per_entry, dtype=half, device=device), m)
 
 
+def layout(lens, nb):
+    """(LP, bins, where) for these row lengths: LP the longest rounded up to NB blocks of a multiple
+    of ALIGN rows, rows placed first fit, longest first, into bins of LP rows; where[b] = (bin, first
+    row of row b in it)."""
+    lp = -(-max(lens) // (ALIGN * nb)) * (ALIGN * nb)
+    used, where = [], [None] * len(lens)
+    for b in sorted(range(len(lens)), key=lambda i: -lens[i]):
+        for i, u in enumerate(used):
+            if u + lens[b] <= lp:
+                where[b] = (i, u)
+                used[i] += lens[b]
+                break
+        else:
+            where[b] = (len(used), 0)
+            used.append(lens[b])
+    return lp, len(used), tuple(where)
+
+
+def work_ratio(lens, nb):
+    """The math path's score entries (bins x NB blocks of LP / NB rows against (t+1) LP / NB keys)
+    over the fmha's causal ones (sum of L^2 / 2)."""
+    lp, bins, _ = layout(lens, nb)
+    return bins * lp * lp * (nb + 1) / nb / sum(length * length for length in lens)
+
+
 class Plan:
     """One step's layout for the math path: the real sequences (bounds[:n_seq + 1]) packed into
-    bins of LP rows (first fit, longest first: short rows share a bin, so the squares the GEMMs
-    compute are fewer), and on the GPU one int32 tensor of three maps: rowmap (bin row -> token,
-    -1 none), seg (bin row -> its sequence's first row in the bin, -1 none) and inv (token -> bin
-    row, -1 for the tail). Built once per step, copied from pinned memory without a host wait."""
+    bins of LP rows (`layout`: short rows share a bin, so the squares the GEMMs compute are fewer),
+    and on the GPU one int32 tensor of three maps: rowmap (bin row -> token, -1 none), seg (bin row
+    -> its sequence's first row in the bin, -1 none) and inv (token -> bin row, -1 for the tail).
+    Built once per step, copied from pinned memory without a host wait."""
 
     __slots__ = ("bounds", "n_seq", "blocks", "lp", "bins", "where", "host", "maps", "rowmap", "seg",
                  "inv")
 
     def __init__(self, bounds, n_seq, device, blocks=None):
         self.bounds, self.n_seq = bounds, n_seq
-        self.blocks = nb = blocks or _STATE["blocks"]
+        self.blocks = blocks or _STATE["blocks"]
         lens = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
-        self.lp = lp = -(-max(lens) // (ALIGN * nb)) * (ALIGN * nb)
-        used, where = [], [None] * n_seq
-        for b in sorted(range(n_seq), key=lambda i: -lens[i]):
-            for i, u in enumerate(used):
-                if u + lens[b] <= lp:
-                    where[b] = (i, u)
-                    used[i] += lens[b]
-                    break
-            else:
-                where[b] = (len(used), 0)
-                used.append(lens[b])
-        self.bins, self.where = len(used), tuple(where)
-        n, rows = bounds[-1], len(used) * lp
+        self.lp, self.bins, self.where = lp, bins, where = layout(lens, self.blocks)
+        n, rows = bounds[-1], bins * lp
         try:
             host = torch.empty(2 * rows + n, dtype=torch.int32, pin_memory=True)
         except RuntimeError:
@@ -281,10 +297,14 @@ _PLAN = {"key": None, "plan": None}
 
 
 def plan_for(bounds, n_seq, device):
-    """The step's Plan, built at the first layer that asks and shared by the others."""
-    key = (bounds, n_seq, device, _STATE["blocks"])
+    """The step's Plan when its lengths fit the math path (else None), decided and built at the
+    first layer that asks and shared by the others."""
+    key = (bounds, n_seq, device, _STATE["blocks"], _STATE["min_tokens"], _STATE["max_len"],
+           _STATE["max_ratio"])
     if _PLAN["key"] != key:
-        _PLAN["key"], _PLAN["plan"] = key, Plan(bounds, n_seq, device)
+        lens = [bounds[i + 1] - bounds[i] for i in range(n_seq)]
+        fit = _lengths_fit(bounds, n_seq) and work_ratio(lens, _STATE["blocks"]) <= _STATE["max_ratio"]
+        _PLAN["key"], _PLAN["plan"] = key, Plan(bounds, n_seq, device) if fit else None
     return _PLAN["plan"]
 
 
@@ -360,8 +380,6 @@ def taken(cu):
     bounds = cached[0]
     real = len(spans)
     if real >= len(bounds) or bounds[real] != spans[-1][1] or bounds[0] != 0:
-        return None
-    if not _lengths_fit(bounds, real):
         return None
     return plan_for(bounds, real, cu.device)
 
