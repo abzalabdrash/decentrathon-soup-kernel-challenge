@@ -2,7 +2,7 @@
 
 Ветка `claude/recon-yerassyl` (main 71074d8 + диагностика P2 + аккаунт 4 в `tools/kaggle_win.sh`). Код решения в ветке не менялся. Разборы по зонам с источниками к каждому числу: `docs/notes/recon/startup.md` (старт и бюджет стены), `cpu.md` (CPU шага), `gpu.md` (GPU шага и клей torch), `tail.md` (хвост, граница шага, сравнение с базой), `research.md` (путь к 37 с, ресерч). Числа T4 взяты из выгрузок Kaggle на диске ноутбука Ерасыла (пути в файлах зон) и из прогонов разведки `soup-recon-pub`, `soup-recon-jury`, `soup-recon-abba1` (аккаунт shyraylym).
 
-Статус: 21:25. Разделы с пометкой [ждет] дописываются по ABBA.
+Статус: 21:30. Разделы с пометкой [ждет] дописываются по ABBA.
 
 ## 1. Замкнутый бюджет стены
 
@@ -81,7 +81,21 @@ P2: раннее освобождение влито; на жюри-строка
 | импорт trl в потоке | `claude/import-thread-yerassyl` 2be3735 | `SOUP_SOLUTION_IMPORT_THREAD=1` | Soup импортирует trl в первой строке setup (`sft.py:734`), поэтому окно потока мало; оценка 0-0,3 с | 16 + 79 Soup | не мерится (низкий выигрыш, риск `_DeadlockError`) |
 | интеграция | `claude/levers-yerassyl` 75cbdd8 | все выше, умолчания 0 | main da895ed + exit-late + exit-fast + warmup-sched + attn-glue | 25 из 26 в одном процессе (падает тест пика attn-glue) | |
 
-Прогоны T4 (аккаунт shyraylym): `soup-recon-abba1` на 0b3a9da (base, exit0, late, trk = `TRACKER_THREAD=1`, lde = `LOAD_EARLY=1`, w1 = `WARMUP_WORKERS=1`), `soup-levers-abba` на 75cbdd8 (base, late, fast, lng, lngi8, glue), `soup-recon-jabba` на строках жюри 33000/48000 seed 171 (base, oattn = `OFFLOAD_ATTN=1`, i8f = `INT8_FWD=1` + `INT8_FWD_CHUNKS=20` + `INT8_COMPILE=apply`). Старт и хвост судить по меткам фаз (внутри сессии ±0,05 с), цикл по стене не судить: на одном коде в одной сессии он гуляет на 1,8 с (research.md, `soup-b5-fq-abba`). [ждет результатов]
+Прогоны T4 (аккаунт shyraylym): `soup-recon-abba1` на 0b3a9da (base, exit0, late, trk = `TRACKER_THREAD=1`, lde = `LOAD_EARLY=1`, w1 = `WARMUP_WORKERS=1`), `soup-levers-abba` на 75cbdd8 (base, late, fast, lng, lngi8, glue), `soup-recon-jabba` на строках жюри 33000/48000 seed 171 (base, oattn = `OFFLOAD_ATTN=1`, i8f = `INT8_FWD=1` + `INT8_FWD_CHUNKS=20` + `INT8_COMPILE=apply`). Старт и хвост судить по меткам фаз (внутри сессии ±0,05 с), цикл по стене не судить: на одном коде в одной сессии он гуляет на 1,8 с (research.md, `soup-b5-fq-abba`).
+
+### Результат `soup-recon-abba1` (0b3a9da = main 94937f7 + режим late, публичные строки, ABBA 2 раунда + холостой, одна сессия)
+
+Средние по 2 прогона, секунды; fs = от `apply begin` до первого шага, tail = от конца цикла до `train end`, toexit = от `train end` до метки exit. Стена в этой сессии гуляет на ±0,6 с из-за цикла (loop base 24,08 / 25,30), поэтому решение по фазам.
+
+| вариант | стена | fs | загрузка | сборка | цикл | tail | toexit | вывод по фазам |
+|---|---|---|---|---|---|---|---|---|
+| base | 43,74 | 10,96 | 3,06 | 3,83 | 24,69 | 0,93 | 0,18 | |
+| exit0 (`EXIT_RELEASE=0`) | 44,03 | 10,94 | 3,00 | 3,83 | 24,81 | 0,50 | 0,17 | tail -0,43 подтверждено, но pinned тогда освобождает разбор процесса (E1: 0,36 против 0,88 с) |
+| late (`EXIT_RELEASE=late`) | 43,78 | 10,90 | 3,08 | 3,78 | 24,92 | 0,52 | 0,36 | tail -0,41, toexit +0,18: нетто -0,23 с |
+| lde (`LOAD_EARLY=1`) | 43,91 | 10,82 | 2,79 | 3,84 | 24,98 | 0,98 | 0,17 | загрузка -0,27, apply +0,12: до первого шага -0,14 с |
+| trk (`TRACKER_THREAD=1`) | 43,86 | 10,92 | 3,06 | 3,79 | 24,79 | 0,93 | 0,18 | эффект в границах шагов (2,7-4,3 мс/шаг), в шуме цикла не виден |
+| w1 (`WARMUP_WORKERS=1`) | 44,00 | 10,88 | 2,57 | 4,26 | 25,00 | 0,93 | 0,18 | загрузка -0,50, сборка +0,43 (прогрев 7,29 с, первый шаг ждал его 0,06-0,08 с): нетто -0,08, прогрев выходит на критический путь, не брать |
+
 
 ## 7. Ответ Gemini Deep Research (31.10, ~21:15): что из него новое
 
