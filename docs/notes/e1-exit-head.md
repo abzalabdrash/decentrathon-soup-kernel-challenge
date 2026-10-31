@@ -81,7 +81,27 @@ packed chunks (copy stream) and each chunk is decoded into one fp16 buffer right
 the packed slot is released as soon as its decode is queued. SOUP_SOLUTION_HEAD_PACK_MAX_ROWS limits
 it to heads of at most that many rows (long steps are compute-bound: the decode would only add).
 
-Results: TODO (soup-e1-pack1 microbench, soup-e1-packv1 variants).
+T4 microbench (`solution/bench_head_pack.py`, soup-e1-pack1, the real checkpoint; the head called
+right after its prefetch, so nothing hides the first copies; medians of 6):
+
+| chunk rows | copy fp16 / packed per chunk | decode per chunk | head N=300 | N=650 | N=830 | N=1100 | N=1400 | N=1970 |
+|---|---|---|---|---|---|---|---|---|
+| 4096 | 1.06 / 0.82 ms (11.9 / 11.6 GB/s) | 0.14-0.16 ms | 40.2 -> 30.9 | 40.3 -> 31.1 | 40.8 -> 41.9 | 48.3 -> 50.4 | 65.2 -> 67.4 | 85.2 -> 88.1 |
+| 3072 | 0.82 / 0.61 ms | 0.12-0.14 ms | 41.4 -> 29.9 | 41.8 -> 30.4 | 42.0 -> 38.6 | 50.8 -> 53.8 | 68.1 -> 71.7 | 82.1 -> 87.5 |
+| 2048 | 0.55 / 0.42 ms | 0.09-0.11 ms | 40.2 -> 30.4 | 40.6 -> 34.9 | 40.8 -> 37.0 | 53.1 -> 55.8 | 65.5 -> 68.9 | 84.9 -> 87.7 |
+
+(head ms, fp16 ring -> packed ring; every packed head bit-identical to the fp16 head.) Copy-bound
+heads (up to ~800 rows) are 9-11.5 ms shorter; compute-bound heads pay the decode (38 x 0.15 ms ~
+6 ms of GPU, +2..5 ms net), hence SOUP_SOLUTION_HEAD_PACK_MAX_ROWS. The decode kernel's block/warps
+sweep moves it by +-10 % (1,024 pairs x 8 warps kept); it runs at ~150 GB/s read+write on the T4
+(a laptop GPU with a 32 MB L2 measures it above its own D2D copy rate; a 256-entry pair table and
+4-values-per-lane variants were not faster). Head memory above its start: 4,096 rows +6..7 MiB
+packed (two 9 MiB packed slots + one 12 MiB decode buffer against two 12 MiB fp16 slots); 3,072 rows
+packed is below the 4,096-row fp16 ring at every N (26.1 vs 28.2 MiB at N=300, 40.1 vs 44.3 at 1,400).
+With MAX_ROWS the run's largest steps (which set the peak) keep the fp16 ring. Build in the thread:
+0.7 s on the T4 (334 MiB pinned, 38 chunks encoded and verified), 75 MiB transient GPU memory.
+
+In training: TODO (soup-e1-packv2 variants; soup-e1-full1 full run with the switches on).
 
 ## Question for the organizers (exact wording)
 
