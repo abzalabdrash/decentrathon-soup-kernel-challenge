@@ -2,6 +2,16 @@
 
 Этот файл для следующего оркестратора (другая машина, другой аккаунт Claude). Порядок чтения: `CLAUDE.md` → этот файл → `docs/STATUS.md` (верхние разделы) → `docs/RESEARCH.md` (конец: внешнее ревью) → `docs/RULINGS.md` → `docs/notes/*.md`. Правила организаторов и 10 проверок в `README.md`.
 
+## СРОЧНЫЙ ЧЕКПОИНТ 31 октября ~11:05 по Астане (лимит аккаунта Абзала кончается; продолжать на машине тиммейта тем же способом: Fable-оркестратор + подчаты Opus 5.5 xhigh по брифам ниже)
+
+Первые шаги нового оркестратора:
+1. `git fetch --all`; main = 0b47c87 (ночь + B1 + раннер Modal). Прочитать этот файл, `docs/STATUS.md` (верх), `docs/RESEARCH.md` (конец: внешнее ревью Астры), `docs/notes/b1-boundary.md`, `docs/notes/m1-modal.md`.
+2. Ветки в полёте (их подчаты остановлены лимитом, состояние в их `docs/notes/*.md`, если успели запушить; иначе читать коммиты): `claude/c1-cpu-diet-0b2063` (CPU-диета шага; профиль `SOUP_SOLUTION_CPU_PROFILE=1` в `solution/cpu_profile.py`; ждал два ABBA-замера на T4, слуги `soup-c1-abba*`), `claude/s1-startup-*` (старт; слуги `soup-s1-v3`, `soup-s1-v4`; must-fix: dtype в `warmup.py` step_ops, см. ниже), `claude/e1-exit-head-*` (выход процесса и 13-битный кодек головы; слуги `soup-e1-exit*`). Их незабранные прогоны Kaggle забрать: `python tools/kaggle_run.py --user <peagverr|namedesign> --repo <url> --slug <slug> --mode variants --attach` (токены Kaggle у тиммейта в Telegram Desktop; GitHub-токен в `github_token.txt` его папки `децентратон/soup`).
+3. `codex/review-1` (611cade+): исправления устойчивости (RNG-гонка прогрева, ожидание потоков при выходе, откаты при нехватке pinned-памяти) и тесты 2 048 токенов; его прогон жюри `soup-codex-r1-jury` на peagverr (seed 31, строки 10000/50000) надо забрать (`--mode jury --attach`); при 10 из 10 и обычном времени шага влить в main (конфликты с B1 в `fused_ce.py`/`head_stream.py` возможны, мелкие).
+4. Must-fix в `solution/warmup.py` (`warm_step_ops`): тензоры создаются без dtype, при fp16 по умолчанию у загрузчика прогрев AdamW/clip падает («Attempting to unscale FP16 gradients») и ядра грузятся на первом шаге; поставить `dtype=torch.float32` явно, тест под `torch.set_default_dtype(torch.float16)`.
+5. Астре отправлен бриф 2 (`docs/briefs/astra-brief-2-2026-10-31.md`): ответ Абзал вставит в чат; разобрать по пунктам, записать дайджест в RESEARCH, раздать подчатам.
+6. После влитий: полный прогон + жюри на новых seed (использованы 7, 13, 21, 31, 42, 57, 99, 123), строка в таблицу STATUS, push. Цель: ≤ 36 с при ≤ 400 MiB; потом устойчивость у жюри (чеклист Астры в RESEARCH и `docs/briefs/codex-task-2-2026-10-31.md`), потом README.
+
 ## Где мы
 
 - main = ночная конфигурация + B1 (граница шага, однопоточный backward) + раннер Modal: на T4 **~41 с / 371 MiB** в холодной сессии (42,5 с / 371 MiB в горячей, прогон B1), база ~80–87 с / 14 345 MiB, **все 10 проверок на публичных строках и на 10 наборах скрытых строк и seed**. s ≈ 1,9–2,1, m = 38,7.
