@@ -135,6 +135,42 @@ from the build's quantization; peagverr):
   SOUP_SOLUTION_HEAD_INT8=0, another session): all 10 checks, 51.8 s, **peak 435 MiB (reserved 314) as with int8**,
   eval -0.002 %, loss curve 0.05 %: the 435 MiB is these rows', not the int8 head's.
 
+## Accuracy first (orchestrator, 31 Oct ~17:00): rescoring and the loss correction (7b67a32)
+
+Forward-only on real final hidden states (`solution/bench_head_int8_real.py`, 6 steps of 4 public rows, the int8
+head against the fp16 streamed head on the same rows; mean |gap| per step, check 5's measure):
+
+| | loss | entropy | accuracy | rewind rows |
+|---|---:|---:|---:|---:|
+| int8 head as in the runs above | 0.145 % | 0.189 % | 0.923 % (5-16 argmax flips per step, 1-2 % of labelled rows) | 0.410 % |
+| + rescoring of near-ties (DELTA 1.0) and the first-order loss correction | **0.045 %** | 0.189 % | **0.041 %** (one flip in 4,287 rows) | **0.092 %** |
+
+So the accuracy gap of the training runs (0.68-0.89 %) was the int8 forward's argmax flips, not the trajectory.
+`head_i8_rescore_kernel` (own): the chunk kernel now also keeps each labelled row's int8 runner-up (one more
+reduction, labelled rows only); a labelled row whose top two (or top and target) are within DELTA logits takes the
+exact fp16 logits of those tokens (fp16 hidden row, fp16 weight rows read by the kernel from the pinned host copy:
+cudaHostRegister'ed memory is mapped under UVA; fp32 dot rounded to fp16 as the base's GEMM output; the first id
+among equal values as torch.argmax). Thresholds (flips left / accuracy gap): off 0.92 %, 0.25: 0.34 %, 0.5 and
+above: 0.04 %. Every labelled row's loss is corrected to first order with the exact logits of its top two and its
+target: loss -= sum_k p_k (x8_k - x_k) - (x8_t - x_t) (p from the int8 pass). Entropy and dL/dh untouched. No sync,
+no CPU work; switches SOUP_SOLUTION_HEAD_INT8_DELTA (0: off) and SOUP_SOLUTION_HEAD_INT8_LOSS_FIX.
+
+dL/dh: the split the orchestrator asked for (P's positive part quantized, s_v folded in, accumulated with the
+online rescaling, W_q[y] of the same int8 weight subtracted after the normalization) is what the head did from
+the start; against a plain P - Y quantization emulated with the same int8 logits the relative error to the fp16
+head's dL/dh is the same on real hidden states (0.0930 vs 0.0931, 0.0995 vs 0.0996, ...): the 7-10 % error comes
+from P computed from int8 logits (and W_q: 2 % with fp16 P), not from the target's -1.
+
+Rules: main bc18d4b's "same behaviour when measured and tested": HEAD_INT8 is on by default in every process (no
+argv check); `solution/conftest.py` pins the fp16 head for solution's own tests, test_head_int8.py builds the int8
+copy itself. The first five heads (steps 0-4) are the fp16 head while the copy is built (START_HEADS 5, as the
+fifth kernel adds compile time): the first step's loss is the fp16 head's. Organizers' answer 12 (wave 2): an int8
+copy of lm_head quantized at load and kept in pinned memory next to the fp16 copy is allowed.
+
+Tests: test_head_int8.py 21 (the int8 pass against fp64 int8 math with rescoring and correction off; rescoring
+against the fp16 head: equal correctness, loss error halved at least; real hidden states: 3 steps, loss < 0.2 %,
+entropy < 0.5 %, accuracy < 0.3 %, rewind < 0.3 %, skipped without the cached checkpoint).
+
 ## Summary
 
 - Default: on in the `soup train` process (head_int8.enabled(), as int8_bwd.py), off in pytest; build at the first
