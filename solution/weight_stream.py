@@ -107,9 +107,9 @@ EARLY_RELEASE = _env_on("SOUP_SOLUTION_RING_EARLY_RELEASE", "1")
 # last two layers' matrices resident for the backward (+6.8 MiB per slot on Qwen2.5-1.5B)
 MLP_SLOTS = {name: max(1, min(2, int(os.environ.get(f"SOUP_SOLUTION_RING_SLOTS_{name.upper()}", "1") or 1)))
              for name in ("gate", "up", "down")}
-# SOUP_SOLUTION_STREAM_DIET=1 (task P3): an untimed copy and wait call the events directly (no torch Python
+# SOUP_SOLUTION_STREAM_DIET=1 (task P3, off by default): an untimed copy and wait call the events directly (no torch Python
 # wrappers) and switch to the copy stream only around the copy itself
-_DIET = _env_on("SOUP_SOLUTION_STREAM_DIET", "1")
+_DIET = _env_on("SOUP_SOLUTION_STREAM_DIET", "0")
 _record = torch._C._CudaEventBase.record
 _wait_on = torch._C._CudaEventBase.wait
 _RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),
