@@ -165,16 +165,124 @@ def gradient_error(lengths_list, groups):
                   + " ".join(f"{e:.4f}" for e in errs), flush=True)
 
 
+def _chat_ids(tokenizer, row, limit=512):
+    """Soup's alpaca row as Qwen's chat: a user turn of instruction (+ input), an assistant turn of
+    output, cut at the task's 512 tokens."""
+    user = row["instruction"] + (f"\n\n{row['input']}" if row["input"] else "")
+    ids = tokenizer.apply_chat_template([{"role": "user", "content": user},
+                                         {"role": "assistant", "content": row["output"]}],
+                                        tokenize=True)
+    ids = ids["input_ids"] if hasattr(ids, "keys") else ids
+    return list(ids)[:limit]
+
+
+def real_gradient_error(layer_ids, data):
+    """The LoRA gradients of real Qwen2.5-1.5B layers on real activations: the model in NF4 as Soup
+    loads it (double quant, fp16 compute), four rows of the task's training data through the plain
+    transformers model for every layer's input, then that layer (its own NF4 weights, LoRA r=16 on q
+    and v with random A and B) through solution's fused path with its norms: fp16 / int8 MLP backward x
+    half / int8 offload of (gate|up). Errors against the fp16 backward with the half offload, and of
+    P1 (int8 offload) against main (int8 backward, half offload)."""
+    import json
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    from solution import int8_bwd, offload, offload_int8
+    from solution.test_fused_proj import _lora, _lora_params, _positions, _rel, _spans
+    from solution.unpad import varlen
+
+    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                               bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=quant,
+                                                 dtype=torch.float16, device_map={"": 0})
+    model.eval()
+    with open(data, encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle][:64]
+    seqs = [_chat_ids(tokenizer, row) for row in rows]
+    batches = {"rows 0-3": list(range(4)),
+               "the 4 longest of rows 0-63": sorted(range(64), key=lambda i: -len(seqs[i]))[:4]}
+    inputs = {}  # (batch, layer) -> real input of the layer, (1, N, 1536) fp32
+    with torch.no_grad():
+        for name, picked in batches.items():
+            per_row = [model(input_ids=torch.tensor([seqs[i]], device="cuda"), output_hidden_states=True)
+                       .hidden_states for i in picked]
+            for layer in layer_ids:
+                inputs[name, layer] = torch.cat([hs[layer] for hs in per_row], dim=1).float()
+    _patch()
+    int8_bwd.compile_now()
+    offload_int8.compile_now()
+    eps = model.config.rms_norm_eps
+
+    def rms(x, weight):
+        return weight.float() * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps))
+
+    print("\nreal Qwen2.5-1.5B layers on real activations: relative error of dL/dx and of the LoRA "
+          "gradients (A_q B_q A_v B_v)")
+    for layer_id in layer_ids:
+        layer = model.model.layers[layer_id]
+        attn, mlp = layer.self_attn, layer.mlp
+        attn.q_proj = _lora(attn.q_proj, seed=100 + layer_id)
+        attn.v_proj = _lora(attn.v_proj, seed=200 + layer_id)
+        attn.train()
+        mlp.train()
+        weights = [*attn.parameters(), *mlp.parameters()]
+        for name, picked in batches.items():
+            lengths = [len(seqs[i]) for i in picked]
+            x0 = inputs[name, layer_id]
+            pe = model.model.rotary_emb(x0, _positions(lengths))
+            grad = torch.randn(x0.shape, device="cuda",
+                               generator=torch.Generator("cuda").manual_seed(layer_id))
+
+            def run(bwd_int8, gu_int8):
+                int8_bwd._STATE["on"] = bwd_int8
+                offload_int8._STATE["on"] = gu_int8
+                for p in weights:
+                    p.grad = None
+                x = x0.detach().requires_grad_(True)
+                with offload.offload_saved_tensors(weights=weights) as off, \
+                        torch.autocast("cuda", dtype=torch.float16), varlen(_spans(lengths)):
+                    a, _ = attn(rms(x, layer.input_layernorm.weight), pe, None)
+                    h = x + a
+                    out = h + mlp(rms(h, layer.post_attention_layernorm.weight))
+                    out.backward(grad)
+                torch.cuda.synchronize()
+                assert off.stats["int8"] == (1 if gu_int8 else 0), off.summary()
+                return [x.grad] + [p.grad.clone() for p in _lora_params(attn)]
+
+            ref = run(False, False)
+            main_path = run(True, False)
+            results = {"fp16 backward, int8 offload": run(False, True),
+                       "int8 backward, half offload (main)": main_path,
+                       "int8 backward, int8 offload (P1)": run(True, True)}
+            for label, got in results.items():
+                errs = [_rel(a, b) for a, b in zip(got, ref)]
+                print(f"  layer {layer_id:2d}, {name} ({sum(lengths)} tokens), {label:34s} dx {errs[0]:.4f}"
+                      f"  LoRA " + " ".join(f"{e:.4f}" for e in errs[1:]), flush=True)
+            errs = [_rel(a, b) for a, b in zip(results["int8 backward, int8 offload (P1)"], main_path)]
+            print(f"  layer {layer_id:2d}, {name}, P1 against main{'':19s} dx {errs[0]:.4f}  LoRA "
+                  + " ".join(f"{e:.4f}" for e in errs[1:]), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--m", type=int, nargs="+", default=[416, 832, 1440, 2048])
     parser.add_argument("--groups", type=int, nargs="+", default=[64, 128, 256])
     parser.add_argument("--skip-error", action="store_true")
+    parser.add_argument("--skip-kernels", action="store_true")
     parser.add_argument("--tiles", nargs="*", default=[], metavar="TMxWARPS")
+    parser.add_argument("--real", type=int, nargs="*", default=None, metavar="LAYER",
+                        help="the real model's layers on real activations (needs data/train.jsonl)")
+    parser.add_argument("--data", default="data/train.jsonl")
     args = parser.parse_args()
+    if args.real is not None:
+        real_gradient_error(args.real or [2, 13, 27], args.data)
+        return
     if args.tiles:
         tiles(args.m, args.tiles)
-    kernels_and_copies(args.m)
+    if not args.skip_kernels:
+        kernels_and_copies(args.m)
     if not args.skip_error:
         gradient_error([[212, 187, 310, 117], [512, 512, 512, 512]], args.groups)
 
