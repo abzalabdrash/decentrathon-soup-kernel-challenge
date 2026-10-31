@@ -314,7 +314,8 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
     streamer = stream_model_weights(model, slots=2)
     try:
         assert streamer.ring == "type" and len(streamer._slots) == 5
-        assert len(weight_stream._MATRICES) == 3 * len(layers)
+        # counted on this model (other tests' models may still have registered matrices)
+        assert sum(m in weight_stream._MATRICES for m in model.modules()) == 3 * len(layers)
         assert fused_proj._mlp_plan(layers[0].mlp, x).ring is streamer
         mlp = layers[1].mlp
         assert weight_stream.mlp_ring(mlp.gate_proj, mlp.up_proj, mlp.down_proj) is streamer
@@ -322,7 +323,7 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
         assert weight_stream.mlp_ring(layers[1].self_attn.k_proj) is None
     finally:
         streamer.restore()
-    assert len(weight_stream._MATRICES) == 0
+    assert not any(m in weight_stream._MATRICES for m in model.modules())
 
     streamer = stream_model_weights(model, slots=2, only={"mlp"}, ring="type")
     try:
