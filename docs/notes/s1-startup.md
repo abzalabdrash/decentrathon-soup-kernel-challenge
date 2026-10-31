@@ -211,3 +211,43 @@ loop 2.3 s against 1.85). The launchers built during the imports make apply 0.43
 CLI 0.18 s longer; the warm-up then ends 1.7 s before train begin, and HELD_ENCODE with the code
 table take 0.5 s off the main thread: 9.25 s, still 0.1 s behind. DRIVER_EARLY=libs makes apply
 0.3 s longer and saves the warm-up only what it no longer has to wait for.
+
+### soup-s1-v9 (namedesign, 2928db3, means of 2 ABBA rounds)
+
+- new (defaults) 3.28 / 3.81 / 7.05 / 8.93 / 9.04 / 5.61 / 0.00 / 1.92 / 1.17 / 0.27 / 0.49
+- lahc 3.63 / 4.35 / 7.35 / 8.95 / 9.04 / 3.54 / 0.00 / 1.75 / 1.09 / 0.67 / 0.49
+- lahcs (+ WARMUP_START=setup) 3.70 / 4.06 / 7.14 / 8.96 / 9.06 / 4.75 / 0.00 / 1.88 / 1.19 / 0.56 / 0.49
+- lahcn (+ LAUNCHER_NICE=10) 3.80 / 4.55 / 7.51 / 9.17 / 9.26 / 3.56 / 0.00 / 1.73 / 1.12 / 0.62 / 0.49
+- lahcsn (+ both) 3.69 / 4.06 / 7.13 / 8.91 / 9.01 / 4.69 / 0.00 / 1.83 / 1.19 / 0.59 / 0.49
+
+All within 0.05 s of the defaults (lahcn 0.22 s behind): the launchers ahead buy the warm-up slack
+with apply time, and HELD_ENCODE with the code table spend that slack on the main thread, for no
+net gain. The criterion (>= 0.1 s to the first step, no loss in the wall, bit-equal) is met only by
+the three switches turned on in 0b1bba7.
+
+### Decision (final defaults of this branch)
+
+On: SOUP_SOLUTION_EMBED_ASYNC, SOUP_SOLUTION_TRITON_KEY=light, SOUP_SOLUTION_ENTRY_POINTS.
+Off (measured on the T4, no gain): LOAD_PREAD, LOAD_CODE_TABLE, HELD_ENCODE, LAUNCHERS_EARLY,
+LAUNCHER_NICE, WARMUP_START=setup|apply_begin, WARMUP_WORKERS=3, WARMUP_ORDER=longest,
+WARMUP_DRIVER_EARLY=1|libs, WARMUP_SKIP=step_ops; EARLY_PROBES stays off (team decision).
+Not done: the load pipeline (review 1, item 4): the tensor loop is 1.85-1.96 s with the new
+defaults (under the 2 s threshold of the brief), its waits for staging 0.25-0.32 s, and the main
+thread is not what bounds the first step alone.
+Diagnostics added: SOUP_SOLUTION_WARMUP_AUDIT=1 (launches per compiled variant).
+
+### Final measurements (namedesign)
+
+- soup-s1-v10 (117f1a0, final code, new defaults against the old ones, 3 ABBA rounds after a warm
+  run): first step from apply begin 9.40 against 9.85 s (-0.45 s; per run 9.41 / 9.30 / 9.49 against
+  9.82 / 9.95 / 9.77), apply end 3.40 against 3.58, Soup setup end 7.05 against 7.81, tensor loop
+  1.90 against 2.31 s; wall 44.11 against 45.25 s (the loop also differs by 0.75 s, partly noise);
+  peak 371 MiB in both; eval loss 2.04936-2.04941 in both.
+- soup-s1-full1 (1238618): 10 of 10 checks, 41.7 s / 371 MiB against the base 79.1 s / 14 345 MiB
+  (s 1.895, m 38.67), eval -0.015 %, own kernels 13.9 %; first step +9.10 s after apply begin.
+  pytest on the T4: 418 passed, 1 failed (test_trainer_build::test_early_probes_serve_same_answers:
+  ENTRY_POINTS, now on by default, had wrapped entry_points in the shared pytest process; fixed in
+  117f1a0).
+- soup-s1-full2 (117f1a0): 10 of 10 checks, 46.1 s / 371 MiB against the base 87.5 s (a hot
+  session: train loop 29.0 s; s 1.899, m 38.67), eval -0.014 %, own kernels 12.7 %, pytest 419
+  passed, 5 skipped; first step +9.75 s after apply begin.
