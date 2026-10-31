@@ -600,25 +600,15 @@ def offload_early(tensor, wire=None, decided=False):
     offloader = _ACTIVE["offloader"]
     if offloader is None:
         return None
-    from . import offload_int8
-
     if wire is not None:
         pending, offloader.pending = offloader.pending, None
         if pending is None or pending[0]() is not tensor:
             raise RuntimeError("offload_early: an int8 form for a tensor without a reserved slot")
         with offloader.lock:
             saved = offloader._offload(tensor, int8=True, wire=wire, reserved=pending[1:])
-    elif not decided and offloader.eligible(tensor) and offload_int8.applies(tensor):
-        with offloader.lock:
-            if offloader.pending is not None:  # reserved and never filled: give the slot back
-                offloader.pending[1].released = True
-            slot, host = offloader.host.push(offload_int8.wire_bytes(*tensor.shape))
-        if slot is not None:
-            offloader.pending = (weakref.ref(tensor), slot, host)
-            return "int8"
-        offloader.pending = None
-        saved = offloader.pack(tensor)  # no pinned memory left: kept on the GPU, in half
-    else:
+    elif not decided and reserve_int8(tensor):
+        return "int8"
+    else:  # half (also when offload_int8 applies but no pinned memory is left: kept on the GPU)
         saved = offloader.pack(tensor)
     if saved is not tensor:
         with offloader.lock:
