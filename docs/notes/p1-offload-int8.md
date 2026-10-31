@@ -20,37 +20,48 @@ backward instead of its post-attention norm).
 | | nogu | 73.39 / 74.40 | 50.06 | 2373 | 2156.9 |
 | | pf2 | 74.59 / 75.15 | 51.17 | 593 | 354.3 |
 
-On the public rows the (gate|up) traffic is hidden (nogu is no faster). On 2,048-token steps it is not:
-without it the run is 2.8 s shorter (steps 3+ -2.5 s), and starting the previous layer's copy one
-tensor earlier alone gives -1.8 s. The bound is the backward's H2D: the prefetch of the next layer's
-(gate|up) (70 MiB at 2,048 tokens, ~5.9 ms at the T4's ~12 GB/s) does not fit under one attention
-backward together with that layer's NF4 weights.
+On the public rows the (gate|up) traffic is hidden (nogu is no faster). On 2,048-token steps it is not
+in that session: without it the run is 2.8 s shorter (steps 3+ -2.5 s), and starting the previous
+layer's copy one tensor earlier alone gives -1.8 s (at +140 MiB). Session matters: in soup-p1-abba-long2
+the card throttled (its first run 75.5 s, the later ones of the same variant 82 s) and the steps were
+compute-bound; there the copies were not the bound (section 5).
 
-## 2. What was built
+## 2. What is in the branch (cebfd3e)
 
 `solution/offload_int8.py` (switch `SOUP_SOLUTION_OFFLOAD_INT8`, on by default only in the `soup train`
 process, like int8_bwd.py; =1 also under pytest, =0 off):
 
-- `gu_quant_kernel`: (gate|up) (2I, M) half -> int8 with one fp32 scale per token and group of 128
-  features (absmax / 127, round to nearest; a group never straddles gate and up). The int8 values plus
-  scales are 51.6 % of the half tensor's bytes (14.7 MiB instead of 28.4 at 832 tokens).
-- `gu_dequant_kernel`: the inverse (the rebuild pass).
-- offload.py: `offload_early(gate_up)` at the gate|up GEMM only notes the tensor when int8 applies;
-  the second call, `offload_early(gate_up, spare=hidden)` right after the down GEMM (one line in
-  fused_proj.py's MLP forward), quantizes into the dead `hidden` activation's storage (exactly
-  2 I M bytes, the int8 size; only the scales are allocated) and starts the D2H of the two parts into
-  one pinned slot. The half (gate|up) is no longer held while the copy runs (only the int8 form is),
-  so it is freed when the MLP's forward returns. The prefetch and the on-demand fetch bring back one
-  uint8 buffer (half the bytes, half the GPU slot).
-- Unpack: the half tensor is rebuilt on the compute stream (the MLP backward's contract does not
-  change), or, with `SOUP_SOLUTION_OFFLOAD_INT8_FUSED=1` (default) and the int8 MLP backward, fused_proj's
-  backward unpacks inside `offload_int8.raw(True)` and `int8_swiglu_bwd_kernel` (`INT8_IN`) reads
-  q * scale itself, rounded to half exactly as the rebuild writes it (bit-identical, tested); no
-  rebuild pass. A layer whose int8 pair is still on the GPU at the backward (the last one) is rebuilt.
-- The two kernels compile in a thread started at the first MLP backward; the first 112 offloads (four
-  steps) stay half, the next one waits for the thread: a fixed switch point.
+- The int8 form: per element (i, t) of the gate half one int16, the gate's int8 in the low byte and the
+  up's in the high byte, plus one fp32 scale per token and group of 128 features of each half (absmax /
+  127, round to nearest). 2 I M bytes + scales = 51.6 % of the half (gate|up) (14.7 MiB instead of 28.4
+  at 832 tokens, 36.1 instead of 70.0 at 2,048).
+- `gu_quant_kernel` (SWIGLU): computes the MLP's SwiGLU forward exactly as the example kernel does
+  (`gate * sigmoid(gate) * up` in fp32, one rounding: hidden bit for bit, test) and in the same pass
+  writes the int8 form in place over the gate half of (gate|up) (each element's two bytes, loaded before
+  by the same program; no other program touches them). No extra read of (gate|up), no new buffer of its
+  size; only the scales are allocated.
+- fused_proj.py, MLP forward (a few lines): `offload.offload_early(gate_up)` at the gate|up GEMM returns
+  "int8" after reserving the host slot; then `swiglu_quant` replaces the example SwiGLU launch and
+  `offload_early(gate_up, wire=...)` starts the D2H of the int8 form (half the bytes) at once. In flight
+  the offload holds (gate|up)'s storage, as the half offload does, for half as long.
+- The backward brings back one uint8 buffer (half the bytes, half the GPU slot). With the int8 MLP
+  backward and `SOUP_SOLUTION_OFFLOAD_INT8_FUSED=1` (default) fused_proj's backward unpacks inside
+  `offload_int8.raw(True)` and gets that buffer: `int8_swiglu_bwd_kernel` (INT8_IN) reads the int16
+  pairs and scales (rounded to half as the rebuild pass would, so bit for bit the same result, test) and
+  writes d_gate / d_up interleaved into the two halves of its own int32 product (no new buffer);
+  `quant_t_int8_kernel` (IL) reads that layout. Otherwise (fp16 backward: the first four steps, or the
+  last layer, still on the GPU) `gu_dequant_kernel` rebuilds the half tensor.
+- The kernels compile in a thread started at the first MLP backward; the first 112 offloads (four steps)
+  stay half, the next one waits for the thread: a fixed switch point. `SOUP_SOLUTION_OFFLOAD_INT8_GROUP`,
+  `_TILE_M`, `_WARPS` are experiment knobs (defaults 128, 128, 8).
 
-## 3. Numerics (solution/bench_offload_int8.py on the T4, soup-p1-bench, 047d9a4)
+Tests: `solution/test_offload_int8.py` (kernels against torch, SwiGLU bit for bit, all three ways back
+under GPU delays, the version guard, the switch point, no record_stream / CPU wait, the fused MLP forward
+bit for bit and dL/dx within 2 %, the raw path bit for bit the rebuild path, the int8 backward's memory).
+Locally (RTX 5060, WSL): test_offload_int8 + test_int8_bwd + test_offload + test_xoffload +
+test_jury_offload_marks 46 passed, test_fused_proj 40 passed.
+
+## 3. Numerics (solution/bench_offload_int8.py on the T4, soup-p1-bench, 047d9a4: the same arithmetic)
 
 Relative error against the fp16 MLP backward with the half offload, one Qwen2.5-1.5B-shaped block
 (fused attention with LoRA r=16 on q and v, then the fused MLP, both residual; NF4 weights):
@@ -66,13 +77,32 @@ Relative error against the fp16 MLP backward with the half offload, one Qwen2.5-
 Groups of 64 / 256 features: 0.45 / 0.53 % alone, the same 2.3 % combined. The int8 offload adds
 ~0.5 % in quadrature to the 2.2 % that the int8 MLP backward already puts on the gradients.
 
-## 4. Cost and gain per layer (T4 bench)
+## 4. Cost and gain per layer (T4, soup-p1-bench2, launch latency excluded)
 
-TODO: tile sweep with the launch latency excluded.
+Copies (pinned host, one layer): D2H 2.35 -> 1.19 ms at 832 tokens, 5.61 -> 2.91 ms at 2,048; H2D
+2.54 -> 1.28 and 5.96 -> 3.10. A separate quantization pass (the first design) cost 0.28 ms at 832 and
+0.55 ms at 2,048 per layer at its best tile (128 tokens x 4-8 warps; 64 x 4: 0.32 / 0.75), the rebuild
+pass about the same: 28 layers x 64 steps of that is 0.5 s (public) to 1-2 s (2,048) of GPU per run,
+which is what the long-row ABBA below paid. Folded into the SwiGLU (cebfd3e), the forward adds only the
+int8 write: locally 0.10 ms at 832 and 0.17 ms at 2,048 over the example SwiGLU (T4: TODO).
 
-## 5. ABBA
+## 5. ABBA (solution-only runs, same session, 2 rounds ABBA + warm run)
 
-TODO
+| commit, design | rows | variant | wall s | steps 3+ s | step 0 s | nvidia-smi | alloc |
+|---|---|---|---|---|---|---|---|
+| 8c9e37b: separate quant into a new buffer, rebuild pass (soup-p1-abba-pub) | public | off | 46.34 / 47.24 | 26.14 | 0.500 | 395 | 229.3 |
+| | | i8 | 47.09 / 47.14 | 26.32 | 0.631 | 455 | 239.5 |
+| d0d48a0: quant after the down GEMM into hidden's storage (soup-p1-abba-pub2) | public | off | 45.90 / 46.39 | 25.20 | 0.512 | 395 | 229.3 |
+| | | i8 fused (fp16 dgate/dup buffer) | 45.29 / 45.60 | 24.25 | 0.651 | 435 | 254.7 |
+| | | i8 rebuild pass | 46.19 / 46.14 | 24.80 | 0.628 | 455 | 229.3 |
+| d0d48a0 (soup-p1-abba-long2, card throttling) | longest, 2,048 | off | 82.34 / 82.04 | 59.06 | 1.093 | 453 | 284.5 |
+| | | i8 fused | 83.18 / 83.36 | 59.84 | 1.115 | 513 | 320.6 |
+| | | i8 rebuild pass | 84.53 / 84.49 | 61.05 | 1.077 | 553 | 284.5 |
+
+Bytes to the host over a long-row run: 143.5 GiB (off) -> 87.9 GiB (i8). Step 0 is +0.13 s with int8:
+the compile thread competes with the first step.
+
+TODO: cebfd3e on jury rows (seed 157, train 42000:42256, eval 51800:52056) and public rows.
 
 ## 6. Full + jury
 

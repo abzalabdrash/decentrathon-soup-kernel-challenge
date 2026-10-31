@@ -24,9 +24,9 @@ Numerics: the forward, the loss and the eval are untouched; the SwiGLU derivativ
 (gate|up) with an error of at most half a quantization step of its group (relative error of the LoRA
 gradients against the half offload: bench_offload_int8.py, test_offload_int8.py).
 
-The two kernels are compiled by a thread started at the first MLP backward (raw()); the first
-START_CALLS offloads stay half (four steps of 28 layers), the next one waits for the thread if it is not
-done, so which offloads go int8 never depends on timing (int8_bwd.py does the same).
+The two kernels are compiled by a thread started at the first MLP backward of the second step (raw());
+the first START_CALLS offloads stay half (four steps of 28 layers), the next one waits for the thread if
+it is not done, so which offloads go int8 never depends on timing (int8_bwd.py does the same).
 """
 
 import atexit
@@ -41,8 +41,11 @@ import triton.language as tl
 from .int8_bwd import _soup_train_process
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8", "1" if _soup_train_process() else "0")
-          .strip().lower() not in ("0", "false", "no", ""), "thread": None, "calls": 0}
+          .strip().lower() not in ("0", "false", "no", ""), "thread": None, "calls": 0, "backwards": 0}
 START_CALLS = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_START_CALLS", "112"))
+# MLP backwards before the compile thread starts: not during the first step (soup-p1-abba-pub2: a
+# thread started there put step 0 +0.13 s later); three steps are left for it before START_CALLS
+COMPILE_AFTER = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_COMPILE_AFTER", "28"))
 # features per scale (64, 128 or 256 divide Qwen2.5-1.5B's 8960); tokens per program
 GROUP = int(os.environ.get("SOUP_SOLUTION_OFFLOAD_INT8_GROUP", "128"))
 # T4 (soup-p1-bench2, quantization alone): 128 tokens x 4 or 8 warps 0.28 ms at 832 tokens, 0.55 at 2,048;
@@ -160,8 +163,10 @@ class Codec:
 def raw(on):
     """While active with `on` (and SOUP_SOLUTION_OFFLOAD_INT8_FUSED), the unpack of an int8 handle
     returns its uint8 buffer (wire_bytes of its shape) instead of the rebuilt half tensor."""
-    if _STATE["on"] and _STATE["thread"] is None and not _READY.is_set():
-        _start_compile()  # at the first MLP backward, as int8_bwd.py: not in the first forward
+    _STATE["backwards"] += 1
+    if (_STATE["on"] and _STATE["thread"] is None and not _READY.is_set()
+            and _STATE["backwards"] > COMPILE_AFTER):
+        _start_compile()
     previous = RAW["now"]
     RAW["now"] = bool(on) and RAW["on"]
     try:
