@@ -35,6 +35,22 @@ The hooks are per instance (`register_forward_pre_hook` / `register_forward_hook
 layer), so the class-level patches of rmsnorm.py and unpad.py's layer loop stay as they are. With
 gradient checkpointing (a fixed Soup switch, off on this task) the layers would run again inside the
 backward; streaming is not set up then.
+
+The type ring (SOUP_SOLUTION_WEIGHT_RING=type; the default `layer` is the ring above). A ring of two
+whole layers keeps 2 x 24.1 MB on the GPU in every phase of the step, though each MLP matrix of a
+layer is read once per pass. Here the attention projections (q, k, v, o: 2.84 MB per layer) keep the
+ring above with its per-layer hooks (K slots by layer: the attention recompute reads them again in
+the backward), and each MLP matrix type (gate, up, down: 7.1 MB each) has ONE slot of its own, which
+every layer's matrix of that type points into for good: 2 x 2.84 + 3 x 7.1 = 27 MB instead of 48.3.
+fused_proj.py's MLP calls `acquire(module, step)` before it dequantizes one of them (the compute
+stream waits for that matrix's copy; a slot holding another layer's matrix is loaded on the spot)
+and `release(module, step)` once the dequantization is queued (the GEMMs read the shared half
+buffer, not the slot): the copy of the same matrix of the next layer in the pass (i+1 forward, i-1
+backward) starts on the copy stream behind that point. Each of gate, up and down is dequantized once
+per pass (forward: gate, up, down; backward: down, gate, up; the recompute mode holds up across its
+two reads), so one slot per type costs no copy more than the layer ring. An MLP that runs without
+acquire() (its forward is not fused_proj's, or the fused path declines the call) gets its three
+matrices loaded before it runs, and again when its layer's backward starts (the hook above).
 """
 
 import atexit
@@ -52,6 +68,21 @@ _STREAMERS = weakref.WeakKeyDictionary()  # decoder layer -> its WeightStreamer
 # decoder layer -> _HostLayer: its 4-bit tensors moved to pinned host memory while transformers
 # loaded the model (load_stream.py), waiting for a WeightStreamer to adopt them
 _LOADED = weakref.WeakKeyDictionary()
+# an MLP matrix's Linear4bit -> (its type-ring WeightStreamer, group, layer index)
+_MATRICES = weakref.WeakKeyDictionary()
+
+RINGS = ("layer", "type")
+# the type ring's groups: the attention projections (every streamed 4-bit layer that is not an MLP
+# matrix), then one group per MLP matrix type
+_TYPE_GROUPS = ("attn", "gate_proj", "up_proj", "down_proj")
+
+
+def ring_from_env():
+    """SOUP_SOLUTION_WEIGHT_RING: `layer` (the default: the ring of whole layers) or `type` (the
+    attention projections in a ring of layers, one slot per MLP matrix type); anything else is
+    `layer`."""
+    value = os.environ.get("SOUP_SOLUTION_WEIGHT_RING", "layer").strip().lower()
+    return value if value in RINGS else "layer"
 
 
 class StreamSkip(Exception):
@@ -246,15 +277,72 @@ class _Segment:
         self.shape, self.dtype = tuple(tensor.shape), tensor.dtype
         self.offset, self.nbytes = offset, tensor.numel() * tensor.element_size()
 
-    def view(self, buffer):
-        """This tensor inside a flat uint8 buffer laid out like the layer."""
-        return buffer[self.offset:self.offset + self.nbytes].view(self.dtype).view(self.shape)
+    def view(self, buffer, base=0):
+        """This tensor inside a flat uint8 buffer laid out like the layer (from byte `base` of the
+        layer's layout on: a slot of the type ring holds one part of it)."""
+        start = self.offset - base
+        return buffer[start:start + self.nbytes].view(self.dtype).view(self.shape)
 
     def assign(self, tensor):
         if self.field == "weight":
             self.owner.weight.data = tensor
         else:
             setattr(self.owner, self.field, tensor)
+
+
+class _Group:
+    """The slots of one part of every layer: `count` slots from `first` in the streamer's flat slot
+    list (layer j in slot first + j % count); `ranges[j]` = (start, nbytes) of the part in layer j's
+    layout (host buffer); `nbytes` = the slot size. The layer ring has one group, the whole layer."""
+
+    __slots__ = ("name", "count", "ranges", "nbytes", "first")
+
+    def __init__(self, name, count, ranges):
+        self.name, self.count, self.ranges = name, count, ranges
+        self.nbytes = max(nbytes for _, nbytes in ranges)
+        self.first = 0
+
+
+def _type_layout(layers, plans):
+    """How the type ring splits each layer's layout (`plans`: its segments in buffer order):
+    (ranges, groups, matrices) with ranges[g][j] = (start, nbytes) of group g of _TYPE_GROUPS, a
+    contiguous run of segments, in layer j; groups[j][k] = the group of segment k of layer j;
+    matrices[j] = {g: the Linear4bit of MLP matrix group g} for layer j. Raises StreamSkip when a
+    layer does not split that way (then the layer ring streams it)."""
+    ranges = [[] for _ in _TYPE_GROUPS]
+    groups_of, matrices = [], []
+    for layer, plan in zip(layers, plans):
+        names = {id(module): name for name, module in layer.named_modules()}
+        groups, modules, group = [], {}, None
+        for segment in plan:
+            if segment.field == "weight":  # a module's segments: weight, absmax(, state2 absmax)
+                name = names.get(id(segment.owner))
+                if name is None:
+                    raise StreamSkip("type ring: a streamed weight outside its layer")
+                parts = name.split(".")
+                group = next((g for g in range(1, len(_TYPE_GROUPS)) if _TYPE_GROUPS[g] in parts), 0)
+                if group and modules.setdefault(group, segment.owner) is not segment.owner:
+                    raise StreamSkip(f"type ring: two {_TYPE_GROUPS[group]} in a layer")
+            elif group is None:
+                raise StreamSkip("type ring: a quant state before its weight")
+            groups.append(group)
+        for g, name in enumerate(_TYPE_GROUPS):
+            where = [k for k, owner in enumerate(groups) if owner == g]
+            if not where or where != list(range(where[0], where[-1] + 1)):
+                raise StreamSkip(f"type ring: {name} missing or not contiguous in a layer's layout")
+            first, last = plan[where[0]], plan[where[-1]]
+            ranges[g].append((first.offset, last.offset + last.nbytes - first.offset))
+        groups_of.append(groups)
+        matrices.append(modules)
+    return ranges, groups_of, matrices
+
+
+def _ring_aware(mlp):
+    """Whether this MLP module's forward brackets every read of its matrices with acquire() and
+    release() (fused_proj.py's patched forward, which calls `mlp_unmanaged` when it falls back)."""
+    if mlp is None or "forward" in vars(mlp):
+        return False
+    return getattr(type(mlp).forward, "_soup_weight_ring", False) is True
 
 
 class _LayerExit(torch.autograd.Function):
@@ -280,9 +368,13 @@ class WeightStreamer:
 
     Timing (CUDA events, read without blocking as they complete, see `stats()`): every copy on the
     copy stream, and the time the compute stream spends in each wait for a layer's copy (an event
-    right before the wait and one right after it), forward and backward apart."""
+    right before the wait and one right after it), forward and backward apart.
 
-    def __init__(self, layers, slots=2, only=None):
+    `ring`: "layer" (rings of whole layers) or "type" (see the module doc: the attention projections
+    in `slots` slots by layer, one slot per MLP matrix type; a layer that does not split that way or
+    `only` given: the layer ring, with the reason in `ring_note`)."""
+
+    def __init__(self, layers, slots=2, only=None, ring="layer"):
         layers = list(layers)
         only = frozenset(only) if only else None
         if not torch.cuda.is_available():
@@ -317,11 +409,33 @@ class WeightStreamer:
                 plan, size = _plan_layer(layer, self.device, only, seen)
                 plans.append(plan)
                 sizes.append(size)
+        # the type ring's split of the layers (read only: before the first change to the model)
+        self.ring, self.ring_note, layout = "layer", None, None
+        if ring == "type":
+            try:
+                if only:
+                    raise StreamSkip("type ring: it streams every 4-bit layer, `only` is set")
+                layout = _type_layout(layers, [[segment for segment, _ in plan] for plan in plans])
+                self.ring = "type"
+            except StreamSkip as exc:
+                self.ring_note = str(exc)
+        elif ring != "layer":
+            self.ring_note = f"unknown ring {ring!r}"
+        if layout is None:
+            groups = [_Group("layer", slots, [(0, size) for size in sizes])]
+        else:
+            groups = [_Group("attn", slots, layout[0][0])] + [
+                _Group(name.split("_")[0], 1, layout[0][g]) for g, name in enumerate(_TYPE_GROUPS) if g]
+        first = 0
+        for group in groups:
+            group.first, first = first, first + group.count
 
         started = time.perf_counter()
         self.layers, self.slots, self.n, self.only = layers, slots, len(layers), only
         self.layer_bytes = sizes
-        self.slot_bytes = max(sizes)
+        self._groups = groups
+        self.slot_bytes = groups[0].nbytes  # the layer ring: max(sizes)
+        self.ring_bytes = sum(group.count * group.nbytes for group in groups)
         self.adopted = sum(host is not None for host in adopted)
         # everything that can fail comes before the first change to the model
         fresh = [j for j, host in enumerate(adopted) if host is None]
@@ -333,11 +447,12 @@ class WeightStreamer:
         self._hosts = [host.buffer if host is not None else self._fresh[starts[j]:starts[j] + sizes[j]]
                        for j, host in enumerate(adopted)]
         self._adopted_hosts = [host for host in adopted if host is not None]  # they keep the pinning
-        self._slots = [torch.empty(self.slot_bytes, dtype=torch.uint8, device=self.device)
-                       for _ in range(slots)]
+        # the slots of every group in one flat list (the layer ring: K slots of a whole layer)
+        self._slots = [torch.empty(group.nbytes, dtype=torch.uint8, device=self.device)
+                       for group in groups for _ in range(group.count)]
         self._copy_stream = torch.cuda.Stream(device=self.device)
-        self._ready = [torch.cuda.Event() for _ in range(slots)]  # copy into the slot done
-        self._free = [torch.cuda.Event() for _ in range(slots)]  # compute queued when a copy was issued
+        self._ready = [torch.cuda.Event() for _ in self._slots]  # copy into the slot done
+        self._free = [torch.cuda.Event() for _ in self._slots]  # compute queued when a copy was issued
         for j in fresh:
             host = self._host_layer(j)
             for segment, tensor in plans[j]:
@@ -350,17 +465,31 @@ class WeightStreamer:
         self._plans = [[segment for segment, _ in plan] for plan in plans]
         del plans
         for j, plan in enumerate(self._plans):
-            slot = self._slots[j % slots]
-            for segment in plan:
-                segment.assign(segment.view(slot))
-        self._owner = [-1] * slots
-        self.loads = 0  # layer copies issued
+            for k, segment in enumerate(plan):
+                group = groups[0 if layout is None else layout[1][j][k]]
+                slot = self._slots[group.first + j % group.count]
+                segment.assign(segment.view(slot, group.ranges[j][0]))
+        self._owner = [-1] * len(self._slots)
+        self.loads = 0  # layer (type ring: group) copies issued
         self.late_loads = 0  # of them, issued when the layer was already due (not prefetched)
+        self.group_loads = [0] * len(groups)
         self._spans = collections.deque()  # (kind, begin event, end event, bytes) not yet read
         self._spare_events = []
         self._reset_timing()
-        for j in range(slots):
-            self._load(j)
+        # type ring: group and layer of every MLP matrix (acquire/release), the layers' MLP modules
+        # (is their forward fused_proj's?), the layers whose MLP ran without acquire() in a forward
+        # with grad (their matrices are loaded again when their backward starts)
+        self._matrices = {}
+        if layout is not None:
+            for j, modules in enumerate(layout[2]):
+                for g, module in modules.items():
+                    self._matrices[module] = (g, j)
+        self._matrix_groups = tuple(range(1, len(groups)))
+        self._mlps = [getattr(layer, "mlp", None) for layer in layers]
+        self._held = set()
+        for g, group in enumerate(groups):
+            for j in range(group.count):
+                self._load(j, g)
         self._copy_stream.synchronize()
         self._harvest(block=True)
         # host -> GPU bandwidth of the first K layer copies, measured before anything else runs
@@ -371,6 +500,8 @@ class WeightStreamer:
             self._handles.append(layer.register_forward_pre_hook(functools.partial(self._before, i)))
             self._handles.append(layer.register_forward_hook(functools.partial(self._after, i)))
             _STREAMERS[layer] = self
+        for module, (g, j) in self._matrices.items():
+            _MATRICES[module] = (self, g, j)
         self.active = True
         torch.cuda.empty_cache()
         self.setup_seconds = time.perf_counter() - started
@@ -384,8 +515,10 @@ class WeightStreamer:
 
     def _reset_timing(self):
         self.copy_ms, self.copy_bytes, self.copies_timed = 0.0, 0, 0
-        self.wait_ms = {1: 0.0, -1: 0.0}  # compute stream waiting for copies: forward, backward
-        self.waits = {1: 0, -1: 0}
+        # compute stream waiting for copies: forward, backward (1, -1: a layer's, or the attention
+        # group's in the type ring; 2, -2: an MLP matrix's in the type ring)
+        self.wait_ms = {1: 0.0, -1: 0.0, 2: 0.0, -2: 0.0}
+        self.waits = {1: 0, -1: 0, 2: 0, -2: 0}
 
     def _event(self):
         return self._spare_events.pop() if self._spare_events else torch.cuda.Event(enable_timing=True)
@@ -416,51 +549,114 @@ class WeightStreamer:
             self._harvest(block=True)
         return {
             "loads": self.loads, "late_loads": self.late_loads,
+            "group_loads": {group.name: n for group, n in zip(self._groups, self.group_loads)},
             "copies_timed": self.copies_timed, "copy_ms": self.copy_ms,
             "copy_gbps": self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None,
             "setup_copy_gbps": self.setup_copy_gbps,
-            "wait_forward_ms": self.wait_ms[1], "wait_backward_ms": self.wait_ms[-1],
-            "waits_forward": self.waits[1], "waits_backward": self.waits[-1],
+            "wait_forward_ms": self.wait_ms[1] + self.wait_ms[2],
+            "wait_backward_ms": self.wait_ms[-1] + self.wait_ms[-2],
+            "waits_forward": self.waits[1] + self.waits[2],
+            "waits_backward": self.waits[-1] + self.waits[-2],
+            # of them, the waits for MLP matrices (type ring)
+            "matrix_wait_forward_ms": self.wait_ms[2], "matrix_wait_backward_ms": self.wait_ms[-2],
+            "matrix_waits_forward": self.waits[2], "matrix_waits_backward": self.waits[-2],
         }
 
-    def _load(self, j):
-        """Starts the copy of layer j into its slot on the copy stream, after the compute queued so
-        far (which includes every use of the slot's previous layer)."""
-        s = j % self.slots
+    def _load(self, j, g=0):
+        """Starts the copy of layer j's part of group g (the layer ring: the whole layer) into its
+        slot on the copy stream, after the compute queued so far (which includes every use of the
+        slot's previous layer)."""
+        group = self._groups[g]
+        s = group.first + j % group.count
+        start, nbytes = group.ranges[j]
         self._free[s].record(torch.cuda.current_stream(self.device))
         begin, end = self._event(), self._event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
             begin.record(self._copy_stream)
-            self._slots[s][:self.layer_bytes[j]].copy_(self._host_layer(j), non_blocking=True)
+            self._slots[s][:nbytes].copy_(self._host_layer(j)[start:start + nbytes], non_blocking=True)
             end.record(self._copy_stream)
             self._ready[s].record(self._copy_stream)
-        self._spans.append(("copy", begin, end, self.layer_bytes[j]))
+        self._spans.append(("copy", begin, end, nbytes))
         self._owner[s] = j
         self.loads += 1
+        self.group_loads[g] += 1
 
-    def _use(self, i, step):
-        """Layer i is about to run (step +1: forward, -1: backward): the compute stream waits for its
-        weights, and the next K-1 layers in that direction start loading."""
-        if not self.active:
-            return
-        s = i % self.slots
-        if self._owner[s] != i:
-            self._load(i)
-            self.late_loads += 1
+    def _wait(self, s, kind):
+        """The compute stream waits for the last copy into slot s (timed as `kind`)."""
         compute = torch.cuda.current_stream(self.device)
         begin, end = self._event(), self._event()
         begin.record(compute)
         compute.wait_event(self._ready[s])
         end.record(compute)
-        self._spans.append((step, begin, end, 0))
+        self._spans.append((kind, begin, end, 0))
         self._harvest()
-        for d in range(1, self.slots):
+
+    def _use(self, i, step):
+        """Layer i is about to run (step +1: forward, -1: backward): the compute stream waits for its
+        weights (the type ring: its attention projections), and the next K-1 layers in that
+        direction start loading."""
+        if not self.active:
+            return
+        group = self._groups[0]
+        s = group.first + i % group.count
+        if self._owner[s] != i:
+            self._load(i)
+            self.late_loads += 1
+        self._wait(s, step)
+        for d in range(1, group.count):
             j = i + d * step
             if j < 0 or j >= self.n:
                 break
-            if self._owner[j % self.slots] != j:
+            if self._owner[group.first + j % group.count] != j:
                 self._load(j)
+        if self._matrix_groups:
+            if step > 0:
+                if not _ring_aware(self._mlps[i]):  # no acquire() will come: its matrices now
+                    self._hold_matrices(i, step, torch.is_grad_enabled())
+            elif i in self._held:
+                self._held.discard(i)
+                self._hold_matrices(i, step, False)
+
+    def _hold_matrices(self, i, step, keep):
+        """Type ring, an MLP that reads its matrices without acquire(): the three matrices of layer
+        i in their slots (loaded on the spot when needed) and the compute stream waiting for them;
+        `keep`: again when the layer's backward starts."""
+        for g in self._matrix_groups:
+            s = self._groups[g].first
+            if self._owner[s] != i:
+                self._load(i, g)
+                self.late_loads += 1
+            self._wait(s, 2 * step)
+        if keep:
+            self._held.add(i)
+
+    def acquire(self, module, step):
+        """Type ring: `module` (an MLP matrix's Linear4bit) is about to be dequantized in a pass
+        (step +1: forward, -1: backward): the compute stream waits for its copy, issued now when its
+        slot holds another layer's matrix. Every read of the matrix comes between this call and
+        `release`. A no-op for a module this streamer does not hold that way."""
+        entry = self._matrices.get(module)
+        if entry is None or not self.active:
+            return
+        g, i = entry
+        s = self._groups[g].first
+        if self._owner[s] != i:
+            self._load(i, g)
+            self.late_loads += 1
+        self._wait(s, 2 * step)
+
+    def release(self, module, step):
+        """Type ring: the last read of `module` in this pass is queued (its dequantization; the
+        GEMMs read the dequantized copy): the copy of the same matrix of the next layer in the pass
+        (i + step) starts behind it."""
+        entry = self._matrices.get(module)
+        if entry is None or not self.active:
+            return
+        g, i = entry
+        j = i + step
+        if 0 <= j < self.n and self._owner[self._groups[g].first] == i:
+            self._load(j, g)
 
     def _before(self, index, module, args):
         if getattr(module, "gradient_checkpointing", False) and module.training:
@@ -497,6 +693,9 @@ class WeightStreamer:
         torch.cuda.synchronize(self.device)
         for layer in self.layers:
             _STREAMERS.pop(layer, None)
+        for module in self._matrices:
+            _MATRICES.pop(module, None)
+        self._matrices, self._held = {}, set()
         self._slots = []
         if self._unpin is not None:
             self._unpin()
@@ -533,11 +732,43 @@ def streamer_of(model):
     return None
 
 
-def stream_model_weights(model, slots=2, log=print, only=None):
+def mlp_ring(*modules):
+    """For fused_proj.py's MLP: the active type-ring WeightStreamer that holds these MLP matrices
+    (all of one layer, each in its slot; bracket their reads with its acquire() and release()),
+    None when none of them is held that way, False when only some are (do not read them)."""
+    if not len(_MATRICES):
+        return None
+    entries = [_MATRICES.get(module) for module in modules]
+    if all(entry is None for entry in entries):
+        return None
+    if any(entry is None for entry in entries):
+        return False
+    streamer, _, layer = entries[0]
+    if not streamer.active or any(s is not streamer or i != layer for s, _, i in entries):
+        return False
+    return streamer
+
+
+def mlp_unmanaged(mlp):
+    """For fused_proj.py's MLP when it falls back to a forward that reads its matrices without
+    acquire(): with a type ring, the three matrices of the layer in their slots before that forward
+    runs, and again when the layer's backward starts. A no-op otherwise."""
+    if not len(_MATRICES) or not isinstance(mlp, torch.nn.Module):
+        return
+    for module in mlp.modules():
+        entry = _MATRICES.get(module)
+        if entry is not None:
+            streamer, _, i = entry
+            if streamer.active:
+                streamer._hold_matrices(i, 1, torch.is_grad_enabled())
+            return
+
+
+def stream_model_weights(model, slots=2, log=print, only=None, ring=None):
     """Streams the 4-bit weights of the decoder layers of a real CUDA Qwen2 model in NF4/FP4
     (bitsandbytes). Returns the WeightStreamer, or None when the model is not one (fake modules,
     CPU, not quantized, gradient checkpointing): then nothing is changed. A model streamed already
-    returns its streamer as it is."""
+    returns its streamer as it is. `ring`: "layer" or "type" (default: SOUP_SOLUTION_WEIGHT_RING)."""
     if not isinstance(model, torch.nn.Module) or not torch.cuda.is_available():
         return None
     existing = streamer_of(model)
@@ -550,15 +781,22 @@ def stream_model_weights(model, slots=2, log=print, only=None):
         if getattr(model, "is_gradient_checkpointing", False):
             raise StreamSkip("gradient checkpointing would rerun the layers in the backward")
         before = torch.cuda.memory_allocated()
-        streamer = WeightStreamer(layers, slots, only)
+        streamer = WeightStreamer(layers, slots, only, ring=ring_from_env() if ring is None else ring)
     except StreamSkip as exc:
         log(f"[solution] weight streaming skipped: {exc}")
         return None
     freed = before - torch.cuda.memory_allocated()
     gbps = streamer.setup_copy_gbps
+    if streamer.ring_note:
+        log(f"[solution] weight streaming: {streamer.ring_note}; the ring of whole layers instead")
+    if streamer.ring == "type":
+        slots_text = ("type ring " + " + ".join(f"{g.count} x {g.name} {g.nbytes / 2**20:.2f}"
+                                                 for g in streamer._groups)
+                      + f" = {streamer.ring_bytes / 2**20:.1f} MiB on the GPU")
+    else:
+        slots_text = f"{streamer.slots} GPU slots x {streamer.slot_bytes / 2**20:.1f} MiB"
     log(f"[solution] 4-bit weights of {streamer.n} layers streamed from pinned host memory"
-        f"{'' if not only else ' (only ' + ','.join(sorted(only)) + ')'}: "
-        f"{streamer.slots} GPU slots x {streamer.slot_bytes / 2**20:.1f} MiB, "
+        f"{'' if not only else ' (only ' + ','.join(sorted(only)) + ')'}: {slots_text}, "
         f"{freed / 2**20:.0f} MiB freed on the GPU, {streamer.adopted} layers already in host memory "
         f"from the load, setup {streamer.setup_seconds:.2f} s, "
         f"host -> GPU {'?' if gbps is None else f'{gbps:.1f}'} GB/s")
@@ -577,6 +815,15 @@ def _report(ref, log):
         return
     copy = (f"{s['copy_ms'] / s['copies_timed']:.2f} ms per copy at {s['copy_gbps']:.1f} GB/s"
             if s["copies_timed"] and s["copy_gbps"] else "no timed copies")
+    if streamer.ring == "type":
+        loads = ", ".join(f"{name} {n}" for name, n in s["group_loads"].items())
+        log(f"[solution] weight streaming (type ring): {s['loads']} copies ({loads}), "
+            f"{s['late_loads']} of them not prefetched; {copy}; compute stream waited for copies "
+            f"{s['wait_forward_ms']:.1f} ms in {s['waits_forward']} forward waits (MLP matrices "
+            f"{s['matrix_wait_forward_ms']:.1f} ms in {s['matrix_waits_forward']}), "
+            f"{s['wait_backward_ms']:.1f} ms in {s['waits_backward']} backward ones (MLP matrices "
+            f"{s['matrix_wait_backward_ms']:.1f} ms in {s['matrix_waits_backward']})")
+        return
     log(f"[solution] weight streaming: {s['loads']} layer copies, {s['late_loads']} of them not "
         f"prefetched; {copy}; compute stream waited for copies {s['wait_forward_ms']:.1f} ms in "
         f"{s['waits_forward']} forward layer calls, {s['wait_backward_ms']:.1f} ms in "
