@@ -56,16 +56,17 @@ def test_int8_registrations_order(fresh, monkeypatch, order):
     done = list(fresh._STATE["results"])
     if order == "longest":  # each call's batch by cost, FIRST in front; int8 among the final call's
         assert done == ["cublas", "step_ops", "rms_norm_rows_fwd", "example_swiglu_fwd_kernel",
-                        "fused_proj_nf4_dequant4", "head_stream_kernels", "offload_int8_kernels",
-                        "int8_bwd_kernels", "int8_in_kernels"]
+                        "fused_proj_nf4_dequant4", "int8_fwd_kernels", "head_stream_kernels",
+                        "offload_int8_kernels", "int8_bwd_kernels", "int8_in_kernels"]
     else:
         assert done == early + late + list(fresh.INT8_WARMUPS)
 
 
 def test_int8_warmup_leaves_nothing_for_the_own_threads(fresh, monkeypatch):
-    from solution import int8_bwd, offload_int8
+    from solution import int8_bwd, int8_fwd, offload_int8
 
     monkeypatch.setitem(int8_bwd._STATE, "on", True)
+    monkeypatch.setitem(int8_fwd._STATE, "on", True)
     monkeypatch.setitem(offload_int8._STATE, "on", True)
     monkeypatch.setitem(offload_int8.RAW, "on", True)
     monkeypatch.setenv("SOUP_SOLUTION_INT8_WARMUP", "1")
@@ -88,6 +89,7 @@ def test_int8_warmup_leaves_nothing_for_the_own_threads(fresh, monkeypatch):
         try:
             assert int8_bwd._warm() is None
             assert offload_int8._warm() is None
+            assert int8_fwd._warm() is None
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -98,14 +100,18 @@ def test_int8_warmup_leaves_nothing_for_the_own_threads(fresh, monkeypatch):
     assert fresh.COMPILES[before:] == []  # every variant was in triton's in-memory cache
     # in a fresh process the warm-up compiled them all (here earlier tests may have compiled some)
     assert kernels <= {"nf4_int8_t_kernel", "int8_swiglu_bwd_kernel", "quant_t_int8_kernel",
-                       "gu_quant_kernel", "gu_dequant_kernel", "quant_t_int8_il_kernel"}
+                       "gu_quant_kernel", "gu_dequant_kernel", "quant_t_int8_il_kernel",
+                       "quant_rows_kernel", "dequant_rows_cols_kernel", "nf4_int8_gu_kernel",
+                       "int8_gate_up_kernel"}
 
 
 def test_int8_warmup_skips_when_switched_off(fresh, monkeypatch):
-    from solution import int8_bwd, offload_int8
+    from solution import int8_bwd, int8_fwd, offload_int8
 
     monkeypatch.setitem(int8_bwd._STATE, "on", False)
+    monkeypatch.setitem(int8_fwd._STATE, "on", False)
     monkeypatch.setitem(offload_int8._STATE, "on", False)
+    assert fresh._warm_int8_fwd() == fresh.SKIPPED
     assert fresh._warm_int8_bwd() == fresh.SKIPPED
     assert fresh._warm_offload_int8() == fresh.SKIPPED
     assert fresh._warm_int8_in() == fresh.SKIPPED

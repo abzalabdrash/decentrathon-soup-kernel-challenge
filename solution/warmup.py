@@ -183,7 +183,8 @@ COSTS = {"fused_proj_nf4_dequant4": 1.60, "head_stream_kernels": 1.00, "step_ops
          "nf4_dequant_kernel": 0.32, "rms_norm_rows_bwd_split": 0.31, "example_swiglu_bwd_kernel": 0.25,
          "example_swiglu_fwd_kernel": 0.23, "fused_proj_x16_rebuild": 0.17,
          "fused_proj_masked_pair_sum": 0.16, "fused_proj_nf4_dequant3": 0.70, "fused_ce_rows_kernel": 0.60,
-         "offload_int8_kernels": 0.98, "int8_bwd_kernels": 0.90, "int8_in_kernels": 0.64}
+         "offload_int8_kernels": 0.98, "int8_bwd_kernels": 0.90, "int8_in_kernels": 0.64,
+         "int8_fwd_kernels": 1.20}  # int8_fwd: its three kernels, measured locally x ~1.5 for the T4
 # SOUP_SOLUTION_INT8_WARMUP=1 (off by default): the int8 kernels of int8_bwd.py and offload_int8.py, which
 # their own threads otherwise compile during steps 1-5 (seven compiles, 2.5-2.7 s on the T4), join the
 # warm-up as these registrations (see _register_int8). In registration order they go after every
@@ -191,7 +192,7 @@ COSTS = {"fused_proj_nf4_dequant4": 1.60, "head_stream_kernels": 1.00, "step_ops
 # SOUP_SOLUTION_WARMUP_ORDER=longest they sort by COSTS with the rest (longest processing time first
 # over all of them: 5.10 s in the two-worker simulation against 5.33 s with them last, and train
 # begin waits for the whole warm-up).
-INT8_WARMUPS = ("int8_bwd_kernels", "offload_int8_kernels", "int8_in_kernels")
+INT8_WARMUPS = ("int8_bwd_kernels", "offload_int8_kernels", "int8_in_kernels", "int8_fwd_kernels")
 COMPILES = []  # every compile seen by `watch_compiles`, as dicts (see there)
 
 _LOCK = threading.Lock()
@@ -488,6 +489,12 @@ def _warm_int8_in():
     return None
 
 
+def _warm_int8_fwd():
+    from . import int8_fwd
+
+    return int8_fwd._warm()  # SKIPPED when SOUP_SOLUTION_INT8_FWD is off
+
+
 def int8_warmup_on():
     return os.environ.get("SOUP_SOLUTION_INT8_WARMUP", "0").strip().lower() not in ("0", "false", "no", "")
 
@@ -497,7 +504,8 @@ def _register_int8():
     apply() starts the warm-up); returns whether it did."""
     if not int8_warmup_on():
         return False
-    for name, fn in zip(INT8_WARMUPS, (_warm_int8_bwd, _warm_offload_int8, _warm_int8_in)):
+    for name, fn in zip(INT8_WARMUPS, (_warm_int8_bwd, _warm_offload_int8, _warm_int8_in,
+                                       _warm_int8_fwd)):
         register(fn, name=name)
     return True
 
