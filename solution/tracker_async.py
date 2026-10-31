@@ -37,7 +37,7 @@ LAST = {"queued": 0, "written": 0, "error": None}
 
 
 def enabled():
-    return os.environ.get("SOUP_SOLUTION_TRACKER_THREAD", "0").strip().lower() not in ("0", "false", "no", "")
+    return os.environ.get("SOUP_SOLUTION_TRACKER_THREAD", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 class _Writer:

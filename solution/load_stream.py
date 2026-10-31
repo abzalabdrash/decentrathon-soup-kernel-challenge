@@ -174,7 +174,7 @@ class _Load:
         self.locate = locate  # LOAD_PREAD: slice -> its byte range in the file
         # SOUP_SOLUTION_LOAD_ONE_SYNC: the layers' copies to pinned host memory are left in flight and the
         # load synchronizes once when it returns (see the module docstring)
-        self.one_sync = _flag("SOUP_SOLUTION_LOAD_ONE_SYNC", "0")
+        self.one_sync = _flag("SOUP_SOLUTION_LOAD_ONE_SYNC", "1")
         self.embedding_pinned = None  # the embedding's pinned buffer once its job took it
         self.embedding_fill = None  # EMBED_ASYNC: (thread, host view, slice, outcome)
         self.pinner = _Pinner(self._requests(), device)

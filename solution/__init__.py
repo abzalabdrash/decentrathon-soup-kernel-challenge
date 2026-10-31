@@ -62,7 +62,7 @@ def apply():
     mark("apply begin")
     # Defaults of switches that other modules read at import time (int8_bwd.py reads its own when
     # fused_proj imports it), so they come before any patch import; an environment value wins.
-    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # E1: pinned host memory handed back on a thread at the last step; not "all" (check 9)
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "late")  # pinned host memory handed back on a thread after Soup's final save_model (T4 -0.21 s, Modal -0.20 s against the last step); not "all" (check 9)
     # answer 29 (chat, 31 Oct): int8 tensor cores for the frozen linear layers in the forward and the backward by
     # input, and for lm_head, are allowed when all 10 checks pass; the MLP backward int8 (int8_bwd.py) measured
     # 10/10 on the public rows (43.1 s / 395 MiB) and on the jury rows (s 1.91 against 1.80-1.85 without it).
