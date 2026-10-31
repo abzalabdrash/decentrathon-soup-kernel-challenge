@@ -220,6 +220,7 @@ class _Probe:
         self.calibrate = False  # collect every layer's max |x| per input channel
         self.chan_max = {}
         self.topk = {}  # layer -> input channels of gate|up kept in fp16 ("gud" variants)
+        self.routed = [0, 0]  # tokens routed to fp16 by the "gut<limit>" variants, tokens seen
 
     def forward(self, mlp, x):
         from solution import int8_fwd
@@ -258,10 +259,35 @@ class _Probe:
             w_d = dequantize_nf4(mlp.down_proj.weight, mlp.down_proj.weight.quant_state,
                                  torch.float16)
             return torch.mm(h.t(), w_d.t()).view(*shape[:-1], d)
-        if self.use == "guk":  # the kernels' top-k path with the calibrated channels
-            idx = self.topk[layer].to(torch.int32)
-            pos = torch.full((d,), -1, dtype=torch.int32, device=x.device)
-            pos[idx.long()] = torch.arange(idx.numel(), dtype=torch.int32, device=x.device)
+        if self.use.startswith("gut"):  # outlier tokens (amax / rms of x above a threshold) in fp16
+            limit = float(self.use[3:])
+            xf = x2.float()
+            ratio = xf.abs().amax(1) / xf.pow(2).mean(1).sqrt().clamp_min(1e-12)
+            routed = ratio > limit
+            self.routed[0] += int(routed.sum())
+            self.routed[1] += n
+            gate_up, _ = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer, torch.float16,
+                                                  inter, hidden=True)
+            gu = gate_up[:, :n].clone()
+            if routed.any():
+                w_gu = torch.cat([dequantize_nf4(mlp.gate_proj.weight,
+                                                 mlp.gate_proj.weight.quant_state, torch.float16),
+                                  dequantize_nf4(mlp.up_proj.weight, mlp.up_proj.weight.quant_state,
+                                                 torch.float16)])
+                gu[:, routed] = torch.mm(w_gu, x2[routed].half().t())
+            g, u = gu[:inter].float(), gu[inter:].float()
+            h = (g * torch.sigmoid(g) * u).half()
+            w_d = dequantize_nf4(mlp.down_proj.weight, mlp.down_proj.weight.quant_state,
+                                 torch.float16)
+            return torch.mm(h.t(), w_d.t()).view(*shape[:-1], d)
+        if self.use in ("guk", "guks"):  # the kernels' top-k path: calibrated / this row's channels
+            if self.use == "guks":
+                pos, idx = int8_fwd._top(torch.linalg.vector_norm(x2.float(), ord=float("inf"),
+                                                                  dim=0))
+            else:
+                idx = self.topk[layer].to(torch.int32)
+                pos = torch.full((d,), -1, dtype=torch.int32, device=x.device)
+                pos[idx.long()] = torch.arange(idx.numel(), dtype=torch.int32, device=x.device)
             x_q, s_x, x_k = int8_fwd.quantize_tokens(x2, n, padded, pos)
             _, h = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer, torch.float16,
                                             inter, hidden=True, idx=idx, x_k=x_k)
@@ -365,6 +391,7 @@ def errors(args):
     print(f"{len(rows)} rows, {sum(len(r[0]) for r in rows)} tokens", flush=True)
     losses = collections.defaultdict(list)
     uses = ["fp16", "all", "gu"] + (["all_skip", "gu_skip"] if args.fp16_layers else [])
+    uses += [f"gut{limit:g}" for limit in args.route]
     if args.topk:
         # "step 0": the first 4 rows in fp16 give every layer's channel maxima
         probe.calibrate = True
@@ -374,7 +401,7 @@ def errors(args):
         probe.calibrate = False
         for layer, peak in probe.chan_max.items():
             probe.topk[layer] = peak.topk(args.topk).indices
-        uses += ["gud", "guk"] if args.topk == int8_fwd.TOPK else ["gud"]
+        uses += ["gud", "guk", "guks"] if args.topk == int8_fwd.TOPK else ["gud"]
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         for ids, n_prompt in rows:
             ids = ids.cuda()[None]
@@ -396,6 +423,9 @@ def errors(args):
               f"({collections.Counter(st['tok_worst_pos']).most_common(1)[0][0]})"
               f"        {max(st['x_peak_ratio']):7.1f}  {max(st['h_peak_ratio']):8.1f}", flush=True)
     base = losses["fp16"]
+    if args.route:
+        print(f"\nrouted to fp16 (all gut variants together): {probe.routed[0]} of "
+              f"{probe.routed[1]} MLP token rows ({100 * probe.routed[0] / max(probe.routed[1], 1):.2f} %)")
     print(f"\nloss fp16 {statistics.mean(base):.5f}")
     for use in uses[1:]:
         rel = [abs(a - b) / b for a, b in zip(losses[use], base)]
@@ -441,6 +471,9 @@ def main():
     parser.add_argument("--single", choices=["gu", "all"], default=None,
                         help="also the loss with one layer at a time in this int8 variant")
     parser.add_argument("--single-rows", type=int, default=12)
+    parser.add_argument("--route", type=float, nargs="*", default=[],
+                        help="also gate|up int8 with the tokens of x amax / rms above these limits "
+                             "in fp16 (outlier-token routing)")
     parser.add_argument("--topk", type=int, default=0,
                         help="also gate|up int8 with the top-k input channels (max |x| over the "
                              "first 4 rows) in fp16")

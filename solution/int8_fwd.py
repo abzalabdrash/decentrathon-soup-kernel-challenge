@@ -1,8 +1,9 @@
 """int8 tensor cores for the fused MLP's forward GEMM of gate|up (task I1, SOUP_SOLUTION_INT8_FWD; on
-by default in the `soup train` process only, like int8_bwd.py: pytest keeps the fp16 forward that
-test_fused_proj compares bit for bit, =1 turns it on there, =0 off everywhere). Organizers' answer 29
-allows int8 for the frozen linear layers in the forward and the backward by input when all 10 checks
-pass.
+by default in every process, like int8_bwd.py, =0 turns it off; solution/conftest.py starts every
+test of solution/ with it off, so the bitwise tests of the fp16 path keep comparing that path, and
+test_int8_fwd.py switches it on). Organizers' answer 29 allows int8 for the frozen linear layers in
+the forward and the backward by input when all 10 checks pass; answer 11 and its follow-up the
+in-run choice of the fp16 channels.
 
 The fp16 forward of fused_proj._MLP rebuilds W_gate, W_up and W_down in fp16 (nf4.py), runs two fp16
 GEMMs into (gate|up) (2I, M), the SwiGLU, and the down GEMM. Here (MODE "gu", the default), with M the
@@ -52,14 +53,13 @@ import triton
 import triton.language as tl
 
 from . import nf4
-from .int8_bwd import _soup_train_process
 
 
 def _env_on(name, default):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
 
 
-_STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "1" if _soup_train_process() else "0"),
+_STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "1"),
           "thread": None, "calls": 0}
 # the first START_CALLS eligible forwards stay fp16 (8 steps x 28 layers); the compile thread starts
 # at eligible forward COMPILE_CALLS (step 2: steps 0 and 1 are the CPU-heavy ones, the later steps
@@ -89,6 +89,10 @@ FP16_LAYERS = _layers(os.environ.get("SOUP_SOLUTION_INT8_FWD_FP16_LAYERS", ""))
 # input channels of gate|up per layer kept out of the int8 product and added in fp32 (0: none): the
 # TOPK largest max |x| of the layer's fp16 forwards before the switch (see `channels`)
 TOPK = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_TOPK", "16"))
+# which top-k channels: "run" (the default: the largest max |x| of the layer's fp16 forwards before
+# the switch, fixed for the rest of the run) or "step" (the largest max |x| of this forward's own
+# input, chosen again on every forward: no state between steps)
+TOPK_MODE = os.environ.get("SOUP_SOLUTION_INT8_FWD_TOPK_MODE", "run").strip().lower()
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 GU_ROWS, GU_CB = 8, 8  # gate/up decode: rows per program, 64-element blocks per row per iteration
@@ -384,7 +388,7 @@ def shapes_ok(hidden, inter, down_rows):
 def observing():
     """Whether the forwards still run fp16 before the switch (when `observe` collects the channel
     maxima for TOPK); call after `usable` counted the forward."""
-    return TOPK > 0 and _STATE["on"] and _STATE["calls"] <= START_CALLS
+    return TOPK > 0 and TOPK_MODE == "run" and _STATE["on"] and _STATE["calls"] <= START_CALLS
 
 
 def usable(tokens):
@@ -467,12 +471,22 @@ def observe(mlp, x2):
         torch.maximum(prev, peak, out=prev)
 
 
+def _top(peak):
+    """(pos (D,) int32: channel -> its slot or -1, idx (TOPK,) int32) of the TOPK largest of peak."""
+    idx = peak.topk(TOPK).indices.to(torch.int32)
+    pos = torch.full((peak.numel(),), -1, dtype=torch.int32, device=peak.device)
+    pos[idx.long()] = torch.arange(TOPK, dtype=torch.int32, device=peak.device)
+    return pos, idx
+
+
 def channels(mlp, x2):
-    """(pos (D,) int32, idx (TOPK,) int32) of this MLP's top-k input channels by the max |x| that
-    `observe` collected (this call's x when nothing was collected), fixed for the rest of the run;
-    None with TOPK = 0."""
+    """(pos (D,) int32, idx (TOPK,) int32) of this MLP's top-k input channels; None with TOPK = 0.
+    TOPK_MODE "run": by the max |x| that `observe` collected (this call's x when nothing was
+    collected), fixed for the rest of the run; "step": by this call's x (GPU ops only, no sync)."""
     if TOPK <= 0:
         return None
+    if TOPK_MODE == "step":
+        return _top(torch.linalg.vector_norm(x2.detach(), ord=float("inf"), dim=0).float())
     found = mlp.__dict__.get("_soup_int8_topk")
     if found is not None:
         return found
@@ -480,10 +494,7 @@ def channels(mlp, x2):
     if peak is None:
         observe(mlp, x2)
         peak = mlp.__dict__.pop("_soup_int8_peak")
-    idx = peak.topk(TOPK).indices.to(torch.int32)
-    pos = torch.full((peak.numel(),), -1, dtype=torch.int32, device=peak.device)
-    pos[idx.long()] = torch.arange(TOPK, dtype=torch.int32, device=peak.device)
-    found = mlp.__dict__["_soup_int8_topk"] = (pos, idx)
+    found = mlp.__dict__["_soup_int8_topk"] = _top(peak)
     return found
 
 
