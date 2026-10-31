@@ -123,3 +123,130 @@ all four, so the 252 / 381 of 9e72037 also depends on allocation order of a late
   defaults and the per-layer timeline.
 - left: find which change after 9e72037 lost the 20 MiB reserved segment (try FEWER_VIEWS=0 and
   DEQUANT_REUSE variants on Modal), then fill this section and the report.
+
+## Session 2 (31 Oct afternoon, branch `claude/c1-cpu-diet-2` from main ce27a54)
+
+### 1. soup-c1-abba4 (peagverr, bc35c89 = the C1 defaults before B1, against the same commit with them off)
+
+Order warm_0 (main path), main_1, c1_1, prof_1, prof_2, c1_2, main_2 (prof = c1 + `SOUP_SOLUTION_CPU_PROFILE=1`).
+Wall: main 43.75 / 43.80 s, c1 42.65 / 42.75 (-1.08 s); steps 3+ 25.50 / 25.41 against 24.61 / 24.53
+(-0.89 s). Peak 401 MiB, reserved 272, alloc 234.6 in all seven runs (30 segment allocations each).
+Checks 3, 4, 9 pass in all; own kernels 13.9-14.0 % (c1), 14.8-15.1 % (main path). T4 pytest:
+**349 passed, 5 skipped, 0 failed** (no failing test in this session).
+
+Per step c1 - main (mean of the two runs each, by the step's token count; 62 timed steps):
+
+| tokens | steps | mean diff | median diff |
+|---|---|---|---|
+| < 400 | 3 | -52.3 ms | -52.2 |
+| 400-500 | 3 | -53.7 ms | -55.0 |
+| 500-600 | 6 | -31.8 ms | -32.0 |
+| 600-900 | 30 | -8.9 ms | -7.3 |
+| >= 900 | 20 | -5.5 ms | -5.5 |
+
+Means per bucket: < 600 tokens 331.2 / 329.5 ms (main) against 288.2 / 287.6 (c1); 600-900 368.6 /
+367.7 against 359.5 / 358.9; >= 900 523.6 / 521.4 against 518.4 / 515.5.
+
+Profiled run (prof_1, the timeline outside the profile window, mean per step size): steps under 600
+tokens issue the forward at 3.55 ms of CPU per layer with the GPU 0.6-3.1 ms behind (CPU-bound), the
+head 110.7 -> 120.4 ms CPU while the GPU ends it at 149.9 (PCIe-bound, 29 ms lag), the backward at
+4.0 ms of CPU per layer with the lag growing 0 -> 7.3 ms (the GPU catches up and falls behind at the
+end), optimizer at 282.9 ms, step end 288.2. Steps of 600-900 tokens: forward 3.6 ms CPU against 4.7
+ms GPU per layer, backward 4.0 against ~5.7 (GPU-bound, lag 29 ms at the head, 50 ms at the end).
+Against prof2 (9e72037): forward 4.0 -> 3.55, backward 4.2 -> 4.0 ms per layer. The cProfile part
+(pre-B1) still shows the FLOP counter's walk (`floating_point_ops` -> `num_parameters`, 31,942
+`named_modules` calls per step) and `model.train()` over 933 modules: both are B1's boundary.py fixes,
+in main since 1be9e55, so not present in main's step any more.
+
+**The 20 MiB reserved segment** (soup-c1-mem2, peagverr, ce27a54 = main with B1, one run each,
+no pytest): default, `FEWER_VIEWS=0`, the three switches added after 9e72037 off
+(`FEWER_VIEWS=0, MLP_ADDMM_INPLACE=0, LAYER_EXIT_HOOK=0`) and `ATTN_ONE_FUNCTION=1`: nvidia-smi
+**371 MiB, reserved 250, 28 segment allocations in all four**; alloc 225.5 MiB (one node 229.7). So
+with B1's single-thread backward (one cuBLAS workspace less: alloc -9.1, reserved -22) the page is
+gone whatever the C1 switches: before B1, 9e72037 had 252 against 272 and bc35c89 272; after B1 every
+variant has 250. Reserved - allocated is now 24.5 MiB (one 20 MiB page of the large pool plus the small
+pool); 230 MiB reserved would need the fragmentation at the peak under 4.5 MiB, which no C1 switch
+changes. Nothing to recover here; 371 MiB is main's number. (The single runs' walls rise with their
+position in the session: 41.6, 41.6, 43.6, 44.3 s; not a comparison.)
+
+### 2. Two nodes instead of one (`SOUP_SOLUTION_ATTN_TWO_NODES=1`, fused_proj.py, on by default)
+
+Why one node cost +4.2 MiB: autograd holds a node's incoming gradient until the node returns, and
+`_AttnBlock`'s incoming gradient is the o_proj output's (N x 1536 half), alive through the attention
+backward, the layer's peak. `_QKVAttn` is `_QKVRope` + the variable-length attention as one node
+(the reshape to the o_proj input a view of its output); the o_proj stays `_Linear4bitHalf`. Its
+backward consumes the output's gradient first, as with three nodes; `_QKVAttn` then holds its own
+incoming gradient (the attention output's, N x 1536 half) through the q/k/v backward, in place of the
+q/k/v gradients (N x 2048 half) that `_QKVRope`'s node held there, and the q/k/v gradients die as soon
+as they are in `g` (`_qkv_backward(box=...)` takes the only references). Same ops, operands and order
+as `_AttnBlock`'s token-major path. `SOUP_SOLUTION_ATTN_ONE_FUNCTION=1` still wins when set; eval, the
+non-recomputing layers and attention dropout take the three nodes.
+
+Tests (`test_fused_proj.py`): `test_attention_two_nodes_is_bitwise` (three, two and one node: output,
+input gradient and LoRA gradients bit for bit, LoRA dropout 0 and 0.05, node types checked);
+`test_attention_two_nodes_backward_peak` (one layer, the output gradient made inside the backward:
+allocated peak two <= three; one = three + N x 2048 bytes on the laptop). The other attention tests pin
+`two_nodes` off where they compare three-node variants. T4 pytest of 1c66f61 (soup-c1-nodes):
+**405 passed, 5 skipped, 0 failed**; Soup's 79 with apply() pass on the laptop.
+
+### 3. The embedding lookup with host ids (`SOUP_SOLUTION_HOST_IDS=1`, step_pipeline.py, unpad.py, head_stream.py)
+
+The host plan (B1) records the packed ids' CPU copy for their GPU view (`step_pipeline.remember`);
+`unpad.varlen_model_forward` builds the alignment tail on the CPU copy too (same fill) and records it
+for the tail-extended GPU ids; `head_stream.lookup` gathers with `step_pipeline.host_ids(ids)` (identity,
+shape and dtype checked) and reads the GPU ids back only when there is none. The forward then starts
+without a host wait. Tests: `test_host_ids_reach_the_embedding_with_the_tail` (37 and 48 tokens, tail id
+None or set, switch on/off), `test_embedding_lookup_with_host_ids` (same rows, no `.to("cpu")` of the
+GPU ids, a copy of another shape ignored), the tiny SFT run with all B1 switches still identical.
+
+### 4. Pre-test "one autograd.Function per decoder block" (`solution/bench_nodes.py`, T4, soup-c1-nodes)
+
+Host cost of one autograd node (a chain of 6 custom Functions against one Function running the same
+6 ops, median of 100): **14 us forward + 19 us backward** at 300, 830 and 1,440 tokens (13.8-14.4 /
+18.4-19.8 us). The attention block of one layer with the recompute (real fused code, 4 rows, host ms
+to issue from an idle GPU, median of 100; kernel launches equal in all three):
+
+| tokens | three nodes fwd / bwd | two nodes fwd / bwd | one node fwd / bwd | MLP fwd / bwd |
+|---|---|---|---|---|
+| 300 | 1.196 / 1.857 | 1.021 / 1.763 | 0.987 / 1.728 | 0.713 / 0.781 |
+| 830 | 1.248 / 1.870 | 1.179 / 1.787 | 1.142 / 1.740 | 0.726 / 0.830 |
+| 1,440 | 1.678 / 1.895 | 1.596 / 1.805 | 1.580 / 1.778 | 0.669 / 0.743 |
+
+The attention block as one Function against today's three nodes: -11 % host time at 300 tokens
+(3.05 -> 2.72 ms), -8 % at 830, -6 % at 1,440; two nodes take most of it (-9 %, -5 %, -5 %). The whole
+layer costs 3.55 + 4.0 ms of host time per layer in training (prof_1 timeline, short steps); one
+Function per decoder block would remove at most the attention's 0.34 ms plus the two norms' and the
+MLP's node round trips (3 x 33 us) and their glue: about 0.5 ms, 6-7 % of the layer. Below the 15-20 %
+threshold of the review: **not rewritten**. Most of what a merge saves is the Python glue between
+nodes (three -> two: 0.27 ms, of which one node's round trip is 0.03 ms), not the autograd node itself.
+
+### 5. ABBA of 2 + 3 (peagverr, soup-c1-abba5, 3e347e7 = ce27a54 + two nodes + host ids; `main` = the same commit with `ATTN_TWO_NODES=0, HOST_IDS=0`, i.e. ce27a54's paths; 2 rounds ABBA + warm run, with pytest)
+
+| variant | wall s | steps 3+ s | median | < 600 tok ms | 600-900 ms | >= 900 ms | nvidia-smi | reserved | alloc peak | own |
+|---|---|---|---|---|---|---|---|---|---|---|
+| main path | 41.69 / 41.89 | 23.70 / 23.54 | 0.383 | 265.2 / 263.7 | 346.8 / 343.9 | 505.7 / 502.8 | 371 | 250 | 225.5 | 14.3 / 14.4 % |
+| two nodes + host ids | 41.79 / 41.89 | 23.57 / 23.51 | 0.379 | 260.5 / 262.4 | 345.3 / 343.8 | 504.0 / 502.4 | 371 | 250 | 225.5 | 14.3 / 14.4 % |
+
+Per step (mean of two runs each): < 400 tokens -3.3 ms, 400-500 -5.0, 500-600 -1.9, 600-900 -0.8,
+>= 900 -1.0. Steps 3+ -0.08 s, wall +0.05 s: **in the noise** (below the 0.3 s mark). Memory the same
+in every run (371 / 250 / 225.5 MiB). `64 lookups with host ids` in each c1 run (0 in main). T4 pytest
+**405 passed, 5 skipped, 0 failed**; checks 3, 4, 9 pass in all five runs. Session note: the poller's
+download broke mid-run (IncompleteRead) and returned three runs; `--attach` fetched the rest (output
+dir 20261031-120802).
+
+Why so little: the bench's -0.27 ms of host time per layer applies only where the CPU is the
+bottleneck, the forward of the ~12 short steps (prof_1: the GPU 0.6-3 ms behind there); the
+backward of short steps and every pass of the longer steps are GPU-bound. The CPU side of the step
+has about this much left on the public rows; further CPU cuts are worth < 0.1 s each.
+
+### 6. GPU glue from R3: k/v expanded once in the recompute (`SOUP_SOLUTION_EXPAND_KV_ONCE`, off)
+
+`_AttnRecompute._rebuild` expands k and v to the 12 q heads once and hands the same tensors to its
+attention forward and to the attention backward (which expanded the compact ones a second time); the
+three backward sites expand only compact k/v and take the kv head count from q's heads / groups.
+Bitwise in all three node layouts and with the recompute's own check (`test_attention_expand_kv_once_is_bitwise`;
+also 2,047, 2,048 and 1,999 + 49 tokens on the laptop). T4 (peagverr, soup-c1-kv1, d1c252d, ABBA 2
+rounds + warm run, no pytest): c1 wall 41.53 / 42.53 s, steps 3+ 23.75 / 24.20; kv1 41.63 / 41.82,
+steps 3+ 24.00 / 24.04; **alloc peak 225.5 -> 224.1 MiB but reserved 250 -> 270, nvidia-smi 371 ->
+391** (the expanded k/v live from the rebuild to the attention backward and fragment the pool). No
+time gained, a 20 MiB page lost: **stays off**.
