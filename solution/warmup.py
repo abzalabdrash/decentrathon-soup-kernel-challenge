@@ -245,8 +245,10 @@ def warm_step_ops():
     # the run is touched and no random number is drawn.
     import torch
 
-    params = [torch.zeros(16, 64, device="cuda", requires_grad=True),
-              torch.zeros(64, 16, device="cuda", requires_grad=True)]
+    # explicit fp32: the loader may have set torch's default dtype to fp16 meanwhile, and the scaler
+    # refuses fp16 gradients ("Attempting to unscale FP16 gradients"), which left these kernels cold
+    params = [torch.zeros(16, 64, device="cuda", dtype=torch.float32, requires_grad=True),
+              torch.zeros(64, 16, device="cuda", dtype=torch.float32, requires_grad=True)]
     optimizer = torch.optim.AdamW(params, lr=1e-4, weight_decay=0.01)
     scaler = torch.amp.GradScaler("cuda")
     loss = params[0].sum() + params[1].sum()

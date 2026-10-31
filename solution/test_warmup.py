@@ -278,6 +278,20 @@ def test_step_ops_draw_no_random_numbers():
     assert torch.equal(torch.cuda.get_rng_state(), cuda)
 
 
+def test_step_ops_warm_under_fp16_default_dtype():
+    # the model loader sets torch's default dtype to fp16 while the warm-up thread may still be at
+    # step_ops: tensors created without a dtype were fp16 then, the scaler refused them ("Attempting
+    # to unscale FP16 gradients") and the AdamW/clip kernels stayed cold for the first step
+    from solution import warmup
+
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float16)
+    try:
+        warmup.warm_step_ops()
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def test_early_start_takes_later_registrations(fresh, monkeypatch):
     """Started early (final=False, as with SOUP_SOLUTION_WARMUP_START=apply_begin) on what is
     registered so far; the final call queues what patch functions registered since; the workers
