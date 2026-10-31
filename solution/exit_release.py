@@ -13,7 +13,8 @@ The driver gives it back page by page when the process ends, on the clock and wi
 overlap.
 
 None of it is needed once the last optimizer step is done. So at the last step's on_step_end (the
-harness's callback, added before ours, has synchronized the device) a thread, not a daemon:
+harness's callback, added before ours, has synchronized the device; at the end of train() instead
+when the trainer evaluates, which runs the model after the last step) a thread, not a daemon:
 1. frees the offload's slabs, spare and used (offload.release_host_memory: cudaFreeHost through
    torch's host allocator; an offload that runs again pins new slabs on demand);
 2. unregisters every registered buffer (weight_stream.unpin_all): the values stay where they are as
@@ -104,10 +105,14 @@ def patch_soup_exit_release():
             from transformers import TrainerCallback
 
             device = next(trainer.model.parameters()).device
+            # an evaluation after the last step would run the model (copies from the host buffers):
+            # with one configured the release waits for the end of train()
+            strategy = getattr(getattr(trainer, "args", None), "eval_strategy", "no")
+            evaluates = getattr(trainer, "eval_dataset", None) is not None or                 str(getattr(strategy, "value", strategy)).lower() != "no"
 
             class _ExitRelease(TrainerCallback):
                 def on_step_end(self, args, state, control, **kw):
-                    if state.max_steps and state.global_step >= state.max_steps:
+                    if not evaluates and state.max_steps and state.global_step >= state.max_steps:
                         start_release(device)
 
                 def on_train_end(self, args, state, control, **kw):

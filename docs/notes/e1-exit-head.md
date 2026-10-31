@@ -64,6 +64,30 @@ it to heads of at most that many rows (long steps are compute-bound: the decode 
 
 Results: TODO (soup-e1-pack1 microbench, soup-e1-packv1 variants).
 
-## Question for the organizers (draft)
+## Question for the organizers (exact wording)
 
-TODO
+> Замороженный общий вес `embed_tokens`/`lm_head` мы, по вашему разрешению, держим в pinned-памяти
+> хоста и стримим чанками на GPU каждый шаг. Можно ли держать на хосте этот вес в сжатом без потерь
+> виде (12 бит на значение вместо 16: байт «знак + 7 бит мантиссы» и 4-битный код класса порядка по
+> таблице чанка, плюс список из 15 исключений) и распаковывать каждый чанк на GPU своим Triton-ядром
+> обратно в fp16 прямо перед GEMM? Значения и dtype, подаваемые в операции, бит-в-бит те же, что у
+> базы (fp16-вес): при загрузке каждый чанк распаковывается тем же ядром и сравнивается с fp16-чанком,
+> при любом расхождении сжатие выключается. Сжатый вид строится заново в каждом запуске из чекпойнта
+> (между запусками ничего не кэшируется), его построение и распаковка входят в замер.
+
+English: The frozen tied embed_tokens/lm_head weight is, as you allowed, kept in pinned host memory
+and streamed to the GPU in chunks every step. May we keep it on the host in a lossless compressed
+form (12 bits per value instead of 16: a sign + 7 mantissa bits byte and a 4-bit exponent-class code
+into a per-chunk table, plus a list of 15 exceptions) and decompress each chunk on the GPU with our
+own Triton kernel back to fp16 right before the GEMMs? The values and dtypes fed to the ops are
+bit-identical to the base's fp16 weight: at load time every chunk is decoded with the same kernel
+and compared with the fp16 chunk, and any mismatch turns the compression off. The compressed form is
+rebuilt from the checkpoint in every run (nothing is cached between runs); building and decoding it
+are inside the measured time.
+
+The exit release needs no question in our reading (no os._exit, no skipped finalization, no
+background process; memory that training no longer uses is handed back on a thread while Soup
+saves); if the orchestrator prefers to ask: «Можно ли после последнего шага обучения освобождать
+pinned-буферы оффлоада и снимать регистрацию pinned-памяти весов в потоке, пока Soup сохраняет
+адаптер (значения весов остаются в обычной памяти, все выходы пишутся как раньше), и выключать
+сборщик мусора после последнего шага?»
