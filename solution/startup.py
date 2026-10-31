@@ -269,7 +269,82 @@ def prepare_imports(log=True, trl=True):
 
 # ---------------------------------------------------------------- imports in a thread
 
-_THREAD = {"thread": None, "error": None, "seconds": {}, "start": None, "done": None}
+_THREAD = {"thread": None, "error": None, "seconds": {}, "start": None, "done": None, "retried": 0}
+
+
+class _ImportRetry(BaseException):
+    """A main-thread import that failed because of the import thread (an import-lock deadlock, a
+    partially initialized module), carried past `except Exception` to the outermost import, which
+    joins the thread and imports again. BaseException: the import code in between must not take
+    it for a missing optional module."""
+
+
+_GUARD = {"main": None, "depth": 0, "originals": None}
+
+
+def _concurrent(exc):
+    """Whether a nested import error can come from the other thread holding a module lock."""
+    if type(exc).__name__ == "_DeadlockError":  # importlib._bootstrap: raised to the importer
+        return True
+    # an `import x` statement of a module in sys.modules accepts it partially initialized on a
+    # deadlock (_lock_unlock_module), and the next `from x import y` or `x.y` fails
+    return isinstance(exc, (ImportError, AttributeError)) and "partially initialized" in str(exc)
+
+
+def _guarded(original):
+    """`original` (builtins.__import__ or importlib.import_module) for the window of the import
+    thread: on the main thread, an import that fails while the thread runs is imported again after
+    the join, on the plain path (_DeadlockError is not caught by importlib when it enters a module
+    lock, importlib/_bootstrap.py `_ModuleLock.acquire`, so it would reach Soup's code)."""
+
+    def guarded(*args, **kwargs):
+        if threading.get_ident() != _GUARD["main"] or _GUARD["originals"] is None:
+            return original(*args, **kwargs)
+        depth = _GUARD["depth"]
+        _GUARD["depth"] = depth + 1
+        try:
+            return original(*args, **kwargs)
+        except _ImportRetry as exc:
+            if depth:
+                raise
+            failure = exc.args[0]
+        except Exception as exc:  # noqa: BLE001 - redone below, or passed on as it was
+            if depth:
+                if _concurrent(exc) and _GUARD["originals"] is not None:
+                    raise _ImportRetry(exc) from exc
+                raise
+            failure = exc
+        finally:
+            _GUARD["depth"] = depth
+        # outermost import of the main thread: no module lock of ours is held any more
+        _THREAD["retried"] += 1
+        if not join_import_thread(timeout=20.0):
+            raise failure
+        return original(*args, **kwargs)
+
+    guarded._soup_import_guard = original
+    return guarded
+
+
+def _install_guard():
+    import builtins
+
+    _GUARD.update(main=threading.get_ident(), depth=0,
+                  originals=(builtins.__import__, importlib.import_module))
+    builtins.__import__ = _guarded(builtins.__import__)
+    importlib.import_module = _guarded(importlib.import_module)
+
+
+def _remove_guard():
+    import builtins
+
+    originals, _GUARD["originals"] = _GUARD["originals"], None
+    if originals is None:
+        return
+    if getattr(builtins.__import__, "_soup_import_guard", None) is originals[0]:
+        builtins.__import__ = originals[0]
+    if getattr(importlib.import_module, "_soup_import_guard", None) is originals[1]:
+        importlib.import_module = originals[1]
 
 
 def _import_thread_run(patch, shortcuts):
@@ -303,10 +378,11 @@ def start_import_thread(patch, shortcuts=True):
         patch()
         return False
     _THREAD.update(error=None, seconds={}, start=time.perf_counter(), done=None, patch=patch,
-                   shortcuts=shortcuts)
+                   shortcuts=shortcuts, retried=0)
     thread = threading.Thread(target=_import_thread_run, args=(patch, shortcuts),
                               name="soup-import", daemon=True)
     _THREAD["thread"] = thread
+    _install_guard()  # until the join: main-thread imports that collide with the thread are redone
     thread.start()
     return True
 
@@ -329,19 +405,24 @@ def patch_soup_import_join():
     cls.setup = setup
 
 
-def join_import_thread():
-    """Waits for start_import_thread's thread (once); if it failed, its work on this thread."""
+def join_import_thread(timeout=None):
+    """Waits for start_import_thread's thread (once); if it failed, its work on this thread.
+    Returns False only when `timeout` ran out (the thread is then left as it is)."""
     thread = _THREAD["thread"]
     if thread is None:
-        return
-    _THREAD["thread"] = None
+        return True
     begin = time.perf_counter()
-    thread.join()
+    thread.join(timeout)
+    if thread.is_alive():
+        return False
+    _THREAD["thread"] = None
+    _remove_guard()
     waited = time.perf_counter() - begin
     seconds, error = _THREAD["seconds"], _THREAD["error"]
     took = (_THREAD["done"] or begin) - _THREAD["start"]
     print("[solution] import thread: " + ", ".join(f"{name} {s:.2f} s" for name, s in seconds.items())
-          + f"; done {took:.2f} s after its start, main thread waited {waited:.2f} s at setup"
+          + f"; done {took:.2f} s after its start, main thread waited {waited:.2f} s at "
+          + ("a failed import, redone" if _THREAD["retried"] else "setup")
           + f"; loaded of {', '.join(_SKIPPED)}: {', '.join(n for n in _SKIPPED if n in sys.modules) or 'none'}"
           + (f"; failed ({error!r}), redone here" if error is not None else ""), flush=True)
     if error is not None:
@@ -351,6 +432,7 @@ def join_import_thread():
             except Exception:  # noqa: BLE001 - the patch imports what it needs itself
                 pass
         _THREAD["patch"]()
+    return True
 
 
 # ---------------------------------------------------------------- diagnostics: profile of the setup
