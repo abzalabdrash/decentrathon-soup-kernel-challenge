@@ -219,3 +219,22 @@ Function per decoder block would remove at most the attention's 0.34 ms plus the
 MLP's node round trips (3 x 33 us) and their glue: about 0.5 ms, 6-7 % of the layer. Below the 15-20 %
 threshold of the review: **not rewritten**. Most of what a merge saves is the Python glue between
 nodes (three -> two: 0.27 ms, of which one node's round trip is 0.03 ms), not the autograd node itself.
+
+### 5. ABBA of 2 + 3 (peagverr, soup-c1-abba5, 3e347e7 = ce27a54 + two nodes + host ids; `main` = the same commit with `ATTN_TWO_NODES=0, HOST_IDS=0`, i.e. ce27a54's paths; 2 rounds ABBA + warm run, with pytest)
+
+| variant | wall s | steps 3+ s | median | < 600 tok ms | 600-900 ms | >= 900 ms | nvidia-smi | reserved | alloc peak | own |
+|---|---|---|---|---|---|---|---|---|---|---|
+| main path | 41.69 / 41.89 | 23.70 / 23.54 | 0.383 | 265.2 / 263.7 | 346.8 / 343.9 | 505.7 / 502.8 | 371 | 250 | 225.5 | 14.3 / 14.4 % |
+| two nodes + host ids | 41.79 / 41.89 | 23.57 / 23.51 | 0.379 | 260.5 / 262.4 | 345.3 / 343.8 | 504.0 / 502.4 | 371 | 250 | 225.5 | 14.3 / 14.4 % |
+
+Per step (mean of two runs each): < 400 tokens -3.3 ms, 400-500 -5.0, 500-600 -1.9, 600-900 -0.8,
+>= 900 -1.0. Steps 3+ -0.08 s, wall +0.05 s: **in the noise** (below the 0.3 s mark). Memory the same
+in every run (371 / 250 / 225.5 MiB). `64 lookups with host ids` in each c1 run (0 in main). T4 pytest
+**405 passed, 5 skipped, 0 failed**; checks 3, 4, 9 pass in all five runs. Session note: the poller's
+download broke mid-run (IncompleteRead) and returned three runs; `--attach` fetched the rest (output
+dir 20261031-120802).
+
+Why so little: the bench's -0.27 ms of host time per layer applies only where the CPU is the
+bottleneck, the forward of the ~12 short steps (prof_1: the GPU 0.6-3 ms behind there); the
+backward of short steps and every pass of the longer steps are GPU-bound. The CPU side of the step
+has about this much left on the public rows; further CPU cuts are worth < 0.1 s each.
