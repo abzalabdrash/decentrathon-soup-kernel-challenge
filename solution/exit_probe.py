@@ -131,6 +131,14 @@ def _install():
         state["after_main"] = True
         add("main_end=%.6f" % now())
         write(2, b"[exit-probe-main-end]\n")  # the parent starts polling /proc
+        if os.environ.get("EXIT_PROBE_FINALIZERS"):  # what weakref.finalize will run at exit, by callback
+            import collections
+            import weakref
+
+            counts = collections.Counter(
+                "%s.%s" % (getattr(info.func, "__module__", "?"), getattr(info.func, "__qualname__", "?"))
+                for info in list(weakref.finalize._registry.values()) if info.atexit)
+            write(2, ("[exit-probe-finalizers] %s\n" % sorted(counts.items(), key=lambda kv: -kv[1])).encode())
 
     def atexit_end():
         add("atexit_end=%.6f" % now())
