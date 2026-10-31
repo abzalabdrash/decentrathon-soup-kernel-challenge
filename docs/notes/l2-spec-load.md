@@ -124,3 +124,13 @@ time allows: pageable early buffers (no cudaHostRegister next to the main thread
 registration chunks. WARMUP_NICE=19 alone: -0.22 s first step on Modal (one session), not measured on Kaggle.
 The remaining start is GIL-bound work that cannot move: imports 3.1 s, the dill hash 2.9 s, Soup's CLI and
 tokenizer ~1 s; with the load fully hidden the floor is ~8.5-9 s from apply begin.
+
+## Final state at the code freeze (31 Oct)
+
+The final candidate (6c426d1, the orchestrator's merge of main + H2 + this branch) has LOAD_ONE_SYNC and
+TRACKER_THREAD on by default; LOAD_EARLY, LOAD_SPEC, LOAD_PREPIN, LOAD_EARLY_START, META_INIT and
+WARMUP_NICE stay off (host-dependent or unproven: Kaggle v3 -0.61 s first step for the load set, Modal m1/m2
++0.7 s). The deciding Kaggle ABBA (soup-l2-kag-abba on 7c0d52e: base / late / small / all without
+META_INIT, launched by the orchestrator) had no results in runs_kaggle/ when this branch stopped. Not done:
+pageable early buffers (no cudaHostRegister next to the main thread's CUDA calls), the likely fix of the
+host dependence.
