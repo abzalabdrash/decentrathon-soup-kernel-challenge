@@ -45,6 +45,16 @@ def close(actual, expected, rtol=1e-3):
     return diff
 
 
+@pytest.fixture(params=[False, True], ids=["diet_off", "diet_on"])
+def diet(request, monkeypatch):
+    """The stream-ordering tests run with SOUP_SOLUTION_STREAM_DIET both ways (pooled events, one
+    wait for the newest copy), whatever the environment's default."""
+    from solution import offload
+
+    monkeypatch.setattr(offload, "DIET", request.param)
+    return request.param
+
+
 @pytest.fixture(scope="module")
 def net():
     from solution.bench_offload import Net, step
@@ -171,7 +181,7 @@ def test_offload_two_independent_branches(order):
     torch.cuda.empty_cache()
 
 
-def test_slot_reuse_waits_for_a_read_on_another_stream():
+def test_slot_reuse_waits_for_a_read_on_another_stream(diet):
     """A slot read back by an H2D copy on stream A (held up by a sleep) is reused for a tensor
     packed on stream B: its D2H must wait for that read, or the backward on A reads the new data.
     On a GPU whose copies in both directions share one queue in submission order (the WSL2 laptop
@@ -206,7 +216,7 @@ def test_slot_reuse_waits_for_a_read_on_another_stream():
     scenario(SLEEP)
 
 
-def test_gpu_tensor_kept_until_its_copy_is_done():
+def test_gpu_tensor_kept_until_its_copy_is_done(diet):
     """The D2H is held up by a sleep on the offload stream while the forward frees and reallocates
     memory: the saved tensor's block must not be handed out before the copy has read it."""
     from solution.offload import Offloader
@@ -235,7 +245,7 @@ def test_gpu_tensor_kept_until_its_copy_is_done():
     scenario(SLEEP)
 
 
-def test_prefetched_tensor_waits_for_its_copy():
+def test_prefetched_tensor_waits_for_its_copy(diet):
     """Each prefetch H2D is queued behind a sleep on the offload stream: the backward must wait
     for it instead of reading the uninitialized (NaN-filled) block."""
     from solution.offload import Offloader
@@ -270,7 +280,7 @@ def test_prefetched_tensor_waits_for_its_copy():
     scenario(SLEEP)
 
 
-def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(monkeypatch):
+def test_single_stream_training_path_has_no_record_stream_and_no_cpu_wait(diet, monkeypatch):
     """Forward and backward on one stream (the training run): every copy, drop and prefetch is
     ordered by stream waits on events; no record_stream for the allocator to track, no CPU-side
     wait (the CPU keeps running ahead of the GPU). The values still come back exactly."""

@@ -5,7 +5,7 @@ point, and fused_proj's MLP with its (gate|up) offloaded as int8 against the hal
 import pytest
 import torch
 
-from solution.test_offload import restore_classes  # noqa: F401
+from solution.test_offload import diet, restore_classes  # noqa: F401
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 
@@ -140,7 +140,7 @@ def _chain(values, early, delay):
 
 
 @pytest.mark.parametrize("knobs", [{}, {"prefetch": 0}, {"max_inflight": 4}])
-def test_int8_handles_through_every_way_back(int8_on, knobs):
+def test_int8_handles_through_every_way_back(int8_on, diet, knobs):
     """Six (gate|up)-shaped tensors offloaded early as int8: the backward gets each one rebuilt from
     its int8 form (the product of all of them, exactly), whichever way it came back."""
     tokens = 256
@@ -267,7 +267,7 @@ def test_fused_mlp_offloaded_as_int8(int8_on, monkeypatch, restore_classes):
         assert err < 0.02
 
 
-def test_no_record_stream_and_no_cpu_wait_on_the_int8_path(int8_on, monkeypatch):
+def test_no_record_stream_and_no_cpu_wait_on_the_int8_path(int8_on, diet, monkeypatch):
     """The int8 path keeps the offload's stream rules on the training path (one stream): no
     record_stream, no CPU wait on an event; the values come back as the kernels rebuild them."""
     import threading

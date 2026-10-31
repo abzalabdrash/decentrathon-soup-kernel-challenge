@@ -352,12 +352,17 @@ def test_stream_memory(cuda_bytes):
 SLEEP_CYCLES = 15_000_000
 
 
+@pytest.mark.parametrize("diet", [False, True], ids=["diet_off", "diet_on"])
 @pytest.mark.parametrize("slots", [2, 3])
-def test_slot_not_overwritten_while_read(slots):
+def test_slot_not_overwritten_while_read(slots, diet, monkeypatch):
     """With the GPU far behind the CPU, a copy that did not wait for the compute queued before it
-    would overwrite a slot that a layer (forward or backward) has not read yet."""
+    would overwrite a slot that a layer (forward or backward) has not read yet (with and without
+    SOUP_SOLUTION_STREAM_DIET's direct event calls)."""
+    from solution import weight_stream
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
+
+    monkeypatch.setattr(weight_stream, "_DIET", diet)
 
     patch_bnb_matmul4bit()
     blocks = make_stack(sleep=SLEEP_CYCLES)
