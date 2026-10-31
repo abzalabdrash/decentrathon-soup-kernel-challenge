@@ -48,6 +48,16 @@ def _sorted_inputs(n, frac_labelled, scale, seed):
     return hidden[order].contiguous(), t, int((t != -100).sum())
 
 
+@pytest.fixture(autouse=True)
+def _pure_int8_math(monkeypatch):
+    """The int8 pass alone (no rescoring of near-ties, no loss correction): what _reference computes;
+    test_rescoring_against_the_fp16_head switches both back on."""
+    from solution import head_int8
+
+    monkeypatch.setattr(head_int8, "DELTA", 0.0)
+    monkeypatch.setattr(head_int8, "LOSS_FIX", False)
+
+
 def _run(streamer, int8, h16, t, n_lab, grad_scale):
     int8.calls = max(int8.calls, 100)  # past the switch point
     before = streamer.int8_heads
@@ -263,6 +273,70 @@ def test_forward_row_blocks_change_nothing(streamed, monkeypatch):
     b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
     for x, y in zip(a, b):
         assert torch.equal(x, y)
+
+
+@pytest.mark.parametrize("n,frac,scale", [(826, 0.6, 1.0), (300, 1.0, 4.0), (1, 1.0, 1.0)])
+def test_rescoring_against_the_fp16_head(streamed, monkeypatch, n, frac, scale):
+    """Near-ties rescored with exact logits: the int8 head's correctness equals the fp16 head's (no
+    argmax flips), and the loss correction brings every row's loss closer to the fp16 head's."""
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(n, frac, scale, seed=50 + n)
+    int8.calls = -1000  # before the switch point: the fp16 ring
+    streamer.prefetch(n)
+    fp16 = streamer.head(h16, t, n_lab, 1.0 / n_lab)
+    plain = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    monkeypatch.setattr(head_int8, "DELTA", 1.0)
+    monkeypatch.setattr(head_int8, "LOSS_FIX", True)
+    fixed = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    lab = t != -100
+    assert torch.equal(fixed[2][lab], fp16[2][lab])
+    err_plain = (plain[0][lab] - fp16[0][lab]).abs()
+    err_fixed = (fixed[0][lab] - fp16[0][lab]).abs()
+    assert err_fixed.mean() < 0.5 * err_plain.mean()
+    assert torch.equal(fixed[1], plain[1]) and torch.equal(fixed[3], plain[3])  # entropy and dL/dh untouched
+    assert torch.equal(fixed[0][~lab], plain[0][~lab])
+
+
+def test_int8_head_on_real_hidden_states(monkeypatch):
+    """Three steps of the task's rows through Qwen2.5-1.5B-Instruct (fp16, from the local Hugging Face
+    cache; skipped without it): the int8 head (smoothing, rescoring, loss correction as in the run)
+    against the fp16 streamed head on the same final hidden states: the step's loss, TRL's entropy and
+    accuracy, Soup's rewind row losses. Measured locally: 0.045 / 0.19 / 0.04 / 0.09 % (6 steps)."""
+    import os
+
+    from solution import head_int8
+    from solution.bench_head_int8_real import hidden_steps, step_gaps
+    from solution.head_stream import HeadStreamer
+
+    data = os.environ.get("SOUP_SOLUTION_TEST_DATA") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "train.jsonl")
+    if not os.path.exists(data):
+        pytest.skip("no data/train.jsonl")
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", local_files_only=True)
+        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", dtype=torch.float16,
+                                                     local_files_only=True).cuda().eval()
+    except Exception as exc:  # noqa: BLE001 - no cached checkpoint
+        pytest.skip(f"no cached checkpoint: {exc!r}")
+    monkeypatch.setattr(head_int8, "DELTA", 1.0)
+    monkeypatch.setattr(head_int8, "LOSS_FIX", True)
+    param = torch.nn.Parameter(model.get_input_embeddings().weight.detach().clone(), requires_grad=False)
+    streamer = HeadStreamer(param, rows=4096, slots=2, norm=model.model.norm)
+    try:
+        int8 = streamer.start_int8(defer=False)
+        int8.join()
+        assert int8.ready and int8.smoothed, int8.error
+        gaps = [step_gaps(streamer, int8, *step) for step in hidden_steps(model, tok, data, steps=3)]
+    finally:
+        streamer.restore()
+        del model
+    mean = [sum(g[k] for g in gaps) / len(gaps) for k in range(4)]
+    for name, value, limit in zip(("loss", "entropy", "accuracy", "rewind"), mean, (0.002, 0.005, 0.003, 0.003)):
+        assert value < limit, (name, value, gaps)
 
 
 def test_eval_logits_stay_fp16(streamed):

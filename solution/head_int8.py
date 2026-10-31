@@ -37,6 +37,13 @@ and chunk c of the vocabulary:
     G_c = P_q @ Q_c                                int32 (n_lab, D), `_int_mm`, labelled rows only
     head_i8_acc_kernel (own): acc = acc * exp(m_old - m_new) + G_c * scale_P (fp32)
     head_finish_kernel (head_stream.py): loss, entropy, correctness, dL/dh = (acc / s - W_q[t]) * g
+    head_i8_rescore_kernel (own, labelled rows): the accuracy and the loss from exact logits where
+        int8 rounding matters: a row whose int8 top two (or top and target) are closer than DELTA
+        takes the exact fp16 logits of these tokens (their fp16 rows read from the pinned host copy
+        by the kernel, over PCIe) for its argmax, and every labelled row's loss is corrected to first
+        order with the exact logits of its top two and its target (real hidden states, 6 steps of
+        the public rows, against the fp16 head: accuracy 0.92 -> 0.04 %, loss 0.15 -> 0.05 %, rewind
+        rows 0.41 -> 0.09 %; entropy 0.19 % as is; dL/dh is the int8 head's, untouched)
 The int32 logits never exist for more than one chunk; nothing of shape (N, V) is made.
 
 Numerics: the forward sees W_q and h_q instead of W and h (per-row / per-token absmax int8, round
@@ -48,8 +55,8 @@ and dL/dh are not finite either and GradScaler skips the step as in the base.
 Which heads take this path never depends on timing: the first START_HEADS heads of the run (the
 kernels compile and the int8 copy is built meanwhile) and any head when the build failed take the
 fp16 path; head START_HEADS + 1 waits for the thread if it is not done. Switches (environment):
-SOUP_SOLUTION_HEAD_INT8 (on by default in the `soup train` process only, as int8_bwd.py; pytest
-keeps the fp16 head), SOUP_SOLUTION_HEAD_INT8_START (START_HEADS), SOUP_SOLUTION_HEAD_INT8_AT
+SOUP_SOLUTION_HEAD_INT8 (on by default in every process; solution/conftest.py pins the fp16 head
+for solution's own tests, test_head_int8.py switches it on), SOUP_SOLUTION_HEAD_INT8_START (START_HEADS), SOUP_SOLUTION_HEAD_INT8_AT
 (where the build thread starts: "setup", the end of Soup's setup, or "head", the run's first head),
 SOUP_SOLUTION_HEAD_INT8_WARM (where the kernels compile: "thread" or "warmup"),
 SOUP_SOLUTION_HEAD_INT8_SMOOTH / _ALPHA (smoothing()), SOUP_SOLUTION_HEAD_INT8_FWD_ROWS,
@@ -69,7 +76,13 @@ import triton.language as tl
 from .fused_ce import IGNORE_INDEX
 from .head_stream import BLOCK_D, head_finish_kernel
 
-START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "4"))
+_STATE = {"on": os.environ.get("SOUP_SOLUTION_HEAD_INT8", "1").strip().lower() not in ("0", "false", "no", "")}
+START_HEADS = int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_START", "5"))
+# the accuracy's rescoring (head_i8_rescore_kernel): rows whose int8 top two (or top and target) are
+# closer than DELTA logits take exact logits for these tokens; DELTA <= 0 switches it off
+DELTA = float(os.environ.get("SOUP_SOLUTION_HEAD_INT8_DELTA", "1.0"))
+# SOUP_SOLUTION_HEAD_INT8_LOSS_FIX: the first-order loss correction of every labelled row (above)
+LOSS_FIX = os.environ.get("SOUP_SOLUTION_HEAD_INT8_LOSS_FIX", "1").strip().lower() not in ("0", "false", "no", "")
 # where the build thread starts: "head" (the first head; soup-h1-abba2: setup end -> train begin +0.07 s against
 # +0.35 s for "setup", the end of Soup's setup, where the thread fought the trainer build for the GIL)
 BUILD_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_AT", "head").strip().lower()
@@ -110,10 +123,9 @@ def smoothing(streamer):
 
 
 def enabled():
-    from .int8_bwd import _soup_train_process
-
-    default = "1" if _soup_train_process() else "0"
-    return os.environ.get("SOUP_SOLUTION_HEAD_INT8", default).strip().lower() not in ("0", "false", "no", "")
+    """SOUP_SOLUTION_HEAD_INT8 (on by default in every process; solution/conftest.py pins the fp16 head
+    for solution's own tests of it)."""
+    return _STATE["on"]
 
 
 @triton.jit(do_not_specialize=["row0", "first", "c0", "vc", "n_lab"])
@@ -124,6 +136,7 @@ def head_i8_chunk_kernel(
     targets_ptr,  # int64 (rows,): target token id or IGNORE
     m_ptr, s_ptr, e_ptr, best_ptr, xt_ptr,  # fp32 (rows,): running max, sum, entropy sum, best, x_t
     idx_ptr,  # int32 (rows,): running argmax
+    best2_ptr, idx2_ptr,  # fp32, int32 (n_lab,): the running runner-up (head_i8_rescore_kernel)
     alpha_ptr, sp_ptr,  # fp32 (n_lab,): exp(m_old - m_new) and P's scale for this chunk
     q_ptr, stride_q,  # int8 (vc, D): the chunk of Q on the GPU
     wt_ptr, stride_wt,  # half (n_lab, D): W_q[target], written by the chunk that holds the target
@@ -159,6 +172,7 @@ def head_i8_chunk_kernel(
         best = tl.load(best_ptr + row)
         best_idx = tl.load(idx_ptr + row)
         x_t = tl.load(xt_ptr + row)
+    best_old, idx_old = best, best_idx
     m_new = tl.maximum(m_old, c_max)
     alpha = tl.exp(m_old - m_new)
     p = tl.exp(x - m_new)
@@ -181,6 +195,22 @@ def head_i8_chunk_kernel(
         tl.store(pq_ptr + row.to(tl.int64) * stride_pq + offs, pq, mask=mask)
         tl.store(sp_ptr + row, u_max / 127.0)
         tl.store(alpha_ptr + row, alpha)
+        # the runner-up: the chunk's second largest, merged with the running two (earlier ids win ties)
+        x2 = tl.where(offs == c_idx, -float("inf"), x)
+        c_max2, c_idx2 = tl.max(x2, axis=0, return_indices=True, return_indices_tie_break_left=True)
+        b2 = -float("inf")
+        i2 = 0
+        if first == 0:
+            b2 = tl.load(best2_ptr + row)
+            i2 = tl.load(idx2_ptr + row)
+        up = c_max > best_old
+        keep_v = tl.where(up, best_old, b2)
+        keep_i = tl.where(up, idx_old, i2)
+        new_v = tl.where(up, c_max2, c_max)
+        new_i = tl.where(up, c0 + c_idx2, c0 + c_idx)
+        take = new_v > keep_v
+        tl.store(best2_ptr + row, tl.where(take, new_v, keep_v))
+        tl.store(idx2_ptr + row, tl.where(take, new_i, keep_i))
         if hit:
             q_row = q_ptr + t_local * stride_q
             wt_row = wt_ptr + row.to(tl.int64) * stride_wt
@@ -189,6 +219,57 @@ def head_i8_chunk_kernel(
                 md = od < D
                 w = tl.load(q_row + od, mask=md, other=0).to(tl.float32) * sv_t
                 tl.store(wt_row + od, w.to(wt_ptr.dtype.element_ty), mask=md)
+
+
+@triton.jit(do_not_specialize=["n_lab"])
+def head_i8_rescore_kernel(
+    h_ptr, stride_h,  # half (n, D): the hidden rows (labelled first)
+    w_ptr, stride_w,  # half (V, D): the exact weight in pinned host memory, read over PCIe (mapped)
+    targets_ptr, idx_ptr, idx2_ptr, best_ptr, best2_ptr, xt_ptr,  # the int8 pass's top two and target
+    m_ptr, s_ptr,  # fp32 (n,): the int8 pass's max and sum (its lse)
+    correct_ptr, loss_ptr,  # int32 (n,): rewritten for the rows rescored; fp32 (n,): corrected (FIX_LOSS)
+    delta, n_lab, D,
+    BLOCK_D: tl.constexpr, FIX_LOSS: tl.constexpr,
+):
+    # TRL's accuracy is argmax(logits) == label; int8 logits flip near-ties (1-2 % of the labelled rows
+    # on real hidden states). A labelled row whose int8 top two, or its top and its target, are less
+    # than delta apart takes the exact logits of these (at most three) tokens: fp16 weight rows from the
+    # host copy, the fp16 hidden row, an fp32 dot rounded to fp16 as the base's fp16 GEMM output, the
+    # first id among equal values as torch.argmax. FIX_LOSS (every labelled row): the loss to first
+    # order with these exact logits in place of the int8 ones, lse - x_t corrected by
+    # sum_k p_k (x8_k - x_k) - (x8_t - x_t) over the top two and the target (p from the int8 pass)
+    row = tl.program_id(0)
+    t = tl.load(targets_ptr + row).to(tl.int32)
+    a1 = tl.load(idx_ptr + row)
+    a2 = tl.load(idx2_ptr + row)
+    b1 = tl.load(best_ptr + row)
+    b2 = tl.load(best2_ptr + row)
+    x_t = tl.load(xt_ptr + row)
+    near = (b1 - b2 < delta) | ((a1 != t) & (b1 - x_t < delta))
+    if near | FIX_LOSS:
+        od = tl.arange(0, BLOCK_D)
+        md = od < D
+        h = tl.load(h_ptr + row.to(tl.int64) * stride_h + od, mask=md, other=0.0).to(tl.float32)
+        w1 = tl.load(w_ptr + a1.to(tl.int64) * stride_w + od, mask=md, other=0.0).to(tl.float32)
+        w2 = tl.load(w_ptr + a2.to(tl.int64) * stride_w + od, mask=md, other=0.0).to(tl.float32)
+        wt = tl.load(w_ptr + t.to(tl.int64) * stride_w + od, mask=md, other=0.0).to(tl.float32)
+        x1 = tl.sum(h * w1, axis=0).to(tl.float16).to(tl.float32)
+        x2 = tl.sum(h * w2, axis=0).to(tl.float16).to(tl.float32)
+        xt = tl.sum(h * wt, axis=0).to(tl.float16).to(tl.float32)
+        win_v, win_i = x1, a1
+        take = (x2 > win_v) | ((x2 == win_v) & (a2 < win_i))
+        win_v = tl.where(take, x2, win_v)
+        win_i = tl.where(take, a2, win_i)
+        take = (xt > win_v) | ((xt == win_v) & (t < win_i))
+        win_i = tl.where(take, t, win_i)
+        if near:
+            tl.store(correct_ptr + row, (win_i == t).to(tl.int32))
+        if FIX_LOSS:
+            lse = tl.load(m_ptr + row) + tl.log(tl.load(s_ptr + row))
+            other = (t != a1) & (t != a2)
+            fix = tl.exp(b1 - lse) * (b1 - x1) + tl.exp(b2 - lse) * (b2 - x2) - (x_t - xt)
+            fix = fix + tl.where(other, tl.exp(x_t - lse) * (x_t - xt), 0.0)
+            tl.store(loss_ptr + row, tl.load(loss_ptr + row) - fix)
 
 
 @triton.jit
@@ -434,9 +515,10 @@ class HeadInt8:
         h_q = torch.empty(n_pad, d, dtype=torch.int8, device=dev)
         s_h = quant_rows(hidden16, h_q, self.inv_col)
         stride = -(-n // 4) * 4  # 16-byte aligned rows of the state, whatever n
-        state = torch.empty(5, stride, dtype=torch.float32, device=dev)
-        m, s, e, best, x_t = state
-        idx = torch.empty(n, dtype=torch.int32, device=dev)
+        state = torch.empty(6, stride, dtype=torch.float32, device=dev)
+        m, s, e, best, x_t, best2 = state
+        indices = torch.empty(2, stride, dtype=torch.int32, device=dev)
+        idx, idx2 = indices[0, :n], indices[1]
         lab = max(n_lab, 1)
         wt = torch.empty(lab, d, dtype=hidden16.dtype, device=dev)
         alpha_sp = torch.empty(2, -(-lab // 4) * 4, dtype=torch.float32, device=dev)
@@ -464,7 +546,7 @@ class HeadInt8:
             for (b0, nb), (h_b, logits) in zip(blocks, gemms):
                 torch._int_mm(h_b, q.t(), out=logits)
                 head_i8_chunk_kernel[(nb,)](
-                    logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, alpha, sp,
+                    logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, best2, idx2, alpha, sp,
                     q, d, wt, wt.stride(0), int(c == 0), c0, vc, n_lab, d,
                     IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, num_warps=self.num_warps,
                 )
@@ -484,6 +566,11 @@ class HeadInt8:
             acc, acc.stride(0), wt, wt.stride(0), grad_scale, n_lab, d,
             IGNORE=IGNORE_INDEX, BLOCK_D=BLOCK_D, num_warps=4,
         )
+        if n_lab and (DELTA > 0 or LOSS_FIX) and st.host.is_pinned():
+            head_i8_rescore_kernel[(n_lab,)](
+                hidden16, hidden16.stride(0), st.host, st.host.stride(0), targets, idx, idx2, best, best2, x_t,
+                m, s, correct, loss, DELTA, n_lab, d, BLOCK_D=triton.next_power_of_2(d), FIX_LOSS=LOSS_FIX,
+                num_warps=4)
         if n_lab == 0:
             acc.zero_()
         elif self.smoothed:
@@ -510,7 +597,7 @@ def _join_at_exit(ref):
 
 
 def warm_kernels(obj=None):
-    """Compiles the four kernels for the classes the head launches (in the build thread)."""
+    """Compiles the five kernels for the classes the head launches (in the build thread)."""
     from .warmup import HIDDEN, compile_kernel, training_half_dtype
 
     half, f32, i8, i32, i64 = training_half_dtype(), torch.float32, torch.int8, torch.int32, torch.int64
@@ -520,11 +607,14 @@ def warm_kernels(obj=None):
     # stride_l = rows of the chunk (4096 and the last 384: divisible by 16), the hidden size 1536;
     # row0, first, c0, vc, n_lab not specialized
     compile_kernel(head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
-                   f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
+                   f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
                    IGNORE=IGNORE_INDEX, BLOCK=triton.next_power_of_2(rows), BLOCK_D=BLOCK_D, num_warps=warps)
     compile_kernel(head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK,
                    num_warps=4)
     compile_kernel(int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)
+    compile_kernel(head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, i32, f32, f32, f32, f32,
+                   f32, i32, f32, 1.0, 387, hidden, BLOCK_D=triton.next_power_of_2(hidden), FIX_LOSS=LOSS_FIX,
+                   num_warps=4)
     # the hidden rows (stride 1536) and, at the build, the weight's rows (fp16 on the T4, as the hidden rows)
     compile_kernel(int8_rows_kernel, half, hidden, f32, i8, hidden, f32, hidden,
                    BLOCK=triton.next_power_of_2(hidden), num_warps=QUANT_WARPS)
