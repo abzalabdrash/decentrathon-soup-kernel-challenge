@@ -200,3 +200,24 @@ pinned-буферы оффлоада и снимать регистрацию pi
   "solution.bench_pack_mem" --slug e1-pmem --commit <head>` (prints nvidia-smi memory.used after each step).
   If it is the registration, put the packed bytes in already-registered memory; then the pack is a small net
   win (-0.07..-0.24 s, 0 MiB) and can be enabled with SOUP_SOLUTION_HEAD_PACK_MAX_ROWS=800.
+
+## Follow-up on main ce27a54 (31 Oct, branch claude/e1-exit-attn)
+
+- Tests on the merged main (the orchestrator merged head_stream.py by hand with C1's slot views):
+  test_exit_release + test_head_pack 13/13 (test_streamed_head_packed_equals_fp16: the packed ring gives
+  the fp16 ring's bits), test_head_stream 15/15, Soup's 79 with apply() 79/79 (laptop). The pack branch
+  of `_load` / `_acquire` / the head loop reads the same as on the E1 branch.
+- ce27a54's commit message says the exit release is on by default, but `solution/__init__.py` still
+  reads `SOUP_SOLUTION_EXIT_RELEASE` with default "0" and no setdefault: it is off unless the
+  environment sets it (told the orchestrator).
+- The +2 MiB with HEAD_PACK=1 (T4, peagverr soup-e1-pmem, ce27a54, `solution.bench_pack_mem`,
+  nvidia-smi memory.used after each step): context 107 MiB; register 334 MiB of host memory +0;
+  register 1,090 MiB more +2; 10 pinned slabs of 256 MiB (cudaHostAlloc) +6; small tensors +16 (the
+  first allocations and kernels of the process); load `head_unpack_kernel`'s module +0; another
+  Triton module +0; unregister the 334 MiB +0. So it is the GPU-side mapping of page-locked host
+  memory (about one 2 MiB step per ~1 GB pinned or registered), not the kernel module: the pack's
+  334 MiB move our 645 + 445 + 2,560 MiB over the next step. Already-pinned memory with room for it is
+  only the offload's spare slabs (7 of 10 used on the public data, all 10 at 2,048-token rows, where
+  two slabs would be pinned again on demand, 130 ms each, and the step comes back). Verdict unchanged:
+  HEAD_PACK stays off (its gain is within the session noise and the organizers' answer on the packed
+  weight is pending); by the formula +2 MiB costs nothing while we have the best memory.
