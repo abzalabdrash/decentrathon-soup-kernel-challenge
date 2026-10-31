@@ -65,6 +65,7 @@ QUANT_ROWS = 1024  # vocabulary rows per quantization step of the build (transie
 ACC_BLOCK = 512
 # hidden rows per forward GEMM: the int32 logits of a chunk (FWD_ROWS x 4096 x 4 bytes, 16 MiB) are
 # twice the fp16 head's per row, so long steps take the forward in blocks of rows
+PBOUND = os.environ.get("SOUP_SOLUTION_HEAD_INT8_PBOUND", "0").strip().lower() not in ("0", "false", "no", "")
 FWD_ROWS = max(int(os.environ.get("SOUP_SOLUTION_HEAD_INT8_FWD_ROWS", "1024")) // 8 * 8, 24)
 
 
@@ -94,7 +95,7 @@ def enabled():
     return os.environ.get("SOUP_SOLUTION_HEAD_INT8", default).strip().lower() not in ("0", "false", "no", "")
 
 
-@triton.jit(do_not_specialize=["row0", "c0", "vc", "n_lab"])
+@triton.jit(do_not_specialize=["row0", "chunk", "c0", "vc", "n_lab"])
 def head_i8_chunk_kernel(
     l32_ptr, stride_l, row0,  # int32 (block rows, vc): this chunk's logits for rows row0 + i
     pq_ptr, stride_pq,  # int8 (n_lab, vc): P quantized, labelled rows
@@ -105,8 +106,10 @@ def head_i8_chunk_kernel(
     alpha_ptr, sp_ptr,  # fp32 (n_lab,): exp(m_old - m_new) and P's scale for this chunk
     q_ptr, stride_q,  # int8 (vc, D): the chunk of Q on the GPU
     wt_ptr, stride_wt,  # half (n_lab, D): W_q[target], written by the chunk that holds the target
+    svm_ptr, chunk,  # fp32 (chunks,): each chunk's largest s_v (PBOUND)
     c0, vc, n_lab, D,
     FIRST: tl.constexpr, IGNORE: tl.constexpr, BLOCK: tl.constexpr, BLOCK_D: tl.constexpr,
+    PBOUND: tl.constexpr,
 ):
     row = row0 + tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -154,7 +157,10 @@ def head_i8_chunk_kernel(
     tl.store(xt_ptr + row, x_t)
     if row < n_lab:
         u = p * sv  # s_v on the contraction axis of the backward GEMM goes into P
-        u_max = tl.max(u, axis=0)
+        if PBOUND:  # max u <= exp(c_max - m_new) * max s_v: no reduction (a coarser grid, up to max/min s_v)
+            u_max = tl.exp(c_max - m_new) * tl.load(svm_ptr + chunk)
+        else:
+            u_max = tl.max(u, axis=0)
         inv = tl.where(u_max > 0.0, 127.0 / u_max, 0.0)
         pq = tl.minimum(tl.floor(u * inv + 0.5), 127.0).to(tl.int8)
         tl.store(pq_ptr + row.to(tl.int64) * stride_pq + offs, pq, mask=mask)
@@ -242,7 +248,7 @@ class HeadInt8:
         self._source = streamer.host  # the fp16 host copy
         self._stop = threading.Event()
         self._thread = None
-        self.host = self._unpin = None
+        self.host = self._unpin = self.sv_max = None
         self.total_bytes = self.vocab * (self.hidden + 4)
         self.col = self.inv_col = None
         if smooth is not None:
@@ -306,6 +312,7 @@ class HeadInt8:
         dev = self.device
         # the default stream: the blocks allocated here go back to the pool training allocates from
         stream = torch.cuda.default_stream(dev)
+        sv_max = torch.empty(self.n_chunks, dtype=torch.float32, device=dev)
         with torch.cuda.stream(stream), torch.no_grad():
             for c in range(self.n_chunks):
                 if self._stop.is_set():
@@ -322,9 +329,10 @@ class HeadInt8:
                 if not bool(torch.isfinite(scales).all()):
                     unpin()
                     raise HeadSkipInt8(f"chunk {c}: a non-finite weight row")
+                sv_max[c] = scales.max()
                 host[b0:b0 + nb].copy_(out)  # synchronous: the pinned bytes are final after it
             stream.synchronize()
-        self.host, self._unpin = host, unpin
+        self.host, self._unpin, self.sv_max = host, unpin, sv_max
 
     # ---- which heads ---------------------------------------------------------------------------
 
@@ -395,9 +403,9 @@ class HeadInt8:
                 torch._int_mm(h_b, q.t(), out=logits)
                 head_i8_chunk_kernel[(nb,)](
                     logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, alpha, sp,
-                    q, d, wt, wt.stride(0), c0, vc, n_lab, d,
+                    q, d, wt, wt.stride(0), self.sv_max, c, c0, vc, n_lab, d,
                     FIRST=c == 0, IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D,
-                    num_warps=self.num_warps,
+                    PBOUND=PBOUND, num_warps=self.num_warps,
                 )
             if n_lab:
                 if NN:
@@ -456,8 +464,9 @@ def warm_kernels(obj=None):
     # stride_l = rows of the chunk (4096 and the last 384: divisible by 16), the hidden size 1536
     for first in (True, False):
         compile_kernel(head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
-                       f32, f32, i8, hidden, half, hidden, 0, rows, 387, hidden,
-                       FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, num_warps=warps)
+                       f32, f32, i8, hidden, half, hidden, f32, 3, 0, rows, 387, hidden,
+                       FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, PBOUND=PBOUND,
+                       num_warps=warps)
         compile_kernel(head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, hidden,
                        FIRST=first, BLOCK=ACC_BLOCK, num_warps=4)
     if not NN:

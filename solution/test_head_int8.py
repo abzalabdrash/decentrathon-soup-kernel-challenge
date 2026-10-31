@@ -210,6 +210,22 @@ def test_nonfinite_hidden_stays_nonfinite(streamed):
     assert torch.isfinite(loss[[0, 1, 2, 4, 6]]).all() and torch.isfinite(dh[[0, 1, 2, 4, 6]]).all()
 
 
+def test_bounded_p_scale(streamed, monkeypatch):
+    """PBOUND: P's scale from exp(c_max - m_new) * max s_v of the chunk (no reduction)."""
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    q, sv = _int8_weight(int8)
+    monkeypatch.setattr(head_int8, "PBOUND", True)
+    for n, frac, scale in ((826, 0.6, 1.0), (354, 0.3, 3.0)):
+        h16, t, n_lab = _sorted_inputs(n, frac, scale, seed=n)
+        out = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+        ref_loss, _, _, ref_dh, _ = _reference(h16, t, n_lab, 1.0 / n_lab, q, sv)
+        assert torch.allclose(out[0].double(), ref_loss, rtol=1e-4, atol=1e-4)
+        err = ((out[3][:n_lab].double() - ref_dh).norm() / ref_dh.norm()).item()
+        assert err < 2e-2, err
+
+
 def test_nn_backward_matches_transposed(streamed, monkeypatch):
     from solution import head_int8
 
