@@ -1,0 +1,202 @@
+"""The int8 streamed head (head_int8.py): the int8 copy against the fp16 host weight, the head against
+the same int8 math in fp64 (loss, entropy, correctness, dL/dh), the fp16 head it replaces, the
+deterministic switch point, rows without labels, tiny heads and non-finite hidden rows."""
+
+import pytest
+import torch
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+
+V, D, ROWS = 8 * 4096 + 384, 1536, 4096  # eight full chunks and the real model's 384-row tail
+
+
+@pytest.fixture(scope="module")
+def streamed():
+    from solution.head_stream import HeadStreamer
+
+    torch.manual_seed(0)
+    # rows of different magnitudes, as an embedding's (the per-row scales matter)
+    weight = (torch.randn(V, D, device="cuda") * 0.02 * torch.rand(V, 1, device="cuda").add_(0.3)).half()
+    param = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    streamer = HeadStreamer(param, rows=ROWS, slots=2)
+    int8 = streamer.start_int8()
+    int8.join()
+    assert int8.ready, int8.error
+    yield weight, streamer, int8
+    streamer.restore()
+
+
+def _int8_weight(int8):
+    """(Q (V, D) int8, s_v (V,) fp32) gathered from the host chunks."""
+    qs, ss = [], []
+    for c in range(int8.n_chunks):
+        _, vc, _, _ = int8.chunk(c)
+        raw = int8.host_chunk(c)
+        qs.append(raw[:vc * D].view(torch.int8).view(vc, D))
+        ss.append(raw[vc * D:].view(torch.float32))
+    return torch.cat(qs).cuda(), torch.cat(ss).cuda()
+
+
+def _sorted_inputs(n, frac_labelled, scale, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = (torch.randn(n, D, device="cuda", generator=gen) * scale).half()
+    hidden[:, 7] *= 12  # an outlier channel, as the model's final hidden states have
+    targets = torch.randint(0, V, (n,), device="cuda", generator=gen)
+    targets[torch.rand(n, device="cuda", generator=gen) >= frac_labelled] = -100
+    order = torch.argsort((targets != -100).to(torch.int8), descending=True, stable=True)
+    t = targets[order].contiguous()
+    return hidden[order].contiguous(), t, int((t != -100).sum())
+
+
+def _run(streamer, int8, h16, t, n_lab, grad_scale):
+    int8.calls = max(int8.calls, 100)  # past the switch point
+    before = streamer.int8_heads
+    streamer.prefetch(h16.shape[0])
+    out = streamer.head(h16, t, n_lab, grad_scale)
+    assert streamer.int8_heads == before + 1
+    return out
+
+
+def _reference(h16, t, n_lab, grad_scale, q, sv):
+    """The int8 head's math in fp64: per-token int8 hidden, int32-exact products, fp64 softmax."""
+    x = h16.float()
+    amax = x.abs().amax(1)
+    inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
+    hq = torch.floor(x * inv[:, None] + 0.5).clamp(-127, 127)
+    sh = (amax / 127.0).double()
+    logits = (hq.double() @ q.double().t()) * sh[:, None] * sv.double()[None, :]
+    lse = torch.logsumexp(logits, 1)
+    p = torch.softmax(logits, 1)
+    entropy = lse - (p * logits).sum(1)
+    lab = t != -100
+    tt = t.clamp_min(0)
+    loss = torch.where(lab, lse - logits.gather(1, tt[:, None])[:, 0], torch.zeros_like(lse))
+    correct = (lab & (logits.argmax(1) == tt)).int()
+    w_q = q.double() * sv.double()[:, None]
+    g = p[:n_lab].clone()
+    g[torch.arange(n_lab), tt[:n_lab]] -= 1
+    dh = (g @ w_q) * grad_scale
+    return loss, entropy, correct, dh, logits
+
+
+def test_int8_copy_matches_the_weight(streamed):
+    weight, _, int8 = streamed
+    q, sv = _int8_weight(int8)
+    w = weight.float()
+    amax = w.abs().amax(1)
+    assert torch.allclose(sv, amax / 127.0, rtol=1e-6, atol=0)
+    expect = torch.floor(w / sv[:, None] + 0.5).clamp(-127, 127)
+    # w / s_v in fp32 against w * (127 / amax): the rounding may differ at exact halves only
+    assert (q.float() - expect).abs().max().item() <= 1
+    assert (q.float() == expect).float().mean().item() > 0.9999
+
+
+@pytest.mark.parametrize("n,frac,scale", [(826, 0.6, 1.0), (354, 0.3, 3.0), (1440, 1.0, 1.0), (61, 0.5, 8.0)])
+def test_int8_head_matches_int8_math(streamed, n, frac, scale):
+    _, streamer, int8 = streamed
+    q, sv = _int8_weight(int8)
+    h16, t, n_lab = _sorted_inputs(n, frac, scale, seed=n)
+    grad_scale = 1.0 / max(n_lab, 1)
+    loss, entropy, correct, dh = _run(streamer, int8, h16, t, n_lab, grad_scale)
+    ref_loss, ref_entropy, ref_correct, ref_dh, logits = _reference(h16, t, n_lab, grad_scale, q, sv)
+    assert torch.allclose(loss.double(), ref_loss, rtol=1e-4, atol=1e-4)
+    assert torch.allclose(entropy.double(), ref_entropy, rtol=1e-4, atol=1e-4)
+    # the argmax may differ only where the two best logits tie to fp32 rounding
+    top2 = logits.topk(2, dim=1).values
+    tie = (top2[:, 0] - top2[:, 1]) < 1e-5 * top2[:, 0].abs().clamp_min(1)
+    assert torch.equal(correct[~tie], ref_correct[~tie])
+    # dL/dh: P quantized per row and chunk (and W_q[target] rounded to fp16)
+    err = (dh[:n_lab].double() - ref_dh).norm() / ref_dh.norm()
+    assert err.item() < 1e-2, err.item()
+
+
+def test_int8_head_close_to_the_fp16_head(streamed):
+    weight, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(826, 0.6, 1.0, seed=5)
+    grad_scale = 1.0 / n_lab
+    int8.calls = -1000  # before the switch point: the fp16 ring
+    before = streamer.int8_heads
+    streamer.prefetch(826)
+    fp16 = streamer.head(h16, t, n_lab, grad_scale)
+    assert streamer.int8_heads == before
+    out = _run(streamer, int8, h16, t, n_lab, grad_scale)
+    lab = t != -100
+    rel = (out[0][lab].sum() / fp16[0][lab].sum() - 1).abs().item()
+    assert rel < 5e-3, rel
+    cos = torch.nn.functional.cosine_similarity(out[3][:n_lab].flatten(), fp16[3][:n_lab].flatten(), dim=0)
+    assert cos.item() > 0.99
+
+
+def test_switch_point_is_fixed(streamed, monkeypatch):
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    monkeypatch.setattr(head_int8, "START_HEADS", 2)
+    int8.calls = 0
+    h16, t, n_lab = _sorted_inputs(300, 0.5, 1.0, seed=3)
+    taken = []
+    for _ in range(4):
+        before = streamer.int8_heads
+        streamer.prefetch(300)
+        streamer.head(h16, t, n_lab, 1.0 / n_lab)
+        taken.append(streamer.int8_heads - before)
+    assert taken == [0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("n,frac", [(97, 0.0), (5, 1.0), (16, 0.5), (17, 1.0)])
+def test_int8_head_small_and_unlabelled(streamed, n, frac):
+    _, streamer, int8 = streamed
+    q, sv = _int8_weight(int8)
+    h16, t, n_lab = _sorted_inputs(n, frac, 1.0, seed=11 + n)
+    grad_scale = 1.0 / max(n_lab, 1)
+    loss, entropy, correct, dh = _run(streamer, int8, h16, t, n_lab, grad_scale)
+    ref_loss, ref_entropy, _, ref_dh, _ = _reference(h16, t, n_lab, grad_scale, q, sv)
+    assert torch.allclose(loss.double(), ref_loss, rtol=1e-4, atol=1e-4)
+    assert torch.allclose(entropy.double(), ref_entropy, rtol=1e-4, atol=1e-4)
+    if n_lab:
+        assert ((dh[:n_lab].double() - ref_dh).norm() / ref_dh.norm()).item() < 1e-2
+    else:
+        assert dh.shape == (1, D) and not dh.any()
+
+
+def test_nonfinite_hidden_stays_nonfinite(streamed):
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(200, 1.0, 1.0, seed=9)
+    h16[3, 100] = float("inf")
+    h16[5, 10] = float("nan")
+    loss, entropy, _, dh = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    for row in (3, 5):
+        assert not torch.isfinite(loss[row]) and not torch.isfinite(dh[row]).all()
+    assert torch.isfinite(loss[[0, 1, 2, 4, 6]]).all() and torch.isfinite(dh[[0, 1, 2, 4, 6]]).all()
+
+
+def test_nn_backward_matches_transposed(streamed, monkeypatch):
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(400, 0.7, 1.0, seed=21)
+    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    monkeypatch.setattr(head_int8, "NN", True)
+    b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_forward_row_blocks_change_nothing(streamed, monkeypatch):
+    from solution import head_int8
+
+    _, streamer, int8 = streamed
+    h16, t, n_lab = _sorted_inputs(700, 0.6, 1.0, seed=31)
+    a = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    monkeypatch.setattr(head_int8, "FWD_ROWS", 96)  # 7 full blocks and a 28-row tail
+    b = _run(streamer, int8, h16, t, n_lab, 1.0 / n_lab)
+    for x, y in zip(a, b):
+        assert torch.equal(x, y)
+
+
+def test_eval_logits_stay_fp16(streamed):
+    """eval and generation (the lm_head override) read the fp16 host copy, not the int8 one."""
+    weight, streamer, _ = streamed
+    x = torch.randn(3, 5, D, device="cuda")
+    out = streamer.linear(x)  # the virtual dtype (fp32) outside autocast, as the base
+    assert torch.allclose(out, x @ weight.float().t(), rtol=1e-4, atol=1e-4)

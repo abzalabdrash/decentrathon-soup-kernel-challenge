@@ -299,6 +299,8 @@ class HeadStreamer:
         # heads of more rows than pack_max_rows (SOUP_SOLUTION_HEAD_PACK_MAX_ROWS, 0 = any) stream fp16:
         # there the GEMMs hide the copies and the decode would only add its time
         self._pack = self._ring_pack = None
+        # head_int8.HeadInt8 (SOUP_SOLUTION_HEAD_INT8): the int8 copy the ring streams for the heads it takes
+        self._int8, self.int8_heads, self.norm = None, 0, norm
         self.pack_max_rows = max(_env_int("SOUP_SOLUTION_HEAD_PACK_MAX_ROWS", 0), 0)
         self.copy_ms = self.wait_ms = 0.0
         self.copy_bytes = 0
@@ -438,6 +440,11 @@ class HeadStreamer:
         """Allocates the ring (on the compute stream) and starts the copies of the first chunks. The
         ring holds packed chunks when the pack is ready and the head has at most pack_max_rows rows
         (`n`, when known; decided here, once per head), else fp16."""
+        if self._ring is None and self._int8 is not None and self._int8.take():
+            self._ring_pack = self._int8
+            self._ring = torch.empty(self.slots, self._int8.slot_bytes, dtype=torch.uint8, device=self.device)
+            self._owner = [-1] * self.slots
+            self._slot_views = None
         if self._ring is None:
             pack = self._pack
             if pack is not None and not (pack.ready and pack.rows == self.rows and pack.n_chunks == self.n_chunks):
@@ -485,6 +492,10 @@ class HeadStreamer:
         """Rows ordered labelled first: hidden (N, D) in the compute dtype, targets (N,) int64 with
         IGNORE_INDEX where there is no label, n_lab labelled rows. Returns per-row loss, entropy,
         correctness (N,) and dL/dh of the labelled rows, fp32 (max(n_lab, 1), D)."""
+        if self._int8 is not None:
+            self.prefetch(hidden16.shape[0])  # decides the ring's form when the norm did not
+            if self._ring_pack is self._int8:
+                return self._int8.head(self, hidden16, targets, n_lab, grad_scale)
         n, d = hidden16.shape
         dev, dtype = hidden16.device, hidden16.dtype
         if d != self.hidden:
@@ -617,11 +628,26 @@ class HeadStreamer:
             log(f"[solution] head pack off: {exc}")
         return self._pack
 
+    def start_int8(self, log=print):
+        """Builds the int8 copy of the weight in a thread (head_int8.py); heads take it from START_HEADS on."""
+        from .head_int8 import HeadInt8, HeadSkipInt8
+
+        if self._int8 is not None:
+            return self._int8
+        try:
+            self._int8 = HeadInt8(self, log=log).start()
+        except HeadSkipInt8 as exc:
+            log(f"[solution] head int8 off: {exc}")
+        return self._int8
+
     def restore(self):
         """The real weight back on the GPU in the virtual dtype, the overrides removed."""
         if self._pack is not None:
             self._pack.stop()
             self._pack = None
+        if self._int8 is not None:
+            self._int8.stop()
+            self._int8 = None
         param = self.param_ref()
         if param is not None and _registered(param) is self:
             if param.data_ptr() == self._placeholder.data_ptr():
@@ -645,7 +671,8 @@ class HeadStreamer:
         if self._spans:
             torch.cuda.synchronize(self.device)
             self._harvest(block=True)
-        return {"heads": self.heads, "packed_heads": self.packed_heads, "loads": self.loads,
+        return {"heads": self.heads, "packed_heads": self.packed_heads, "int8_heads": self.int8_heads,
+                "loads": self.loads,
                 "late_loads": self.late_loads,
                 "copies_timed": self.copies_timed, "copy_ms": self.copy_ms,
                 "copy_gbps": self.copy_bytes / self.copy_ms / 1e6 if self.copy_ms > 0 else None,
@@ -908,6 +935,15 @@ def _maybe_pack(streamer, log, point):
         streamer.start_pack(log)
 
 
+def _maybe_int8(streamer, log):
+    """SOUP_SOLUTION_HEAD_INT8 (head_int8.enabled()): the int8 copy, built in a thread from the end of
+    Soup's setup (under the trainer build, as the pack)."""
+    from . import head_int8
+
+    if head_int8.enabled():
+        streamer.start_int8(log)
+
+
 def finish_setup(model, log=print):
     """After Soup's setup: keeps streaming when the weight is still the frozen tied weight of the
     model's own embedding and lm_head; otherwise puts it back on the GPU (fp32, the base's state).
@@ -934,6 +970,7 @@ def finish_setup(model, log=print):
         if reason is None:
             active = streamer
             _maybe_pack(streamer, log, "setup")
+            _maybe_int8(streamer, log)
             continue
         streamer.restore()
         log(f"[solution] head streaming undone ({reason}): the weight is back on the GPU")
@@ -960,6 +997,8 @@ def _report(ref, log):
     copy = (f"{st['copy_ms'] / st['copies_timed']:.2f} ms per chunk at {st['copy_gbps']:.1f} GB/s"
             if st["copies_timed"] and st["copy_gbps"] else "no timed copies")
     packed = f" ({st['packed_heads']} from the 12-bit pack)" if streamer._pack is not None else ""
+    if streamer._int8 is not None:
+        packed += f" ({st['int8_heads']} from the int8 copy)"
     log(f"[solution] head stream: {st['heads']} heads{packed}, {st['loads']} chunk copies ({st['late_loads']} "
         f"not prefetched), {copy}; the head waited for copies {st['wait_ms'] / st['heads']:.1f} ms per step")
 
