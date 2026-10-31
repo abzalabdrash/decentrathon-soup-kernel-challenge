@@ -29,7 +29,7 @@ a time. If streaming is declined later, everything comes back to the GPU as it w
 Switch: SOUP_SOLUTION_LOAD_STREAM=0. With SOUP_SOLUTION_LOAD_PINNED=1 the checkpoint -> GPU copies of
 the loads handled here go through pinned buffers filled by a thread (load_pinned.py).
 
-SOUP_SOLUTION_EMBED_ASYNC=1: the embedding's job of the loop (`_materialize_copy(slice, "cpu",
+SOUP_SOLUTION_EMBED_ASYNC (on by default, =0 for the original job): the embedding's job of the loop (`_materialize_copy(slice, "cpu",
 float16)`: `slice[...]`, a view of the safetensors mmap since safetensors 0.8, then `.to(float16)`
 into a fresh 467 MB tensor) took 0.59 s of the main thread on the T4, and head_stream.py then copied
 the result into its pinned buffer (0.08 s). Here the job returns an fp16 view of that pinned buffer
@@ -178,7 +178,7 @@ class _Load:
     def embedding_job(self, job, spawn, args, kwargs):
         """SOUP_SOLUTION_EMBED_ASYNC (see the module docstring): the job for the embedding's checkpoint
         slice, or None for any other tensor (or when switched off)."""
-        if self.embed_key is None or self.embedding_fill is not None or not _flag("SOUP_SOLUTION_EMBED_ASYNC"):
+        if self.embed_key is None or self.embedding_fill is not None or not _flag("SOUP_SOLUTION_EMBED_ASYNC", "1"):
             return None
         try:
             bound = inspect.signature(spawn).bind(*args, **kwargs).arguments
@@ -626,6 +626,6 @@ def patch_loader(layers=None, only=None, embedding=None):
 
     if _flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(modeling_utils, "safe_open"):
         _wrap(modeling_utils, "safe_open", _opener)
-    if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC")) and hasattr(core_model_loading,
+    if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC", "1")) and hasattr(core_model_loading,
                                                                                  "spawn_materialize"):
         _wrap(core_model_loading, "spawn_materialize", _spawner)

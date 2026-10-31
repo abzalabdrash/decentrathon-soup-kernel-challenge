@@ -132,4 +132,6 @@ def test_light_triton_key(monkeypatch):
 
     monkeypatch.setattr(cache, "triton_key", functools.lru_cache()(original.__wrapped__))  # not computed yet
     assert warmup.install_light_triton_key() is True and getattr(cache.triton_key, "_soup_light", False)
-    monkeypatch.delenv("SOUP_SOLUTION_TRITON_KEY")
+    monkeypatch.setattr(cache, "triton_key", functools.lru_cache()(original.__wrapped__))
+    monkeypatch.setenv("SOUP_SOLUTION_TRITON_KEY", "full")  # light is the default: anything else keeps triton's
+    assert warmup.install_light_triton_key() is False and not getattr(cache.triton_key, "_soup_light", False)

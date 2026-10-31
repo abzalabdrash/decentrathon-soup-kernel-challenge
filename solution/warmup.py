@@ -79,9 +79,11 @@ ptxas and C compiler subprocesses and the cubin loads drop and retake the GIL ma
 thread lowers the switch interval to 1 ms while it runs (see `_run`). Its largest single cost next
 to the model load was triton's own hash, 415 MB of libtriton.so read and digested (`_triton_key`):
 `start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. With
-SOUP_SOLUTION_TRITON_KEY=light the key names libtriton.so by its size, modification time and inode
-instead (`_light_triton_key`): on the 4-vCPU T4 box the 1.4 CPU-seconds of that hash run next to the
-GIL-bound imports, and the key only names entries of the run's own, initially empty, cache. At
+SOUP_SOLUTION_TRITON_KEY=light (the default; =full for triton's own) the key names libtriton.so by its
+size, modification time and inode instead (`_light_triton_key`): on the 4-vCPU T4 box the 1.4
+CPU-seconds of that hash run next to the GIL-bound imports, and the key only names entries of the
+run's own, initially empty, cache (T4, soup-s1-v4 and soup-s1-v5: with EMBED_ASYNC and
+ENTRY_POINTS, the first step 0.38-0.42 s earlier). At
 exit, `_shutdown` stops the warm-up between two registrations. `watch_compiles()` logs any compile
 (or on-disk cache read) outside the warm-up; the log line "waited N s for the warmup" at `train`
 begin shows whether the warm-up fits.
@@ -91,6 +93,9 @@ Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_e
 after apply() run without the workers' GIL contention),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
 SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
+Diagnostics: SOUP_SOLUTION_WARMUP_AUDIT=1 counts, from `train` begin, the launches of every variant
+the warm-up compiled (see `_audit_begin`) and prints them when training ends: a variant with no
+launch is compile time the first step never needed.
 
 The launchers (SOUP_SOLUTION_LAUNCHER_OPT, SOUP_SOLUTION_LAUNCHER_NICE; off by default)
 ------------------------------------------------------------------------------------
@@ -494,9 +499,10 @@ def _light_triton_key():
 
 
 def install_light_triton_key():
-    """SOUP_SOLUTION_TRITON_KEY=light: triton's cache key without hashing libtriton.so (see
-    _light_triton_key), unless triton computed its key already. Returns whether it is in place."""
-    if os.environ.get("SOUP_SOLUTION_TRITON_KEY", "").strip().lower() != "light":
+    """SOUP_SOLUTION_TRITON_KEY=light (the default; any other value keeps triton's own key): triton's
+    cache key without hashing libtriton.so (see _light_triton_key), unless triton computed its key
+    already. Returns whether it is in place."""
+    if os.environ.get("SOUP_SOLUTION_TRITON_KEY", "light").strip().lower() != "light":
         return False
     try:
         from triton.runtime import cache
@@ -1045,6 +1051,9 @@ def watch_compiles(log=True):
                     "cache_hit": getattr(local, "cache_hit", None),
                 }
                 COMPILES.append(record)
+                if _AUDIT["on"]:
+                    _AUDIT["compiled"].append((getattr(kwargs.get("fn"), "jit_function", None),
+                                              kwargs.get("key"), record))
                 if log and record["thread"] not in _STATE["idents"]:
                     what = ("kernel loaded from the on-disk cache" if record["cache_hit"]
                             else "compile")
@@ -1099,6 +1108,60 @@ def preload_in_background(modules, log=True):
     return ready
 
 
+# SOUP_SOLUTION_WARMUP_AUDIT=1 (diagnostics): (jit function, key, COMPILES record) of every compile
+_AUDIT = {"on": os.environ.get("SOUP_SOLUTION_WARMUP_AUDIT", "0").strip().lower() not in ("0", "false", "no", ""),
+          "compiled": [], "counters": []}
+
+
+class _CountingCache(dict):
+    """A JITFunction's in-memory kernel cache that counts its lookups by key: `JITFunction.run`
+    looks every launch up with `kernel_cache.get(key)` (jit.py:712) and `_do_compile` stores into
+    the same dict, read again from `device_caches` on each call."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.lookups = {}
+
+    def get(self, key, default=None):
+        self.lookups[key] = self.lookups.get(key, 0) + 1
+        return super().get(key, default)
+
+
+def _audit_begin():
+    """Swaps the kernel cache of every function the warm-up compiled for a counting copy (same
+    entries), so that from here on each launch is counted under its key."""
+    try:
+        done = set()
+        for fn, _key, _record in list(_AUDIT["compiled"]):
+            if fn is None or id(fn) in done:
+                continue
+            done.add(id(fn))
+            for device, entry in list(fn.device_caches.items()):
+                if isinstance(entry[0], _CountingCache):
+                    continue
+                counting = _CountingCache(entry[0])
+                fn.device_caches[device] = (counting, *entry[1:])
+                _AUDIT["counters"].append((fn, counting))
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(f"[solution] warmup audit failed: {exc!r}", flush=True)
+
+
+def _audit_report():
+    try:
+        lookups = {}
+        for fn, counting in _AUDIT["counters"]:
+            for key, count in counting.lookups.items():
+                lookups[(id(fn), key)] = lookups.get((id(fn), key), 0) + count
+        for fn, key, record in _AUDIT["compiled"]:
+            where = "warm-up" if record["thread"] in _STATE["idents"] else "training"
+            count = lookups.get((id(fn), key), 0) if fn is not None else "?"
+            print(f"[solution] warmup audit: {record['kernel']} compiled in the {where} "
+                  f"({record['seconds']:.2f} s), launched {count} times in training "
+                  f"({record['spec']}; num_warps={record['num_warps']})", flush=True)
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        print(f"[solution] warmup audit failed: {exc!r}", flush=True)
+
+
 def patch_soup_warmup(start_in_setup=False):
     """Soup hooks for the warm-up: with `start_in_setup`, start it when
     SFTTrainerWrapper._setup_transformers begins (instead of from apply()); in every case, when
@@ -1124,7 +1187,13 @@ def patch_soup_warmup(start_in_setup=False):
             finished = wait_for_warmup(60.0)
             print(f"[solution] waited {time.perf_counter() - start:.2f} s for the warmup"
                   + ("" if finished else " (not finished)"), flush=True)
-        return original_train(self, *args, **kwargs)
+        if not _AUDIT["on"]:
+            return original_train(self, *args, **kwargs)
+        _audit_begin()
+        try:
+            return original_train(self, *args, **kwargs)
+        finally:
+            _audit_report()
 
     cls._setup_transformers = _setup_transformers
     cls.train = train

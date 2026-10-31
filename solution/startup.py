@@ -57,7 +57,7 @@ Each replacement lives only for the import it serves and is undone right after (
 function is put back), and only modules imported in that window keep the answer. If a module is
 already imported, nothing is replaced for it.
 
-SOUP_SOLUTION_ENTRY_POINTS=1: `importlib.metadata.entry_points()` reads the entry points of every
+SOUP_SOLUTION_ENTRY_POINTS (on by default, =0 for the original): `importlib.metadata.entry_points()` reads the entry points of every
 installed distribution on each call (about a thousand on Kaggle: 63 ms for Soup's plugin discovery
 at the start of train() in the T4 profile, soup-s1-diag0), and after the harness's prelude the run
 calls it three times: bitsandbytes' backend discovery (bitsandbytes/__init__.py:70) and fsspec's
@@ -114,8 +114,8 @@ import types
 from .phases import mark
 
 
-def _flag(name):
-    return os.environ.get(name, "0") not in ("0", "false", "no", "")
+def _flag(name, default="0"):
+    return os.environ.get(name, default) not in ("0", "false", "no", "")
 
 
 # ---------------------------------------------------------------- imports
@@ -240,7 +240,7 @@ def prepare_imports(log=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
     Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
     seconds = {}
-    if _flag("SOUP_SOLUTION_ENTRY_POINTS"):
+    if _flag("SOUP_SOLUTION_ENTRY_POINTS", "1"):
         try:
             share_entry_points()  # before bitsandbytes and fsspec read them
         except Exception:  # noqa: BLE001 - every call reads them then
