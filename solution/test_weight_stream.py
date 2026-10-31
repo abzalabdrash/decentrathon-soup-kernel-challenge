@@ -505,9 +505,13 @@ def _apply_layer_patches():
 
 
 @pytest.mark.parametrize("path", ["hf", "varlen"])
-def test_tiny_qwen2_4bit(tiny_qwen_dir, path):
+def test_tiny_qwen2_4bit(tiny_qwen_dir, path, monkeypatch):
     from solution.weight_stream import find_decoder_layers, stream_model_weights, streamer_of
 
+    # the ring of whole layers (no late loads); the type ring, the default, has its own tests in
+    # test_weight_ring.py (on this tiny model fused_proj declines the MLP and the type ring loads
+    # its matrices on the spot, by design)
+    monkeypatch.setenv("SOUP_SOLUTION_WEIGHT_RING", "layer")
     if path == "varlen":
         _apply_layer_patches()
     step = _hf_step if path == "hf" else _varlen_step

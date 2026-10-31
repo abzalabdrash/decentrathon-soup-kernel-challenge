@@ -303,7 +303,9 @@ def test_ring_switch_and_fallbacks(layer_shaped_qwen_dir, night, monkeypatch):
     try:
         assert streamer.ring == "layer" and streamer.ring_note is None
         assert len(streamer._slots) == 2 and streamer.slot_bytes == max(streamer.layer_bytes)
-        assert len(weight_stream._MATRICES) == 0 and not streamer._matrices
+        # this model's matrices are not registered (other tests' type-ring streamers may still be)
+        assert not streamer._matrices
+        assert not any(m in weight_stream._MATRICES for m in model.modules())
         assert fused_proj._mlp_plan(layers[0].mlp, x).ring is None
     finally:
         streamer.restore()
