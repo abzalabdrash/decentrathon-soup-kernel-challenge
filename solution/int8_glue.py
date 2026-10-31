@@ -29,12 +29,19 @@ BLOCK_COLS = 2048  # one row of the hidden size 1536 per program
 COLS_TILE = 512  # columns per program of the dequantization
 
 
-@triton.jit
-def quant_rows_kernel(x_ptr, stride_x, q_ptr, stride_q, s_ptr, n_cols, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["n_rows"])
+def quant_rows_kernel(x_ptr, stride_x, n_rows, q_ptr, stride_q, s_ptr, n_cols, BLOCK: tl.constexpr,
+                      ROUND: tl.constexpr):
+    # rows past n_rows are padding: zeros and scale 0; ROUND 1 / 2: x rounded to fp16 / bf16 first (the
+    # cast the torch path makes before quantizing: an fp32 gradient read as is)
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
-    m = offs < n_cols
+    m = (offs < n_cols) & (row < n_rows)
     x = tl.load(x_ptr + row.to(tl.int64) * stride_x + offs, mask=m, other=0.0).to(tl.float32)
+    if ROUND == 1:
+        x = x.to(tl.float16).to(tl.float32)
+    elif ROUND == 2:
+        x = x.to(tl.bfloat16).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     nan = tl.sum((x != x).to(tl.int32), axis=0) > 0
     amax = tl.where(nan, float("nan"), amax)
@@ -45,7 +52,7 @@ def quant_rows_kernel(x_ptr, stride_x, q_ptr, stride_q, s_ptr, n_cols, BLOCK: tl
     inv = tl.where(amax > 0.0, tl.math.div_rn(one, safe) * 127.0, 0.0)
     y = tl.floor(x * inv + 0.5)
     y = tl.minimum(tl.maximum(y, -127.0), 127.0)
-    tl.store(q_ptr + row.to(tl.int64) * stride_q + offs, y.to(tl.int8), mask=m)
+    tl.store(q_ptr + row.to(tl.int64) * stride_q + offs, y.to(tl.int8), mask=offs < n_cols)
     tl.store(s_ptr + row, amax * tl.math.div_rn(one, tl.full([], 127.0, tl.float32)))
 
 
@@ -62,14 +69,23 @@ def dequant_rows_cols_kernel(acc_ptr, stride_acc, amax_ptr, col_ptr, out_ptr, st
     tl.store(out_ptr + row.to(tl.int64) * stride_out + cols, y, mask=m)
 
 
-def quant_rows(x):
-    """int8_bwd._quant_rows of a 2-D half tensor (contiguous rows): (int8 rows, fp32 scales)."""
+def _round_mode(dtype, half):
+    if half is None or dtype == half:
+        return 0
+    return 1 if half == torch.float16 else 2
+
+
+def quant_rows(x, rows=None, half=None):
+    """int8_bwd._quant_rows of a 2-D tensor with contiguous rows: (int8 rows, fp32 scales). With `half`
+    a wider x is rounded to it first (`x.to(half)`'s values), and with `rows` the result has that many
+    rows, zeros past x's (fused_proj._padded_half's padding), so the gradient needs no cast of its own."""
     n, d = x.shape
-    q = torch.empty((n, d), dtype=torch.int8, device=x.device)
-    s = torch.empty(n, dtype=torch.float32, device=x.device)
-    if n:
-        quant_rows_kernel[(n,)](x, x.stride(0), q, q.stride(0), s, d, BLOCK=triton.next_power_of_2(d),
-                                num_warps=4, enable_fp_fusion=False)
+    rows = n if rows is None else rows
+    q = torch.empty((rows, d), dtype=torch.int8, device=x.device)
+    s = torch.empty(rows, dtype=torch.float32, device=x.device)
+    if rows:
+        quant_rows_kernel[(rows,)](x, x.stride(0), n, q, q.stride(0), s, d, BLOCK=triton.next_power_of_2(d),
+                                   ROUND=_round_mode(x.dtype, half), num_warps=4, enable_fp_fusion=False)
     return q, s
 
 
@@ -96,8 +112,11 @@ def gate_up_scales(gate, scale_g, scale_u, inverse):
     return scale_gu, inv_gu
 
 
-def usable(x):
-    return ON and x.dim() == 2 and x.is_cuda and x.stride(1) == 1 and x.dtype in (torch.float16, torch.bfloat16)
+def usable(x, half=None):
+    """Whether quant_rows takes x: on, 2-D with contiguous rows on the GPU, half (or fp32 rounded to `half`)."""
+    halves = (torch.float16, torch.bfloat16)
+    return (ON and x.dim() == 2 and x.is_cuda and x.stride(1) == 1
+            and (x.dtype in halves or (half in halves and x.dtype == torch.float32)))
 
 
 def warm(half, hidden, f32=torch.float32):
@@ -106,7 +125,9 @@ def warm(half, hidden, f32=torch.float32):
 
     if not ON:
         return
-    compile_kernel(quant_rows_kernel, half, hidden, torch.int8, hidden, f32, hidden,
-                   BLOCK=triton.next_power_of_2(hidden), num_warps=4, enable_fp_fusion=False)
+    # fused_proj's fp32 gradient rounded to the half type in the kernel, and a half gradient as is
+    for src, mode in ((f32, _round_mode(f32, half)), (half, 0)):
+        compile_kernel(quant_rows_kernel, src, hidden, 832, torch.int8, hidden, f32, hidden,
+                       BLOCK=triton.next_power_of_2(hidden), ROUND=mode, num_warps=4, enable_fp_fusion=False)
     compile_kernel(dequant_rows_cols_kernel, torch.int32, hidden, f32, f32, f32, hidden, hidden,
                    TILE=COLS_TILE, num_warps=4, enable_fp_fusion=False)

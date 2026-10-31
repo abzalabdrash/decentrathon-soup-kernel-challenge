@@ -55,6 +55,20 @@ def test_quant_rows_nonfinite(int8_on):
     assert torch.equal(s[finite], s_ref[finite])
 
 
+@pytest.mark.parametrize("n,padded", [(826, 832), (832, 832), (5, 24)])
+@pytest.mark.parametrize("half", [torch.float16, torch.bfloat16])
+def test_quant_rows_from_fp32_padded(int8_on, n, padded, half):
+    """The fp32 gradient read as is: rounded to half and padded in the kernel, the same as quantizing
+    fused_proj._padded_half's tensor."""
+    from solution import int8_glue
+    from solution.fused_proj import _padded_half
+
+    x = _rows(n, 1536, torch.float32, seed=n + 1)
+    q_ref, s_ref = int8_on._quant_rows(_padded_half(x, n, padded, half))
+    q, s = int8_glue.quant_rows(x, rows=padded, half=half)
+    assert torch.equal(q, q_ref) and torch.equal(s, s_ref)
+
+
 @pytest.mark.parametrize("n", [17, 832])
 def test_dequant_equals_torch(n):
     from solution import int8_glue
@@ -89,8 +103,8 @@ def test_mlp_backward_glue_equals_torch_glue(int8_on, monkeypatch):
     monkeypatch.setenv("SOUP_SOLUTION_FUSED_GU_SPLIT", "1")
     mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=20).cuda().train()
     gen = torch.Generator("cuda").manual_seed(7)
-    x = torch.randn(1, 832, 1536, device="cuda", generator=gen)
-    grad = (torch.randn(1, 832, 1536, device="cuda", generator=gen) * 1e-2).half()
+    x = torch.randn(1, 829, 1536, device="cuda", generator=gen)  # 829: the padded path too
+    grad = (torch.randn(1, 829, 1536, device="cuda", generator=gen) * 1e-2).half()
     results = []
     for on in (False, True):
         monkeypatch.setattr(int8_glue, "ON", on)

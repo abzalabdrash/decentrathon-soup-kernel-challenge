@@ -281,13 +281,15 @@ def usable(plan, tokens):
     return _READY.is_set()
 
 
-def mlp_backward(plan, gate_up, grad16, buffer, done=None):
+def mlp_backward(plan, gate_up, grad16, buffer, done=None, padded=None):
     """The fused MLP's backward from dL/dout (tokens, D) half and the saved (gate|up) (2I, tokens):
     returns dL/dx (tokens, D) fp32; (gate|up) is overwritten with its gradient. `buffer` is
     fused_proj's flat half buffer for one (I, D) weight (taken as int8 bytes). A uint8 `gate_up` is
     offload_int8.py's int8 form of it (offload_int8.raw): the SwiGLU backward reads that and writes
     the gradient over the int32 product of step 3 (interleaved per element: no new buffer)."""
     tokens, d = grad16.shape
+    if padded is not None:  # grad16: the unpadded gradient in its own dtype (int8_glue pads and rounds)
+        tokens = padded
     inter = plan.gate.out_features
     device = grad16.device
     i8 = buffer.view(torch.int8)
@@ -306,7 +308,10 @@ def mlp_backward(plan, gate_up, grad16, buffer, done=None):
         else:
             q, qs = offload_int8.views(gate_up, 2 * inter, tokens)
     # 1. the incoming gradient per token (int8_glue's kernel, or the torch ops)
-    g_q, s_g = int8_glue.quant_rows(grad16) if int8_glue.usable(grad16) else _quant_rows(grad16)
+    if padded is not None:
+        g_q, s_g = int8_glue.quant_rows(grad16, rows=padded, half=plan.half)
+    else:
+        g_q, s_g = int8_glue.quant_rows(grad16) if int8_glue.usable(grad16) else _quant_rows(grad16)
     # 2-3. dL/dhidden^T (I, tokens) in int32 through W_down^T int8
     inv_d, scale_d = _column_scales(plan.down, plan.half, buffer)
     w_down_t = i8[:inter * d].view(inter, d)
