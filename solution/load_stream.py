@@ -490,7 +490,8 @@ def _loader(original):
             return original(*args, **kwargs)
         ranges = None
         opened, _STATE["opened"] = _STATE["opened"], []
-        if _flag("SOUP_SOLUTION_LOAD_PREAD") and isinstance(bound.get("state_dict"), dict) and opened:
+        if (_flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(os, "preadv") and isinstance(bound.get("state_dict"), dict)
+                and opened):
             try:
                 ranges = _FileRanges(bound["state_dict"], opened)
             except Exception:  # noqa: BLE001 - staged from the slices
