@@ -101,7 +101,28 @@ packed is below the 4,096-row fp16 ring at every N (26.1 vs 28.2 MiB at N=300, 4
 With MAX_ROWS the run's largest steps (which set the peak) keep the fp16 ring. Build in the thread:
 0.7 s on the T4 (334 MiB pinned, 38 chunks encoded and verified), 75 MiB transient GPU memory.
 
-In training: TODO (soup-e1-packv2 variants; soup-e1-full1 full run with the switches on).
+In training, soup-e1-packv2 (namedesign, 59402d0, variants ABBA 2 runs each + warm, a hot session:
+median step 0.43 s; pack started at peft's kbit preparation):
+
+| variant | wall | steps 3+ | step 0 | first step mark | head copy wait/step | nvidia-smi |
+|---|---:|---:|---:|---:|---:|---:|
+| defaults | 48.31 | 28.47 | 0.565 | +16.75 s | 6.4-7.9 ms | 401 |
+| HEAD_PACK=1 (all heads) | 48.32 | 28.12 (-0.35) | 0.483 | +17.11 s | 1.7-1.9 ms | 403 |
+| HEAD_PACK=1, ROWS=3072 | 48.40 | 28.21 (-0.26) | 0.507 | +17.07 s | 0.7-1.0 ms | 403 |
+| HEAD_PACK=1, MAX_ROWS=800 | 48.29 | 28.02 (-0.45) | 0.480 | +17.21 s | 1.8-1.9 ms | 403 |
+
+The steps gain what the microbench says, but the build delayed the first step by 0.3-0.45 s
+(setup_transformers +0.25..0.4 s: started at prepare, its cudaHostRegister of 334 MiB holds up the
+setup's own CUDA calls), so the wall did not move. torch's reserved/allocated are identical (272 /
+234.6 MiB); nvidia-smi +2 MiB outside the allocator (one more CUDA module). The build now starts at
+the end of Soup's setup (SOUP_SOLUTION_HEAD_PACK_AT=setup, default; under the trainer build, CPU
+work, where the offload prepins for the same reason): soup-e1-packv3 measures it.
+
+Full run with the candidate switches (soup-e1-full1, peagverr, 59402d0, `--env EXIT_RELEASE=1
+EXIT_NOGC=1 HEAD_PACK=1 HEAD_PACK_MAX_ROWS=800`): **all 10 checks pass**; base 80.5 s / 14,345 MiB, ours
+46.4 s / 403 MiB (s 1.735 against a fast base; m 35.6), eval -0.015 %, loss curve 0.01 % / 0.05 %,
+own kernels 14.0 % (head_unpack_kernel listed under check 3); 33 of 64 heads packed, the pack ready
+0.2 s before train begin; the release: 2,560 MiB freed and 1,424 MiB unregistered in 0.45 s.
 
 ## Question for the organizers (exact wording)
 
