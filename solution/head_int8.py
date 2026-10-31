@@ -72,15 +72,17 @@ def smoothing(streamer):
     """The smoothing vector for this streamer's copy (SOUP_SOLUTION_HEAD_INT8_SMOOTH): "gamma" (default)
     takes |gamma|^alpha of the decoder's final RMSNorm weight (frozen in this task; any positive vector
     keeps the products exact, so a later change of it would only change the rounding), alpha from
-    SOUP_SOLUTION_HEAD_INT8_ALPHA (0.5); "none": no smoothing."""
+    SOUP_SOLUTION_HEAD_INT8_ALPHA (1: the norm weight folded into W whole: on real final hidden
+    states of the public rows loss +0.07 % and accuracy +0.0 % against the fp16 head, against +0.48 % and -0.8 %
+    unsmoothed and +0.40 % with alpha 0.5); "none": no smoothing."""
     mode = os.environ.get("SOUP_SOLUTION_HEAD_INT8_SMOOTH", "gamma").strip().lower()
     weight = getattr(getattr(streamer, "norm", None), "weight", None)
     if mode != "gamma" or not isinstance(weight, torch.Tensor) or weight.numel() != streamer.hidden:
         return None
     try:
-        alpha = float(os.environ.get("SOUP_SOLUTION_HEAD_INT8_ALPHA", "0.5"))
+        alpha = float(os.environ.get("SOUP_SOLUTION_HEAD_INT8_ALPHA", "1"))
     except ValueError:
-        alpha = 0.5
+        alpha = 1.0
     c = weight.detach().float().abs().clamp_min(1e-3) ** alpha
     return c / c.mean()
 
