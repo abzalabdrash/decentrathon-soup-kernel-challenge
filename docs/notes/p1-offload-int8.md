@@ -118,7 +118,21 @@ scale vector per 32-row tile: 0.190 ms from the int8 form against 0.225 from the
 1f44bbc / cebfd3e is that of off (453 MiB on the jury rows, 395 public): the earlier +40 / +60 MiB are
 gone.
 
-TODO: 1e0eac4 on jury-like and public rows.
+**1e0eac4 on jury-like rows (soup-p1-abba-jury3, seed 157, train 42000:42256, eval 51800:52056):**
+
+| variant | wall s | train phase s (begin -> end) | steps 3+ s | median step | step 0 | nvidia-smi | alloc | own |
+|---|---|---|---|---|---|---|---|---|
+| off | 49.61 / 50.22 | 31.49 / 32.02 | 29.13 | 0.457 | 0.649 | 453 | 267.6 | 16.9 % |
+| i8 | 49.56 / 49.35 | 30.90 / 30.85 | 28.13 | 0.434 | 0.658 | 453 | 268.6 | 20.5 % |
+
+The training phase is -0.88 s and steps 3+ -1.00 s (median step -5 %); the wall only -0.46 s because the
+i8 runs reached `train begin` 0.4 s later (model load and trainer build: 17.26 / 17.11 s against 16.84 /
+16.78; nothing before training reads the switch, so that is load jitter of this session). Inside the
+loop, step 4 (the switch point, 113th offload) took 0.96 / 0.86 s against 0.50: it waited ~0.4 s for the
+compile threads (mine and int8_bwd's, which compiled the INT8_IN variants too), and steps 1-3 were
++0.25 s from their contention. bbc1001 moves the switch to step 7 (196 offloads) and compiles the INT8_IN
+variants in offload_int8's own thread (int8_bwd's thread compiles exactly main's kernels): without the
+stall the loop gain is ~-1.3 s on these rows.
 
 ## 6. Full + jury
 
