@@ -33,6 +33,13 @@ Here, each behind its switch, for the real CUDA trainer only (anything else runs
   (the same integer operations as unpad.pack_batch on the GPU), and copied to the GPU in one
   non-blocking copy next to the batch. The forward (fused_ce.py) and the head take them by the
   identity of the batch's GPU tensors; any other tensor takes the GPU path.
+- SOUP_SOLUTION_BWD_SINGLE_THREAD=1: the trainer's `accelerator.backward(loss)` runs under
+  `torch.autograd.set_multithreading_enabled(False)`: the autograd engine then evaluates every node
+  on the calling thread instead of handing the CUDA nodes to its device thread (the same nodes, the
+  same order, the same streams: the engine sets each node's stream itself). The main thread's cuBLAS
+  handle, and so its workspace (8 MiB per handle and stream in torch 2.11), then serves the backward
+  too, instead of a second handle made by the autograd thread; and no GIL handoff between the two
+  threads per Python node of our autograd functions.
 - SOUP_SOLUTION_BOUNDARY_TIMING=1 (diagnostics): host time of the callbacks per event, the log,
   Soup's tracker commit and display, the DataLoader fetch, printed once per epoch.
 """
@@ -62,6 +69,7 @@ _STATE = {
     "prefetch": _flag("SOUP_SOLUTION_PREFETCH_BATCH"),
     "plan": _flag("SOUP_SOLUTION_HOST_PLAN"),
     "timing": _flag("SOUP_SOLUTION_BOUNDARY_TIMING"),
+    "bwd_single": _flag("SOUP_SOLUTION_BWD_SINGLE_THREAD"),
     "patched": False,
 }
 _STATS = {"prefetched": 0, "planned": 0, "plans_used": 0, "known_used": 0, "fetch_s": 0.0, "plan_s": 0.0}
@@ -320,7 +328,7 @@ def patch_step_pipeline():
     """Trainer._run_epoch / training_step / _get_num_items_in_batch / _save_checkpoint and accelerate's
     send_to_device (see the module doc); nothing unless one of the switches is on."""
     if _STATE["patched"] or not (_STATE["nan_gpu"] or _STATE["prefetch"] or _STATE["plan"]
-                                 or _STATE["timing"]):
+                                 or _STATE["timing"] or _STATE["bwd_single"]):
         return
     import accelerate.data_loader as adl
     from transformers import Trainer
@@ -348,9 +356,12 @@ def patch_step_pipeline():
             self.args.logging_nan_inf_filter = False
             self.__dict__["_soup_nan_gpu"] = True
         restore_timing = _start_timing(self) if _STATE["timing"] else None
+        single = _STATE["bwd_single"] and _single_thread_backward(self.accelerator)
         try:
             return run_epoch(self, *args, **kwargs)
         finally:
+            if single:
+                self.accelerator.__dict__.pop("backward", None)
             if flipped:
                 self.args.logging_nan_inf_filter = True
                 self.__dict__.pop("_soup_nan_gpu", None)
@@ -359,7 +370,7 @@ def patch_step_pipeline():
             from .trainer_patch import flush_deferred
 
             flush_deferred(self)
-            _report(self, flipped, undo is not None)
+            _report(self, flipped, undo is not None, single)
             if restore_timing is not None:
                 restore_timing()
 
@@ -421,8 +432,27 @@ def unpatch_step_pipeline():
     _STATE["patched"] = False
 
 
-def _report(trainer, flipped, iterator):
+def _single_thread_backward(accelerator):
+    """accelerator.backward on the calling thread for one epoch (an instance attribute); False when
+    something else already put one there."""
+    if accelerator is None or "backward" in vars(accelerator):
+        return False
+    backward = accelerator.backward
+
+    @functools.wraps(backward)
+    def single_thread_backward(*args, **kwargs):
+        with torch.autograd.set_multithreading_enabled(False):
+            return backward(*args, **kwargs)
+
+    accelerator.backward = single_thread_backward
+    return True
+
+
+def _report(trainer, flipped, iterator, single=False):
     parts = []
+    if single:
+        parts.append(f"backward on the calling thread (allocated at the epoch end "
+                     f"{torch.cuda.memory_allocated() / 2**20:.1f} MiB)")
     if flipped:
         parts.append("nan/inf filter on the GPU")
     if iterator:
@@ -479,14 +509,38 @@ def _start_timing(trainer):
 
     CallbackHandler.call_event = timed_call_event
     Trainer._maybe_log_save_evaluate = timed_log_save
+    wrapped = []
+    for name in ("floating_point_ops", "_clip_grad_norm", "_get_grad_norm", "training_step",
+                 "get_batch_samples", "_get_learning_rate"):
+        wrapped.append((Trainer, name, getattr(Trainer, name)))
+    for owner, name, fn in wrapped:
+        setattr(owner, name, _timed_method(f"{owner.__name__}.{name}", fn))
+    from . import boundary
+
+    builds = boundary._STATE.get("builds", 0)
 
     def restore():
         CallbackHandler.call_event = call_event
         Trainer._maybe_log_save_evaluate = log_save
+        for owner, name, fn in wrapped:
+            setattr(owner, name, fn)
         for fn in undo:
             fn()
+        _TIMES["boundary.py list builds"] = [0.0, boundary._STATE.get("builds", 0) - builds]
 
     return restore
+
+
+def _timed_method(label, fn):
+    @functools.wraps(fn)
+    def timed(*args, **kwargs):
+        started = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _timed(label, started)
+
+    return timed
 
 
 def _wrap_soup_sinks(callback, undo):

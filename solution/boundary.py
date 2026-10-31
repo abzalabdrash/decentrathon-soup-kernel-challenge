@@ -57,6 +57,7 @@ def _entry(model):
     """The lists of `model` for the current registration generation (built on first use)."""
     entry = _CACHE.get(model)
     if entry is None or entry["generation"] != _STATE["generation"]:
+        _STATE["builds"] = _STATE.get("builds", 0) + 1
         params = list(model.parameters())
         trainable = [p for p in params if p.requires_grad]
         frozen_with_grad = any(p.grad is not None for p in params if not p.requires_grad)

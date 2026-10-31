@@ -55,29 +55,61 @@ def _log_trl_metrics(trainer, mode, inputs, step):
         _record_metrics(trainer, entry)
 
 
-def _record_metrics(trainer, entry):
+def _record_metrics(trainer, entry, read=None):
     """One step's values into TRL's `_metrics` and `_total_train_tokens`, as TRL's compute_loss puts
-    them there: entropy, num_tokens, mean_token_accuracy."""
+    them there: entropy, num_tokens, mean_token_accuracy. `read` gives the values already read."""
     mode, entropy, tokens, labelled, accuracy = entry
+    if read is None:
+        read = [t.item() if t is not None else None for t in (entropy, tokens, labelled, accuracy)]
+    entropy, tokens, labelled, accuracy = read
     metrics = trainer._metrics
-    metrics[mode]["entropy"].append(entropy.item())
+    metrics[mode]["entropy"].append(entropy)
     if tokens is not None:
-        tokens = tokens.item()
         if mode == "train" and hasattr(trainer, "_total_train_tokens"):
             trainer._total_train_tokens += tokens
     if hasattr(trainer, "_total_train_tokens"):
         metrics[mode]["num_tokens"] = [trainer._total_train_tokens]
-    metrics[mode]["mean_token_accuracy"].append(accuracy.item() if labelled.item() > 0 else 0.0)
+    metrics[mode]["mean_token_accuracy"].append(accuracy if labelled > 0 else 0.0)
+
+
+def read_all(tensors):
+    """`[t.tolist() for t in tensors]` with one device-to-host copy: every value goes through float64,
+    which holds fp32/fp16/bf16 values and integers below 2**53 exactly, and comes back as the Python
+    float or int `.item()` / `.tolist()` gives."""
+    import torch
+
+    if not tensors:
+        return []
+    device = tensors[0].device
+    if any(t.device != device or t.is_complex() or t.dtype == torch.float64 for t in tensors) or len(tensors) == 1:
+        return [t.tolist() for t in tensors]
+    flat = torch.cat([t.detach().reshape(-1).to(torch.float64) for t in tensors]).tolist()
+    out, start = [], 0
+    for t in tensors:
+        n = t.numel()
+        chunk = flat[start:start + n]
+        start += n
+        if not t.is_floating_point():
+            chunk = [bool(v) for v in chunk] if t.dtype == torch.bool else [int(v) for v in chunk]
+        out.append(chunk if t.dim() else chunk[0])
+    return out
 
 
 def flush_deferred(trainer=None):
-    """The deferred rewind records (all trainers) and this trainer's deferred metrics, in order."""
-    _flush_rewind()
+    """The deferred rewind records (all trainers) and this trainer's deferred metrics, in order,
+    read from the GPU in one copy."""
+    rows, DEFER["rows"] = DEFER["rows"], []
     pending = trainer.__dict__.get(PENDING_ATTR) if trainer is not None else None
     if pending:
         trainer.__dict__[PENDING_ATTR] = []
-        for entry in pending:
-            _record_metrics(trainer, entry)
+    tensors = [t for _, _, means, tokens in rows for t in (means, tokens)]
+    for entry in pending or ():
+        tensors += [t for t in entry[1:] if t is not None]
+    values = iter(read_all(tensors))
+    if rows:
+        _record_rewind(rows, values)
+    for entry in pending or ():
+        _record_metrics(trainer, entry, [next(values) if t is not None else None for t in entry[1:]])
 
 
 # ---- Soup's rewind recorder ------------------------------------------------------------------
@@ -100,15 +132,19 @@ class _DeviceRows:
 
 def _flush_rewind():
     rows, DEFER["rows"] = DEFER["rows"], []
-    if not rows:
-        return
+    if rows:
+        _record_rewind(rows, iter(read_all([t for _, _, m, k in rows for t in (m, k)])))
+
+
+def _record_rewind(rows, values):
     from soup_cli.trainer import rewind_hf
 
     record = rewind_hf.RewindState._soup_original_on_micro_batch
-    for state, step, means, tokens in rows:
+    for state, step, _, _ in rows:
+        means, tokens = next(values), next(values)
         try:
             # Soup: [float(mean) for mean in means], [int(count) for count in tokens]
-            record(state, step=step, row_loss=means.tolist(), row_tokens=tokens.tolist())
+            record(state, step=step, row_loss=means, row_tokens=tokens)
         except Exception as exc:  # noqa: BLE001 - Soup's compute_loss never raises into training
             state.fail(exc)
 

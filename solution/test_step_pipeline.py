@@ -291,3 +291,57 @@ def test_tiny_sft_run_identical_with_the_switches(tmp_path, monkeypatch):
     assert records_off == records_on and len(records_on) == steps
     assert adapter_off.keys() == adapter_on.keys()
     assert all(torch.equal(adapter_off[n], adapter_on[n]) for n in adapter_off)
+
+
+# ---- the backward on the calling thread -------------------------------------------------------
+
+
+@pytest_cuda
+@pytest.mark.parametrize("ring", ["type", None])
+def test_single_thread_backward_same_step(layer_shaped_qwen_dir, night, ring):
+    """SOUP_SOLUTION_BWD_SINGLE_THREAD: a packed step through the layer patches with the night
+    defaults (attention recompute, the MLP offload's events, LoRA dropout) and the weight ring's
+    events gives the same outputs and gradients bit for bit with the backward on the calling thread;
+    the backward's hooks run there; one cuBLAS workspace (handle) fewer is made."""
+    import threading
+
+    from solution.test_weight_ring import _ring_step
+    from solution.test_weight_stream import _same, _soup_like
+    from solution.weight_stream import stream_model_weights
+
+    model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
+    streamer = stream_model_weights(model, slots=2, ring=ring) if ring else None
+    lora = next(p for n, p in model.named_parameters() if p.requires_grad)
+    threads = []
+    handle = lora.register_hook(lambda g: threads.append(threading.get_ident()))
+
+    def step(single):
+        torch.cuda.synchronize()
+        torch._C._cuda_clearCublasWorkspaces()
+        before = torch.cuda.memory_allocated()
+        if single:
+            with torch.autograd.set_multithreading_enabled(False):
+                out = _ring_step(model)
+        else:
+            out = _ring_step(model)
+        model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        return out, torch.cuda.memory_allocated() - before
+
+    try:
+        ref, workspaces = step(False)
+        assert threads[-1] != threading.get_ident()  # the engine's device thread
+        got, workspaces_single = step(True)
+        assert threads[-1] == threading.get_ident()
+        again, _ = step(False)
+    finally:
+        handle.remove()
+        if streamer is not None:
+            streamer.restore()
+    assert _same(ref, again)  # the step is reproducible here
+    assert _same(ref, got)
+    assert workspaces - workspaces_single >= 4 * 2**20  # the autograd thread's cuBLAS workspace
+
+
+from solution.test_weight_ring import night  # noqa: E402,F401 - fixtures
+from solution.test_weight_stream import layer_shaped_qwen_dir  # noqa: E402,F401
