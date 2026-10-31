@@ -36,7 +36,10 @@ def patch_qwen2_mlp_half():
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
         if (act != "silu" or not torch.is_tensor(x) or not x.is_cuda
-                or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
+                or x.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                or (x.dtype == torch.float32 and not torch.is_autocast_enabled("cuda"))):
+            # A plain fp32 Qwen MLP outside autocast must keep its own dtype. Forcing its input
+            # to fp16 would either fail at the first Linear or change the requested computation.
             return original(self, x)
         half = x.dtype if x.dtype != torch.float32 else half_dtype()
         x_half = x if x.dtype == half else x.to(half)

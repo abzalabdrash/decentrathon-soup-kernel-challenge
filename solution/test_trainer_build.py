@@ -81,6 +81,50 @@ def test_fast_rows_same_labels(tokenizer, monkeypatch):
     assert getattr(loss_mask._coerce_int_list, "_soup_original", None) is None
 
 
+@pytest.mark.parametrize("long_prompt", [False, True])
+def test_fast_rows_preserve_truncation_boundaries_and_errors(tokenizer, monkeypatch, long_prompt):
+    messages = ROWS[0]
+    if long_prompt:
+        # '~' is in the byte alphabet but absent from the BPE training corpus, so each
+        # repetition adds one token. Put the first assistant target at index 511:
+        # max_length=511 drops it; 512 and 513 keep one and two causal targets.
+        def row(n):
+            return [{"role": "user", "content": "~" * n},
+                    {"role": "assistant", "content": "The quick brown fox " * 10}]
+
+        baseline = loss_mask.build_assistant_only_labels(row(600), tokenizer, max_length=4096)
+        first = next(i for i, label in enumerate(baseline["labels"]) if label != -100)
+        messages = row(600 + 511 - first)
+    full = loss_mask.build_assistant_only_labels(messages, tokenizer, max_length=4096)
+    first = next(i for i, label in enumerate(full["labels"]) if i > 0 and label != -100)
+    assert first > 1
+    if long_prompt:
+        assert first == 511 and len(full["input_ids"]) > 513
+    lengths = sorted({0, 1, first - 1, first, first + 1, first + 2, 511, 512, 513})
+
+    def outcome(length):
+        data = None
+        try:
+            data = loss_mask.build_assistant_only_labels(messages, tokenizer, max_length=length)
+            loss_mask.ensure_causal_loss_target(data["labels"], max_length=length)
+        except (TypeError, ValueError) as exc:
+            return data, (type(exc), str(exc))
+        return data, None
+
+    monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_CHEAP_FINGERPRINT", "0")
+    expected = {length: outcome(length) for length in lengths}
+    assert expected[first][1][0] is loss_mask.NoCausalLossTargetError
+    assert expected[first + 1][1] is None
+    monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
+    undo = trainer_build.install()
+    try:
+        for length in lengths:
+            assert outcome(length) == expected[length], length
+    finally:
+        undo()
+
+
 def test_fast_mask_only_without_generation_block(tokenizer, monkeypatch):
     monkeypatch.setenv("SOUP_SOLUTION_FAST_ROWS", "1")
     undo = trainer_build.install()
@@ -133,6 +177,67 @@ def test_fast_int_list_matches_loop(monkeypatch):
                 fast(bad, field="x", allow_bool=allow_bool)
     finally:
         undo()
+
+
+def test_fast_tokenization_does_not_cache_standins():
+    """A fake tokenizer can change its answer on each call: always take Soup's code."""
+    calls = []
+
+    def original(tokenizer, messages):
+        calls.append(True)
+        return [len(calls)]
+
+    class Fake:
+        chat_template = CHATML
+
+    fast = trainer_build._fast_tokenize_only(original)
+    tok = Fake()
+    assert fast(tok, ROWS[0]) == [1]
+    assert fast(tok, ROWS[0]) == [2]
+
+
+def test_fast_rows_fall_back_for_instance_template_override(tokenizer):
+    import copy
+    import types
+
+    tok = copy.deepcopy(tokenizer)
+    calls = []
+
+    def apply(self, messages, **kwargs):
+        calls.append(True)
+        return {"input_ids": [len(calls)], "assistant_masks": [1]}
+
+    tok.apply_chat_template = types.MethodType(apply, tok)
+    assert trainer_build._template_without_generation(tok) is None
+    fast = trainer_build._fast_mask(loss_mask._apply_template_with_mask)
+    assert fast(tok, ROWS[0]) == ([1], [1])
+
+
+def test_fast_tokenization_tracks_vocabulary_changes(tokenizer):
+    import copy
+
+    tok = copy.deepcopy(tokenizer)
+    original = loss_mask._tokenize_only
+    fast = trainer_build._fast_tokenize_only(original)
+    messages = ROWS[0]
+    before = fast(tok, messages)
+    tok.add_tokens([messages[0]["content"]])
+    expected = original(tok, messages)
+    assert expected != before
+    assert fast(tok, messages) == expected
+
+
+def test_fast_tokenization_does_not_cache_nested_content(tokenizer):
+    """The memo copies only dictionaries; a nested message mutation must reach the original."""
+    messages = [{"role": "user", "content": [{"text": "first"}]}]
+
+    def original(tokenizer, rows):
+        return [len(rows[0]["content"][0]["text"])]
+
+    fast = trainer_build._fast_tokenize_only(original)
+    assert fast(tokenizer, messages) == [5]
+    messages[0]["content"][0]["text"] = "changed"
+    assert fast(tokenizer, messages) == [7]
 
 
 def _functions():

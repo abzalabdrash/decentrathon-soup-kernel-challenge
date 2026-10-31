@@ -268,8 +268,11 @@ def _cached_bias(owner, bases, dtype):
 
 
 def _no_hooks(*modules):
+    # The fused path reads a child's weights directly instead of calling that child. An instance
+    # forward override must stay observable, just like its hooks (the class-forward check alone
+    # in _plain_4bit does not see module.forward = ...).
     return not any(m._forward_hooks or m._forward_pre_hooks or m._backward_hooks
-                   or m._backward_pre_hooks for m in modules)
+                   or m._backward_pre_hooks or "forward" in vars(m) for m in modules)
 
 
 def _global_hooks():
@@ -345,9 +348,11 @@ def _lora(module):
             or lora_a.bias is not None or lora_b.bias is not None or not _no_hooks(lora_a, lora_b)):
         return None
     dropout = module.lora_dropout[name]
+    if not _no_hooks(dropout):
+        return None
     if type(dropout) is torch.nn.Identity:
         p = 0.0
-    elif type(dropout) is torch.nn.Dropout and not dropout.inplace and _no_hooks(dropout):
+    elif type(dropout) is torch.nn.Dropout and not dropout.inplace:
         p = float(dropout.p) if dropout.training else 0.0
     else:
         return None

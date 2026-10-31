@@ -98,10 +98,15 @@ def _template_without_generation(tokenizer):
         from transformers import PreTrainedTokenizerBase
     except Exception:  # noqa: BLE001
         return None
-    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+    if (not isinstance(tokenizer, PreTrainedTokenizerBase)
+            or not type(tokenizer).__module__.startswith("transformers.")):
         return None
     if getattr(type(tokenizer), "apply_chat_template", None) is not PreTrainedTokenizerBase.apply_chat_template:
         return None
+    method = getattr(tokenizer, "apply_chat_template", None)
+    if (getattr(method, "__func__", None) is not PreTrainedTokenizerBase.apply_chat_template
+            or getattr(method, "__self__", None) is not tokenizer):
+        return None  # an instance-level replacement can have its own behavior/state
     template = getattr(tokenizer, "chat_template", None)
     if not isinstance(template, str) or not template or _GENERATION.search(template):
         return None
@@ -128,23 +133,31 @@ MEMO_CALLS = 8  # _tokenize_only calls remembered: a row's prefixes come between
 
 
 def _fast_tokenize_only(original):
-    recent = []  # [(tokenizer, chat template, copy of the messages, ids)], newest last
+    recent = []  # [(tokenizer, signature, copy of the messages, ids)], newest last
 
     def _tokenize_only(tokenizer, messages, *args, **kwargs):
         if args or kwargs or not isinstance(messages, (list, tuple)):
             return original(tokenizer, messages, *args, **kwargs)
-        template = getattr(tokenizer, "chat_template", None)
         try:
-            for cached_tok, cached_template, cached, ids in reversed(recent):
-                if (cached_tok is tokenizer and cached_template is template and len(cached) == len(messages)
-                        and all(a == b for a, b in zip(cached, messages))):
-                    return list(ids)
+            # Soup's regression tests use stand-ins; custom tokenizers can be stateful. Nested
+            # multimodal messages cannot be remembered by the shallow dict copy below either.
+            plain = (_template_without_generation(tokenizer) is not None
+                     and all(type(m) is dict and all(type(v) is str for v in m.values())
+                             for m in messages))
+            if plain:
+                signature = _signature(tokenizer)
+                for cached_tok, cached_signature, cached, ids in reversed(recent):
+                    if (cached_tok is tokenizer and cached_signature == signature and len(cached) == len(messages)
+                            and all(a == b for a, b in zip(cached, messages))):
+                        return list(ids)
         except Exception:  # noqa: BLE001
             recent.clear()
+            plain = False
+        if not plain:
+            return original(tokenizer, messages)
         ids = original(tokenizer, messages)
         try:
-            recent.append((tokenizer, template, [dict(m) if isinstance(m, dict) else m for m in messages],
-                           list(ids)))
+            recent.append((tokenizer, signature, [dict(m) for m in messages], list(ids)))
             del recent[:-MEMO_CALLS]
         except Exception:  # noqa: BLE001
             recent.clear()

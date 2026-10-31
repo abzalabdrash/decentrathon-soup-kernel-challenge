@@ -561,7 +561,7 @@ def test_qkv_rebuilds_x16_from_the_input_norm(layer_1p5b, fused_norm):
 # guards
 
 
-def test_guards_take_the_previous_path(layer_1p5b):
+def test_guards_take_the_previous_path(layer_1p5b, monkeypatch):
     from solution import fused_proj
     from solution.unpad import varlen
 
@@ -600,8 +600,25 @@ def test_guards_take_the_previous_path(layer_1p5b):
     attn.k_proj = k_proj
     assert plan() is not None
 
+    # Every child that the fused implementation bypasses must retain an instance's own forward.
+    # Even Identity can have hooks/a forward installed by instrumentation or a fake-module test.
+    for module in (attn.q_proj, attn.q_proj.base_layer, attn.q_proj.lora_A["default"],
+                   attn.q_proj.lora_B["default"], attn.q_proj.lora_dropout["default"], attn.k_proj):
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "forward", lambda value: value)
+            assert plan() is None
+        assert plan() is not None
+    handle = attn.q_proj.lora_dropout["default"].register_forward_hook(lambda *a: None)
+    try:
+        assert plan() is None
+    finally:
+        handle.remove()
+
     with torch.autocast("cuda", dtype=torch.float16):
         assert fused_proj._mlp_plan(mlp, x) is not None
+        with monkeypatch.context() as patch:
+            patch.setattr(mlp.gate_proj, "forward", lambda value: value)
+            assert fused_proj._mlp_plan(mlp, x) is None
         assert fused_proj._mlp_plan(mlp, x[:, :64]) is None  # bitsandbytes' small-M GEMM
         assert fused_proj._mlp_plan(mlp, x.cpu()) is None
     with torch.autocast("cuda", dtype=torch.bfloat16):

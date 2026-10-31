@@ -30,6 +30,28 @@ def test_mlp_half_matches_original():
     torch.testing.assert_close(x.grad, x_ref.grad, rtol=5e-2, atol=5e-2)
 
 
+def test_fp32_without_autocast_keeps_original_forward():
+    """An unexpected full-precision MLP must not receive forced fp16 inputs."""
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
+
+    from solution.mlp16 import patch_qwen2_mlp_half
+
+    patch_qwen2_mlp_half()
+    original = Qwen2MLP._soup_original_forward
+    config = Qwen2Config(hidden_size=64, intermediate_size=160)
+    mlp = Qwen2MLP(config).cuda().float()
+    x = torch.randn(1, 7, 64, device="cuda", requires_grad=True)
+    ref_x = x.detach().clone().requires_grad_(True)
+    expected = original(mlp, ref_x)
+    got = mlp(x)
+    expected.sum().backward()
+    got.sum().backward()
+    assert got.dtype == torch.float32
+    assert torch.equal(got, expected)
+    assert torch.equal(x.grad, ref_x.grad)
+
+
 def test_shrink_embeddings_is_exact_only():
     from solution.embed16 import shrink_embeddings
 
