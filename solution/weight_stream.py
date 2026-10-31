@@ -107,6 +107,11 @@ EARLY_RELEASE = _env_on("SOUP_SOLUTION_RING_EARLY_RELEASE", "1")
 # last two layers' matrices resident for the backward (+6.8 MiB per slot on Qwen2.5-1.5B)
 MLP_SLOTS = {name: max(1, min(2, int(os.environ.get(f"SOUP_SOLUTION_RING_SLOTS_{name.upper()}", "1") or 1)))
              for name in ("gate", "up", "down")}
+# SOUP_SOLUTION_STREAM_DIET=1 (task P3): an untimed copy and wait call the events directly (no torch Python
+# wrappers) and switch to the copy stream only around the copy itself
+_DIET = _env_on("SOUP_SOLUTION_STREAM_DIET", "1")
+_record = torch._C._CudaEventBase.record
+_wait_on = torch._C._CudaEventBase.wait
 _RING = {"timing": _env_on("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0"),
          "stream_timing": _env_on("SOUP_SOLUTION_STREAM_TIMING", "0")}
 
@@ -722,6 +727,17 @@ class WeightStreamer:
         if timed is None:
             timed = self.matrix_timing if g else self.timing
         copy_stream = self._copy_stream
+        if _DIET and not timed:
+            free = self._free[s]
+            _record(free, self._compute())
+            _wait_on(free, copy_stream)
+            with self._side():
+                dst.copy_(src, non_blocking=True)
+            _record(self._ready[s], copy_stream)
+            self._owner[s] = j
+            self.loads += 1
+            self.group_loads[g] += 1
+            return
         self._free[s].record(self._compute())
         with self._side():
             copy_stream.wait_event(self._free[s])
@@ -744,7 +760,10 @@ class WeightStreamer:
         +-2, with SOUP_SOLUTION_WEIGHT_RING_TIMING=1)."""
         compute = self._compute()
         if not (self.matrix_timing if kind in (2, -2) else self.timing):
-            compute.wait_event(self._ready[s])
+            if _DIET:
+                _wait_on(self._ready[s], compute)
+            else:
+                compute.wait_event(self._ready[s])
             return
         begin, end = self._event(), self._event()
         begin.record(compute)
