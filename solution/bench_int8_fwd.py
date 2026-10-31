@@ -79,11 +79,14 @@ def timing(args):
     for m in args.m:
         x = torch.randn(1, m, 1536, device="cuda", generator=torch.Generator("cuda").manual_seed(m))
         plan = fused_proj._mlp_plan(mlp, x)
-        variants = {"fp16": None, "all": (*ops, None), "gu": (*ops, None), "guk": (*ops, topk)}
+        # name -> (plan.int8, MODE, CHUNKS): fp16, int8 gate|up and down, int8 gate|up with or
+        # without the top-k channels, the int32 product in 1, 5 or 10 chunks
+        variants = {"fp16": (None, "gu", 1), "all": ((*ops, None), "all", 1),
+                    "gu5": ((*ops, None), "gu", 5), "guk1": ((*ops, topk), "gu", 1),
+                    "guk5": ((*ops, topk), "gu", 5), "guk10": ((*ops, topk), "gu", 10)}
 
         def call(name):
-            plan.int8 = variants[name]
-            int8_fwd.MODE = "gu" if name == "guk" else (name if name != "fp16" else int8_fwd.MODE)
+            plan.int8, int8_fwd.MODE, int8_fwd.CHUNKS = variants[name]
             return fused_proj._MLP.forward(ctx, x, plan)
 
         for name in variants:
@@ -102,10 +105,8 @@ def timing(args):
                 times[name].append(start.elapsed_time(end) / args.iters)
         med = {name: statistics.median(t) for name, t in times.items()}
         results[m] = med
-        print(f"M={m}: fp16 {med['fp16']:.3f} ms, int8 all {med['all']:.3f} ms "
-              f"(x{med['fp16'] / med['all']:.2f}), int8 gu {med['gu']:.3f} ms "
-              f"(x{med['fp16'] / med['gu']:.2f}), gu + top-{int8_fwd.TOPK} {med['guk']:.3f} ms "
-              f"(x{med['fp16'] / med['guk']:.2f})", flush=True)
+        print(f"M={m}: " + ", ".join(f"{name} {ms:.3f} ms (x{med['fp16'] / ms:.2f})"
+                                     for name, ms in med.items()), flush=True)
         if m in args.profile:
             for name in variants:
                 kernels = _profile(lambda: call(name))

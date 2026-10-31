@@ -28,9 +28,10 @@ The int8 weights take the place of the fp16 rebuilds in fused_proj's shared buff
 exactly the size of one fp16 (I, D) weight). The int32 product of step 3 is 2I * M / CHUNKS * 4 bytes
 (transient).
 
-Schedule: the five kernels are compiled by a thread started at the first eligible forward; the first
-START_CALLS eligible MLP forwards (four steps of the 28-layer model) take the fp16 path, and the next
-one waits for the thread if it is not done, so which forwards run int8 never depends on timing. Only
+Schedule: the kernels are compiled by a thread started at an eligible forward; the first
+START_CALLS eligible MLP forwards (eight steps of the 28-layer model) take the fp16 path, and the next
+one waits for the thread if it is not done, so which forwards run int8 never depends on timing (the
+thread starts at the COMPILE_CALLS-th, in step 2). Only
 forwards with autograd on count (the training's), no-grad forwards (Soup's rewind or generation)
 stay fp16.
 
@@ -57,8 +58,13 @@ def _env_on(name, default):
 
 _STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "1" if _soup_train_process() else "0"),
           "thread": None, "calls": 0}
-# the first START_CALLS eligible forwards stay fp16 while the thread compiles (4 steps x 28 layers)
-START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_START_CALLS", "112"))
+# the first START_CALLS eligible forwards stay fp16 (8 steps x 28 layers); the compile thread starts
+# at eligible forward COMPILE_CALLS (step 2: steps 0 and 1 are the CPU-heavy ones, the later steps
+# wait on the GPU and leave the CPU to the thread). T4, soup-i1-abba4: started at the first forward
+# with the switch after 4 steps, the thread cost steps 0-4 +100 / +200 / +30 / +67 / +450 ms (the
+# last one the switch waiting for it)
+START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_START_CALLS", "224"))
+COMPILE_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_COMPILE_CALLS", "57"))
 # products of the gate|up GEMM (2I / CHUNKS weight rows each, one int32 buffer reused)
 CHUNKS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_CHUNKS", "5"))
 # which GEMMs run int8: "all" (gate|up and down) or "gu" (gate|up only: its epilogue writes the
@@ -391,11 +397,12 @@ def observing():
 def usable(tokens):
     """Whether the int8 path takes this MLP forward (the caller has checked the plan: NF4 weights in
     nf4.py's layout, the shapes, autograd on, (gate|up) kept): switched on, more than 16 tokens, a
-    multiple of OUT_ROWS, START_CALLS such forwards ran before (the kernels compile meanwhile)."""
+    multiple of OUT_ROWS, START_CALLS such forwards ran before (the kernels compile meanwhile, from
+    the COMPILE_CALLS-th)."""
     if not _STATE["on"] or tokens <= 16 or tokens % OUT_ROWS:
         return False
     _STATE["calls"] += 1
-    if not _READY.is_set():
+    if not _READY.is_set() and _STATE["calls"] >= min(COMPILE_CALLS, START_CALLS + 1):
         _start_compile()
     if _STATE["calls"] <= START_CALLS:
         return False  # fp16 for the first START_CALLS, compiled or not: the switch point is fixed
