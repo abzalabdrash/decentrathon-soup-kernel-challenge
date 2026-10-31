@@ -37,6 +37,7 @@ NOGC (another session); the thread takes 0.45-0.53 s and is done before main() r
 import atexit
 import gc
 import os
+import sys
 import threading
 import time
 
@@ -68,6 +69,13 @@ def _release(device):
     _STATE["seconds"] = time.perf_counter() - started
 
 
+def _soup_train_process():
+    """True in the measured `soup train` process (the harness runs Soup's CLI with that argv), False
+    under pytest and other callers: there the collector must stay on after a tiny training."""
+    argv = sys.argv
+    return len(argv) >= 2 and os.path.basename(argv[0]).split(".")[0] == "soup" and argv[1] == "train"
+
+
 def start_release(device=None):
     """Starts the release thread once (later calls do nothing). Returns the thread."""
     if _STATE["thread"] is None:
@@ -75,8 +83,8 @@ def start_release(device=None):
         _STATE["thread"] = thread
         thread.start()
         atexit.register(lambda: print(f"[solution] exit release: {report()}", flush=True))
-        if _on("SOUP_SOLUTION_EXIT_NOGC"):
-            gc.disable()
+        if _on("SOUP_SOLUTION_EXIT_NOGC") and _soup_train_process():
+            gc.disable()  # only in the `soup train` process: a test process keeps its collector
     return _STATE["thread"]
 
 

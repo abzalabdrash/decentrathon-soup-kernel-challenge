@@ -72,6 +72,25 @@ served (a select on the same immutable EntryPoints object) only while sys.path i
 read with, until Soup's train() returns. Nothing is installed during a run (the rules forbid it; the
 harness compares `pip freeze`), and the GPUs do not change, so the answers are the ones the calls
 would give later; the organizers allow the same for packages_distributions().
+SOUP_SOLUTION_EARLY_PROBES=p2p: only accelerate's check in the thread (the entry points scan, Python
+reading files, costs more under the warm-up's GIL contention in a thread than in the main thread,
+night session 5: 0.36 thread-s against 70 ms; the check is a wait for nvidia-smi, 64 ms of the main
+thread in the trainer build on the T4, soup-s1-diag0).
+
+SOUP_SOLUTION_HELD_ENCODE=1: Soup's row tokenization calls the tokenizer once per
+text, and transformers' `TokenizersBackend._encode_plus` (tokenization_utils_tokenizers.py:1027)
+hands even a single text to the Rust tokenizer's `encode_batch`, which releases the GIL around its
+work (~0.1 ms of Rust per row) and must take it back afterwards. While the warm-up threads compile
+kernels, every such retake waits until a worker drops the GIL at its next switch interval (1 ms
+while the warm-up runs): on the T4 (soup-s1-diag0, startup profile) the 256 rows' `encode_batch`
+calls took 1.17 s of a 1.66 s tokenization window in which the main thread got 23 % of a CPU. On a
+4-CPU WSL box with one busy Python thread, 512 calls: `encode_batch([text])` 0.71 s, `encode(text)`
+0.15 s, 0.06 s alone. While Soup's setup runs, `_encode_plus` sees the tokenizer through a stand-in
+whose `encode_batch` of one plain text (no pretokenized input, no padding configured on the Rust
+tokenizer) returns `[encode(text)]`: tokenizers' `encode_batch` is `encode` mapped over the inputs
+plus a batch padding that is off here, so the encodings are the same (ids, type ids, masks, offsets,
+tokens, word ids, overflow: checked on the 256 training rows); anything else, and every other
+attribute, goes to the tokenizer itself. The stand-in lives only for that one call.
 """
 
 import dis
@@ -442,7 +461,8 @@ _PROBES = {"current": None, "patched": False}
 
 
 class _Probes:
-    def __init__(self):
+    def __init__(self, entry_points=True):
+        self.with_entry_points = entry_points
         self.entry_points = self.sys_path = self.p2p = None
         self.p2p_function = None
         self.done = threading.Event()
@@ -450,10 +470,11 @@ class _Probes:
 
     def _work(self):
         try:
-            import importlib.metadata as metadata
+            if self.with_entry_points:
+                import importlib.metadata as metadata
 
-            self.sys_path = tuple(sys.path)
-            self.entry_points = getattr(metadata.entry_points, "_soup_original", metadata.entry_points)()
+                self.sys_path = tuple(sys.path)
+                self.entry_points = getattr(metadata.entry_points, "_soup_original", metadata.entry_points)()
         except Exception:  # noqa: BLE001
             self.entry_points = None
         try:
@@ -519,7 +540,7 @@ def _start_probes(tokenizer):
             return
     except Exception:  # noqa: BLE001
         return
-    probes = _Probes()
+    probes = _Probes(entry_points=os.environ.get("SOUP_SOLUTION_EARLY_PROBES", "").strip().lower() != "p2p")
     _PROBES["current"] = probes
     probes.thread.start()
 
@@ -548,11 +569,67 @@ def _cheap_update_fingerprint(original):
     return update_fingerprint
 
 
+# ---------------------------------------------------------------- SOUP_SOLUTION_HELD_ENCODE
+
+class _SingleEncode:
+    """Stands for a tokenizers.Tokenizer inside one `_encode_plus` call: a batch of one text is
+    encoded with `encode`, which keeps the GIL, instead of `encode_batch`, which releases it (see
+    the module docstring); everything else goes to the tokenizer itself."""
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._inner, name, value)
+
+    def encode_batch(self, input, is_pretokenized=False, add_special_tokens=True):  # noqa: A002 - tokenizers' name
+        inner = self._inner
+        if (type(input) is list and len(input) == 1 and type(input[0]) is str and not is_pretokenized
+                and inner.padding is None):
+            return [inner.encode(input[0], is_pretokenized=False, add_special_tokens=add_special_tokens)]
+        return inner.encode_batch(input, is_pretokenized=is_pretokenized, add_special_tokens=add_special_tokens)
+
+
+def _held_encode_plus(original):
+    try:
+        from tokenizers import Tokenizer
+    except Exception:  # noqa: BLE001
+        Tokenizer = None
+
+    def _encode_plus(self, *args, **kwargs):
+        state = getattr(self, "__dict__", None)
+        inner = state.get("_tokenizer") if isinstance(state, dict) else None
+        if Tokenizer is None or type(inner) is not Tokenizer:
+            return original(self, *args, **kwargs)
+        state["_tokenizer"] = _SingleEncode(inner)
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if type(state.get("_tokenizer")) is _SingleEncode:
+                state["_tokenizer"] = inner
+
+    _encode_plus._soup_original = original
+    return _encode_plus
+
+
 # ---------------------------------------------------------------- scoping
 
 def _replacements():
     """[(owner, attribute, factory)] for the switches that are on."""
     out = []
+    if _flag("SOUP_SOLUTION_HELD_ENCODE"):
+        try:
+            from transformers.tokenization_utils_tokenizers import TokenizersBackend
+
+            if callable(TokenizersBackend.__dict__.get("_encode_plus")):
+                out.append((TokenizersBackend, "_encode_plus", _held_encode_plus))
+        except Exception:  # noqa: BLE001
+            pass
     if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT", "1"):  # on by default since the night integration
         try:
             import datasets.arrow_dataset

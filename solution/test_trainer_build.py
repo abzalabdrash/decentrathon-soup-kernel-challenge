@@ -370,3 +370,133 @@ def test_probes_alone_do_not_tokenize_early(tokenizer, tmp_path):
         assert early.thread is None
     finally:
         undo()
+
+
+def _encodings(tok, texts):
+    """Everything transformers returns for these calls, as plain values."""
+    out = []
+    for text in texts:
+        for kwargs in ({}, {"return_offsets_mapping": True, "return_special_tokens_mask": True},
+                       {"truncation": True, "max_length": 5, "return_overflowing_tokens": True, "stride": 1},
+                       {"padding": "max_length", "max_length": 64}, {"add_special_tokens": False}):
+            out.append({key: value for key, value in tok(text, **kwargs).items()})
+        out.append(dict(tok(text, text[::-1])))
+    out.append(dict(tok(list(texts))))
+    out.append(dict(tok(list(texts), padding=True)))
+    return out
+
+
+def test_held_encode_same_encodings(tokenizer, monkeypatch):
+    texts = [tokenizer.apply_chat_template(row, tokenize=False) for row in ROWS] + ["", "a b c"]
+    expected = _encodings(tokenizer, texts)
+    expected_ids = [tokenizer.apply_chat_template(row, tokenize=True) for row in ROWS]
+    expected_labels = _labels(tokenizer)
+    backend = tokenizer._tokenizer
+    monkeypatch.setenv("SOUP_SOLUTION_HELD_ENCODE", "1")
+    undo = trainer_build.install()
+    try:
+        cls = transformers.tokenization_utils_tokenizers.TokenizersBackend
+        assert getattr(cls._encode_plus, "_soup_original", None) is not None
+        assert _encodings(tokenizer, texts) == expected
+        assert [tokenizer.apply_chat_template(row, tokenize=True) for row in ROWS] == expected_ids
+        assert _labels(tokenizer) == expected_labels
+        assert tokenizer._tokenizer is backend  # the stand-in lives only inside one call
+    finally:
+        undo()
+    assert getattr(transformers.tokenization_utils_tokenizers.TokenizersBackend._encode_plus,
+                   "_soup_original", None) is None
+
+
+def test_held_encode_stand_in(tokenizer):
+    backend = tokenizer._tokenizer
+    stand_in = trainer_build._SingleEncode(backend)
+    for text in ("Сәлем, қалайсың?", "", "the lazy dog " * 30):
+        for special in (True, False):
+            a = stand_in.encode_batch([text], add_special_tokens=special)
+            b = backend.encode_batch([text], add_special_tokens=special)
+            assert len(a) == len(b) == 1
+            for field in ("ids", "type_ids", "attention_mask", "special_tokens_mask", "offsets", "tokens",
+                          "word_ids", "sequence_ids"):
+                assert getattr(a[0], field) == getattr(b[0], field)
+    # batches, pairs and pretokenized input go to encode_batch itself
+    assert [e.ids for e in stand_in.encode_batch(["a", "b c"])] == [e.ids for e in backend.encode_batch(["a", "b c"])]
+    assert [e.ids for e in stand_in.encode_batch([("a", "b")])] == [e.ids for e in backend.encode_batch([("a", "b")])]
+    assert ([e.ids for e in stand_in.encode_batch([["a", "b"]], is_pretokenized=True)]
+            == [e.ids for e in backend.encode_batch([["a", "b"]], is_pretokenized=True)])
+    # attributes are the tokenizer's own, both ways
+    flag = backend.encode_special_tokens
+    stand_in.encode_special_tokens = not flag
+    assert backend.encode_special_tokens is (not flag) and stand_in.encode_special_tokens is (not flag)
+    backend.encode_special_tokens = flag
+    assert stand_in.get_vocab_size() == backend.get_vocab_size()
+
+
+def test_held_encode_restores_after_error(tokenizer, monkeypatch):
+    backend = tokenizer._tokenizer
+    monkeypatch.setenv("SOUP_SOLUTION_HELD_ENCODE", "1")
+    undo = trainer_build.install()
+    try:
+        with pytest.raises(ValueError):
+            tokenizer(123)  # not a text: transformers raises inside _encode_plus
+        assert tokenizer._tokenizer is backend
+    finally:
+        undo()
+
+
+def test_held_encode_real_rows(monkeypatch):
+    """Qwen2.5's tokenizer (when it is in the local Hugging Face cache) on the task's training rows:
+    the same input ids and labels through Soup's row formatting with and without the switch."""
+    import json
+    from pathlib import Path
+
+    rows_file = Path(__file__).resolve().parents[1] / "data" / "train.jsonl"
+    try:
+        tok = transformers.AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", local_files_only=True)
+    except Exception:  # noqa: BLE001 - not downloaded here
+        pytest.skip("Qwen2.5 tokenizer not in the local cache")
+    if not rows_file.exists():
+        pytest.skip("data/train.jsonl not prepared")
+    rows = [json.loads(line) for line in rows_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    conversations = [[{"role": "user", "content": (row.get("instruction", "") + "\n" + row.get("input", "")).strip()},
+                      {"role": "assistant", "content": row.get("output", "")}] for row in rows]
+    expected = [loss_mask.build_assistant_only_labels(c, tok, max_length=512) for c in conversations]
+    texts = [tok.apply_chat_template(c, tokenize=False) for c in conversations]
+    expected_offsets = [tok(t, return_offsets_mapping=True)["offset_mapping"] for t in texts]
+    monkeypatch.setenv("SOUP_SOLUTION_HELD_ENCODE", "1")
+    undo = trainer_build.install()
+    try:
+        assert [loss_mask.build_assistant_only_labels(c, tok, max_length=512) for c in conversations] == expected
+        assert [tok(t, return_offsets_mapping=True)["offset_mapping"] for t in texts] == expected_offsets
+    finally:
+        undo()
+
+
+def test_early_probes_p2p_only(monkeypatch):
+    """SOUP_SOLUTION_EARLY_PROBES=p2p: the thread checks P2P only; entry_points() is the original."""
+    import importlib.metadata as metadata
+
+    accelerate_state = pytest.importorskip("accelerate.state")
+    torch = pytest.importorskip("torch")
+    saved_ep, saved_p2p = metadata.entry_points, accelerate_state.check_cuda_p2p_ib_support
+    saved_flag = trainer_build._PROBES["patched"]
+    trainer_build._PROBES["patched"] = False
+    monkeypatch.setenv("SOUP_SOLUTION_EARLY_PROBES", "p2p")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    calls = []
+    try:
+        trainer_build._patch_probes()
+        patched_ep = metadata.entry_points
+        monkeypatch.setattr(patched_ep, "_soup_original", lambda **k: calls.append(k) or saved_ep(**k))
+        trainer_build._start_probes(transformers.PreTrainedTokenizerFast(
+            tokenizer_object=tokenizers.Tokenizer(tokenizers.models.BPE())))
+        probes = trainer_build._PROBES["current"]
+        assert probes is not None and not probes.with_entry_points
+        probes.thread.join(30)
+        assert probes.entry_points is None and calls == []  # nothing scanned in the thread
+        assert accelerate_state.check_cuda_p2p_ib_support() == probes.p2p
+        assert sorted(metadata.entry_points(group="console_scripts")) == sorted(saved_ep(group="console_scripts"))
+    finally:
+        trainer_build._PROBES["current"] = None
+        metadata.entry_points = saved_ep
+        accelerate_state.check_cuda_p2p_ib_support = saved_p2p
+        trainer_build._PROBES["patched"] = saved_flag

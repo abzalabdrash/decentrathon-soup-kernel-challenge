@@ -57,6 +57,19 @@ Each replacement lives only for the import it serves and is undone right after (
 function is put back), and only modules imported in that window keep the answer. If a module is
 already imported, nothing is replaced for it.
 
+SOUP_SOLUTION_ENTRY_POINTS (on by default, =0 for the original): `importlib.metadata.entry_points()` reads the entry points of every
+installed distribution on each call (about a thousand on Kaggle: 63 ms for Soup's plugin discovery
+at the start of train() in the T4 profile, soup-s1-diag0), and after the harness's prelude the run
+calls it three times: bitsandbytes' backend discovery (bitsandbytes/__init__.py:70) and fsspec's
+registry (fsspec/__init__.py:75) during apply()'s imports, Soup's plugin discovery
+(soup_cli/plugins/__init__.py:193) when train() begins. From the start of apply() the full set is
+read once and every call is answered with its `select(**params)`, which is how the original builds
+its answer (`EntryPoints(...).select(**params)`, importlib/metadata/__init__.py); EntryPoints is an
+immutable tuple. It is read again whenever sys.path differs from the one it was read with. Nothing
+is installed during a run (the rules forbid it; the harness compares `pip freeze`), so the answers
+are the ones the calls would compute; the organizers allow the same for packages_distributions().
+This replacement stays for the whole run.
+
 The objects of all these imports live as long as the process. `freeze_imported_objects` (the end
 of apply()) moves them out of the garbage collector's reach with `gc.freeze()`, CPython's API for
 exactly that: the full collections that come later (accelerate's `free_memory` runs `gc.collect()`
@@ -101,8 +114,8 @@ import types
 from .phases import mark
 
 
-def _flag(name):
-    return os.environ.get(name, "0") not in ("0", "false", "no", "")
+def _flag(name, default="0"):
+    return os.environ.get(name, default) not in ("0", "false", "no", "")
 
 
 # ---------------------------------------------------------------- imports
@@ -153,6 +166,42 @@ def _not_installed():
     return False
 
 
+_ENTRY_POINTS = {"path": None, "value": None, "reads": 0, "served": 0}
+
+
+def _shared_entry_points(original):
+    """importlib.metadata.entry_points for SOUP_SOLUTION_ENTRY_POINTS (see the module docstring)."""
+
+    def entry_points(**params):
+        path = tuple(sys.path)
+        if _ENTRY_POINTS["path"] != path or _ENTRY_POINTS["value"] is None:
+            _ENTRY_POINTS["value"] = original()
+            _ENTRY_POINTS["path"] = path
+            _ENTRY_POINTS["reads"] += 1
+        else:
+            _ENTRY_POINTS["served"] += 1
+        everything = _ENTRY_POINTS["value"]
+        return everything.select(**params) if params else everything
+
+    entry_points._soup_original = original
+    return entry_points
+
+
+def share_entry_points():
+    """Installs _shared_entry_points (once). Returns whether it is installed."""
+    import importlib.metadata as metadata
+
+    current = metadata.entry_points
+    if getattr(current, "_soup_shared", False):
+        return True
+    if getattr(current, "_soup_original", None) is not None:
+        return False  # someone else's replacement (the probes of trainer_build.py): leave it
+    shared = _shared_entry_points(current)
+    shared._soup_shared = True
+    metadata.entry_points = shared
+    return True
+
+
 _SKIPPED = ("sklearn", "wandb", "networkx", "torch._inductor.compile_fx", "scipy.optimize",
             "torchvision")  # checked in the log, after apply() and at the first step
 
@@ -191,6 +240,11 @@ def prepare_imports(log=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
     Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
     seconds = {}
+    if _flag("SOUP_SOLUTION_ENTRY_POINTS", "1"):
+        try:
+            share_entry_points()  # before bitsandbytes and fsspec read them
+        except Exception:  # noqa: BLE001 - every call reads them then
+            pass
     try:
         import transformers
         import transformers.utils
