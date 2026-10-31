@@ -115,7 +115,16 @@ soup-a1-extremes2 (peagverr, main 5f3fd27 = 8d2d0bd + S1 + A1 + R3, seed 101, `-
 - `test_offload.py::test_mode_matches_plain_and_lowers_peak[offload]`: 13 выгруженных тензоров вместо 12, лишний помечен как вход слоя. Метка `mark_residual`/`mark_offload`, не взятая в каком-то более раннем тесте (forward без графа), осталась в глобальном `_RESIDUAL["marked"]`, и fp32-тензор теста получил тот же адрес. Значения при этом верные, меняется только счёт. Исправлено в `offload.py:offload_saved_tensors`: на входе в контекст метки сбрасываются (поставленная до входа метка может быть только протухшей; в обучении контекст открывается один раз в начале `train()`, то есть это ничего не меняет). Тест `test_jury_offload_marks.py` падает на 5f3fd27 и проходит с правкой; `test_offload.py`, `test_xoffload.py` целиком проходят (28).
 - `test_trainer_build.py::test_early_probes_serve_same_answers`: `startup._shared_entry_points` (S1, `SOUP_SOLUTION_ENTRY_POINTS`, теперь включён по умолчанию) уже обернул `importlib.metadata.entry_points` и поставил `_soup_original`, когда `apply()` вызывался в более раннем тесте той же сессии; `trainer_build._patch_probes` по этому маркеру не оборачивает повторно, и утверждение `metadata.entry_points is not saved_ep` падает. В прогоне `soup train` это ни на что не влияет: `SOUP_SOLUTION_EARLY_PROBES` выключен по умолчанию, `_patch_probes` не вызывается. Правка за S1 (тест должен ставить исходный `entry_points` через monkeypatch, либо `_patch_probes` должен смотреть свой маркер, а не общий `_soup_original`).
 
-(longest2 на 5f3fd27: ниже, когда придёт)
+soup-a1-longest2 (peagverr, main 5f3fd27, seed 103, `--select longest`, все шаги по 2 048 токенов). База OOM (14 667 MiB). Решение: 68,6 / 69,6 с (на ce27a54 было 70,7 / 74,9), пик 431 MiB, reserved 310 (запас проверки 9: 130 MiB), свои ядра 10,7 / 10,6 %, медиана шага 0,78 / 0,79 с; проверки 2, 3, 4, 9, 10 пройдены; выпуск при выходе «2560 MiB of offload slabs freed, 1090 MiB unregistered in 0.52 s»; 0 повторов аллокатора и освобождений сегментов, все копии по префетчу, 10 заготовленных слабов. `pytest solution`: те же два падения, что в extremes2 (в 5f3fd27 ещё нет de0292c и правки S1).
+
+Сводка четырёх стресс-прогонов (только прогоны решения; база во всех четырёх падает по памяти):
+
+| Прогон | sha | стена, с | пик / reserved, MiB | запас пр. 9, MiB | свои ядра | откаты, поздние копии |
+|---|---|---|---|---|---|---|
+| extremes, seed 97 | ce27a54 | 56,1 / 55,8 | 471 / 350 | 131 | 10,7 / 10,8 % | нет |
+| longest, seed 83 | ce27a54 | 70,7 / 74,9 | 431 / 310 | 130 | 10,1 / 9,6 % | нет |
+| extremes2, seed 101 | 5f3fd27 | 51,8 / 52,2 | 471 / 350 | 131 | 11,5 / 11,4 % | нет |
+| longest2, seed 103 | 5f3fd27 | 68,6 / 69,6 | 431 / 310 | 130 | 10,7 / 10,6 % | нет |
 
 ## 6. Перед сдачей: что прогнать на финальном коммите
 
