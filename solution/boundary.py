@@ -25,8 +25,9 @@ Here the same results come from lists made once per training run, for the real C
   transformers' `PreTrainedModel.train` (Qwen2ForCausalLM and Qwen2Model in transformers 5.16),
   which adds to it only a kernel re-cast when `use_kernels` is set and the mode changes: such
   models are checked for `use_kernels` at every call.
-Every list is dropped when a parameter or module is registered anywhere (torch's global
-registration hooks) or when the model's trainable set no longer matches the optimizer's; anything
+Every list is dropped when a parameter or module is registered on one of the model's modules
+(torch's global registration hooks; registrations elsewhere in the process, a deepcopy or another
+model, leave it) or when the model's trainable set no longer matches the optimizer's; anything
 else (Soup's tests with fake trainers, other models, DoRA's own `train`) runs the original code.
 SOUP_SOLUTION_STEP_BOUNDARY=1 turns it on (off by default until measured).
 """
@@ -37,12 +38,19 @@ import weakref
 import torch
 
 _STATE = {"on": os.environ.get("SOUP_SOLUTION_STEP_BOUNDARY", "0").strip().lower()
-          not in ("0", "false", "no", ""), "generation": 0, "hooks": None}
+          not in ("0", "false", "no", ""), "generation": 0, "hooks": None,
+          "watched": set(),  # ids of the listed models' modules
+          "builds": 0, "bumps": {}}  # (module type, name) -> registrations that dropped lists
 _CACHE = weakref.WeakKeyDictionary()  # model -> {"generation", "trainable", "modules", "flops_params"}
 
 
-def _bump(*_args, **_kwargs):
+def _bump(module=None, name=None, value=None, *_args, **_kwargs):
+    if module is not None and id(module) not in _STATE["watched"]:
+        return None  # not a module of a listed model (an id reused by a new object only rebuilds)
     _STATE["generation"] += 1
+    key = (type(module).__name__, name)
+    _STATE["bumps"][key] = _STATE["bumps"].get(key, 0) + 1
+    return None
 
 
 def _install_hooks():
@@ -57,11 +65,12 @@ def _entry(model):
     """The lists of `model` for the current registration generation (built on first use)."""
     entry = _CACHE.get(model)
     if entry is None or entry["generation"] != _STATE["generation"]:
-        _STATE["builds"] = _STATE.get("builds", 0) + 1
+        _STATE["builds"] += 1
         params = list(model.parameters())
         trainable = [p for p in params if p.requires_grad]
         frozen_with_grad = any(p.grad is not None for p in params if not p.requires_grad)
         modules = list(model.modules())
+        _STATE["watched"].update(id(m) for m in modules)
         pretrained_train = _pretrained_train()
         # nn.Module.train, or what calls it: PreTrainedModel.train, this module's PeftModel.train
         plain_trains = (torch.nn.Module.train, pretrained_train, _STATE.get("train"))

@@ -517,7 +517,7 @@ def _start_timing(trainer):
         setattr(owner, name, _timed_method(f"{owner.__name__}.{name}", fn))
     from . import boundary
 
-    builds = boundary._STATE.get("builds", 0)
+    builds = boundary._STATE["builds"]
 
     def restore():
         CallbackHandler.call_event = call_event
@@ -526,7 +526,9 @@ def _start_timing(trainer):
             setattr(owner, name, fn)
         for fn in undo:
             fn()
-        _TIMES["boundary.py list builds"] = [0.0, boundary._STATE.get("builds", 0) - builds]
+        _TIMES["boundary.py list builds"] = [0.0, boundary._STATE["builds"] - builds]
+        for (kind, name), count in boundary._STATE["bumps"].items():
+            _TIMES[f"boundary.py dropped by {kind}.{name}"] = [0.0, count]
 
     return restore
 
