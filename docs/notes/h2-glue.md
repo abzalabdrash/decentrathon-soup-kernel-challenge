@@ -46,5 +46,22 @@ h2-abba1 (c7ba0f4, ABBA 3 rounds + warm): glue off 49.02 s wall / steps 3+ 28.25
 steps 0-5 equal (the int8 backward starts after four steps), steps 6+ -0.54 s (-9.4 ms per step); peak 403 MiB and
 reserved 274 in both; own kernels 19.4 -> 20.3 %.
 
-Not done: the two (N, 1536) casts per layer (58 per step, 1.6 ms GPU) would go into the norm kernels' stores
-(rmsnorm.py / fused_proj.py, other owners); the GQA copies and sums and the attention fill are off limits.
+## After main faaa190 (P2's early release; merged at 6643497, only diag.py conflicted)
+
+- e4a866c: the MLP backward's gradient cast folded in too: fused_proj's int8 branch hands int8_bwd the gradient
+  as it comes (fp32 on the T4) and `quant_rows_kernel` rounds it to the half type and pads it to the GEMMs'
+  multiple of 8 itself (bit for bit as `_padded_half` then `_quant_rows`; test_quant_rows_from_fp32_padded, the
+  MLP backward test at 829 tokens): one cast (or empty + copy + zero when the tokens are not a multiple of 8)
+  less per layer. The int8 backward's compile thread compiles both variants (fp32 rounded, half as is).
+- Local: test_int8_glue + test_int8_bwd + test_offload_int8 37 passed; test_fused_proj + test_model_path 43.
+
+## What is left of the glue (h2-diag1's stacks, with the glue on)
+
+- The GQA expansions (`clone` of (1, N, 2, 6, 128), ~6 per layer and step) and their group sums (2 per layer),
+  the copy of grad_v into the q|k|v gradient (`as_strided(...).copy_(grad_v)`, 1 per layer), a (1, N, 2, 128)
+  clone (1 per layer), dropout's masks, the attention's 15.7 MB `zero_`: off limits for this task.
+- One (N, 1536) fp32 -> half cast per layer left: the attention block's `grad.to(half)` before the o_proj input
+  gradient GEMM (fused_proj.py:1117); it would go into the producer of that gradient (the post-attention norm's
+  backward in rmsnorm.py writing a half copy), another owner's kernel.
+- 113 scalar `add_` per step: AdamW's step counters of the 112 LoRA tensors (the optimizer: not ours to change).
+- No floor left; one clamp per step (the loss path's).
