@@ -107,3 +107,29 @@ def test_warmup_order_longest(monkeypatch):
     assert queued(None) == names
     assert queued("longest") == ["cublas", "rms_norm_rows_fwd", "head_stream_kernels", "unknown_kernel",
                                  "fused_proj_masked_pair_sum"]
+
+
+def test_light_triton_key(monkeypatch):
+    """SOUP_SOLUTION_TRITON_KEY=light: triton's key with libtriton.so named by its file attributes;
+    the other parts are triton's own; not installed once triton's own key was computed."""
+    from triton.runtime import cache
+
+    original = cache.triton_key
+    while getattr(original, "_soup_light", False):
+        pytest.skip("the light key is installed in this process already")
+    light = warmup._light_triton_key()
+    key = light()
+    assert key == light() and key.startswith(triton.__version__)
+    full = original()
+    ours, theirs = key[len(triton.__version__):].split("-"), full[len(triton.__version__):].split("-")
+    assert len(ours) == len(theirs)
+    differ = [i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b]
+    assert len(differ) == 1 and ours[differ[0]].startswith("libtriton:")  # only the binary's part
+    monkeypatch.setenv("SOUP_SOLUTION_TRITON_KEY", "light")
+    assert warmup.install_light_triton_key() is False  # triton's own key is computed (cached) here
+    assert cache.triton_key is original
+    import functools
+
+    monkeypatch.setattr(cache, "triton_key", functools.lru_cache()(original.__wrapped__))  # not computed yet
+    assert warmup.install_light_triton_key() is True and getattr(cache.triton_key, "_soup_light", False)
+    monkeypatch.delenv("SOUP_SOLUTION_TRITON_KEY")

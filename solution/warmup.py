@@ -78,7 +78,10 @@ Everything runs in this process. The compile, the
 ptxas and C compiler subprocesses and the cubin loads drop and retake the GIL many times, so the
 thread lowers the switch interval to 1 ms while it runs (see `_run`). Its largest single cost next
 to the model load was triton's own hash, 415 MB of libtriton.so read and digested (`_triton_key`):
-`start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. At
+`start_early`, first thing in apply(), runs it in a thread of its own, next to the imports. With
+SOUP_SOLUTION_TRITON_KEY=light the key names libtriton.so by its size, modification time and inode
+instead (`_light_triton_key`): on the 4-vCPU T4 box the 1.4 CPU-seconds of that hash run next to the
+GIL-bound imports, and the key only names entries of the run's own, initially empty, cache. At
 exit, `_shutdown` stops the warm-up between two registrations. `watch_compiles()` logs any compile
 (or on-disk cache read) outside the warm-up; the log line "waited N s for the warmup" at `train`
 begin shows whether the warm-up fits.
@@ -443,6 +446,66 @@ def _triton_key():
             triton_key()
         except Exception:  # noqa: BLE001 - another triton layout; the first compile does it then
             pass
+
+
+def _light_triton_key():
+    """triton/runtime/cache.py `triton_key` with libtriton.so named by its size, modification time
+    and inode instead of a sha256 of its 415 MB (SOUP_SOLUTION_TRITON_KEY=light): the key names the
+    entries of triton's on-disk cache, which the harness gives every run fresh and empty
+    (TRITON_CACHE_DIR in the run's directory, harness/run_task.py), so within a run any key that
+    identifies the installed triton does what triton's does; the kernels compiled are the same. The
+    other parts (the version and a sha256 of each source file of triton's compiler, backends and
+    language packages) are triton's own, in its order."""
+    import functools
+    import hashlib
+    import pkgutil
+    import sysconfig
+
+    from triton import __version__
+    from triton.runtime import cache
+
+    @functools.lru_cache()
+    def triton_key():
+        triton_path = os.path.dirname(os.path.dirname(os.path.abspath(cache.__file__)))
+        contents = []
+        with open(cache.__file__, "rb") as f:
+            contents += [hashlib.sha256(f.read()).hexdigest()]
+        for path, prefix in ((os.path.join(triton_path, "compiler"), "triton.compiler."),
+                             (os.path.join(triton_path, "backends"), "triton.backends.")):
+            for lib in pkgutil.walk_packages([path], prefix=prefix):
+                with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
+                    contents += [hashlib.sha256(f.read()).hexdigest()]
+        ext = sysconfig.get_config_var("EXT_SUFFIX").split(".")[-1]
+        stat = os.stat(os.path.join(triton_path, "_C", f"libtriton.{ext}"))
+        contents.append(f"libtriton:{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}")
+        language_path = os.path.join(triton_path, "language")
+        for lib in pkgutil.walk_packages([language_path], prefix="triton.language."):
+            with open(lib.module_finder.find_spec(lib.name).origin, "rb") as f:
+                contents += [hashlib.sha256(f.read()).hexdigest()]
+        return f"{__version__}" + "-".join(contents)
+
+    triton_key._soup_light = True
+    return triton_key
+
+
+def install_light_triton_key():
+    """SOUP_SOLUTION_TRITON_KEY=light: triton's cache key without hashing libtriton.so (see
+    _light_triton_key), unless triton computed its key already. Returns whether it is in place."""
+    if os.environ.get("SOUP_SOLUTION_TRITON_KEY", "").strip().lower() != "light":
+        return False
+    try:
+        from triton.runtime import cache
+
+        current = cache.triton_key
+        if getattr(current, "_soup_light", False):
+            return True
+        info = getattr(current, "cache_info", None)
+        if info is None or info().currsize:
+            return False  # computed already (or not triton's lru_cache function): keep it
+        cache.triton_key = _light_triton_key()
+        return True
+    except Exception:  # noqa: BLE001 - triton's own key then
+        return False
 
 
 def _prepare_triton():
@@ -840,6 +903,7 @@ def start_early(log=True):
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
+    install_light_triton_key()  # SOUP_SOLUTION_TRITON_KEY=light: no sha256 of libtriton.so
     threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
     start_launchers_ahead()  # SOUP_SOLUTION_LAUNCHERS_EARLY=1: the launchers built during the imports
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
