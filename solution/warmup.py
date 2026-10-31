@@ -495,7 +495,10 @@ def _worker(device, stream, log):
                                        else round(time.perf_counter() - start, 3))
         except Exception as exc:  # noqa: BLE001 - a warm-up must never break training
             _STATE["errors"][name] = repr(exc)
-            if log:
+            # not once the exit has begun (_STOP), like the "warmup done" line: printed after
+            # pytest's summary, a line with " failed" becomes the last summary line that
+            # harness/check_rules.py run_tests() reads, and check 10 fails with 79 passed
+            if log and not _STOP.is_set():
                 print(f"[solution] warmup {name} failed: {exc!r}", flush=True)
 
 
@@ -529,9 +532,10 @@ def _run(device, log, workers, switch):
             helpers.append(helper)  # only the threads that started are joined
         _worker(device, stream, log)
     except Exception as exc:  # noqa: BLE001
+        exiting = _STOP.is_set()  # the exit has begun: print nothing (see _worker)
         _STOP.set()  # the helpers finish the registration they are in and take no new one
         _STATE["errors"]["(thread)"] = repr(exc)
-        if log:
+        if log and not exiting:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
         # this thread's own setup or a later helper's start can fail while an earlier helper is

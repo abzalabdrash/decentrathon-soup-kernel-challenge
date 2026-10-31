@@ -144,3 +144,34 @@ def test_coordinator_failure_drains_live_helpers_before_done(monkeypatch, failur
             helper.join(5)
     assert not coordinator.is_alive() and done.is_set() and stop.is_set()
     assert "(thread)" in state["errors"] and synced == [True]
+
+
+def _check10_last_line(stdout):
+    """harness/check_rules.py run_tests(): the last line that names passed / failed / error."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    summary = [line for line in lines if " passed" in line or " failed" in line or "error" in line]
+    return (summary or lines or ["no output"])[-1]
+
+
+def test_registration_failing_during_exit_prints_nothing(monkeypatch, capsys):
+    """A registration that raises after the exit began (pytest has printed "79 passed" by then)
+    must not print "[solution] warmup <name> failed: ...": check_rules would read that line as the
+    summary and fail check 10. The error is still recorded."""
+    torch = pytest.importorskip("torch")
+    state, stop = warmup._new_state(), threading.Event()
+    monkeypatch.setattr(warmup, "_STATE", state)
+    monkeypatch.setattr(warmup, "_STOP", stop)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
+
+    def compile_during_exit():
+        stop.set()  # _shutdown runs while this registration compiles
+        raise RuntimeError("compiler gone")
+
+    state["queue"].put(("late", compile_during_exit))
+    state["closed"] = True
+    print("79 passed in 0.62s")
+    warmup._worker(0, None, log=True)
+    out = capsys.readouterr().out
+    assert "late" in state["errors"] and "failed" not in out
+    assert _check10_last_line(out) == "79 passed in 0.62s"
