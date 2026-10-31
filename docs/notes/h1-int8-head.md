@@ -108,3 +108,27 @@ delayed train begin by 0.35 s; at the first head it took 2.1 s (ready after 4-5 
 fe361ac: the quantization is one own kernel (int8_rows_kernel, also used for the hidden rows) per 1,024 rows on a
 stream of its own, all asynchronous with one synchronize (bench process: compilation 0.32 s, pinning 0.03,
 quantization 0.07 locally), the build at the first head by default.
+
+soup-h1-abba3 (ce85dc8, the async build with int8_rows_kernel; a hot session; ABBA 2 rounds + warm, peagverr):
+
+| variant | wall | steps 3+ | step 0 | train begin -> end | peak | own kernels |
+|---|---:|---:|---:|---:|---:|---:|
+| fp16 | 49.50 | 28.83 | 0.502 | 31.35 | 395 | 16.3 % |
+| **int8 (default: build at the first head, kernels compiled in its thread)** | **48.95 (-0.55)** | 28.07 (-0.76) | 0.626 | 30.72 (-0.63) | 395 | 18.6 % |
+| int8, kernels compiled in warmup.py's threads (SOUP_SOLUTION_HEAD_INT8_WARM=warmup) | 49.49 (-0.01) | 27.95 (-0.88) | 0.549 | 30.48 | 395 | 18.6 % |
+
+Per round the default is -0.94 and -0.16 s of wall. The build in training: compilation 1.67-1.82 s, pinning 0.12,
+quantization 0.13-0.18 (was 0.64-0.70), ready after 4 heads (head 5 never waited); train begin as with fp16.
+Compiling in the warm-up moves train begin 0.5-0.9 s later (the warm-up is the startup's critical path): rejected.
+
+Full and jury runs (2e5e2ac with SOUP_SOLUTION_HEAD_INT8_AT=head, i.e. the int8 head as in fe361ac/ce85dc8 apart
+from the build's quantization; peagverr):
+
+- soup-h1-full1 (public rows): **all 10 checks**; base 81.2 s / 14,345 MiB, ours 45.8 s / 395 MiB (s 1.771 against a
+  fast base, m 36.3), eval +0.020 %, loss first step 0.01 %, mean of all steps 0.24 %; own kernels 19.7 %; pytest on
+  the T4 458 passed, 5 skipped; Soup's 79 pass. Mean per-step relative gaps to the base (check 5's measure, limit
+  3 %): loss 0.24 %, entropy 0.30 %, accuracy 0.89 % (main 8387938 in soup-m8-full: 0.06 / 0.18 / 0.28 %).
+- soup-h1-jury1 (seed 139, rows 34000:34256 / 46000:46256, base/solution/solution/base): **all 10 checks**; base
+  90.0 s, ours 50.3 s (s 1.787), peak 435 MiB (reserved 314), eval +0.027 %; per-step gaps of the two solution
+  runs: loss 0.23 / 0.22 %, entropy 0.32 / 0.30 %, accuracy 0.68 / 0.70 % (largest single step 2.3 %; base_2 vs
+  base_1: 0.01 / 0.01 / 0.10 %). The fp16 head on the same rows (soup-h1-jury1c) for the peak's comparison: below.
