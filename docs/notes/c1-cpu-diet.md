@@ -123,3 +123,48 @@ all four, so the 252 / 381 of 9e72037 also depends on allocation order of a late
   defaults and the per-layer timeline.
 - left: find which change after 9e72037 lost the 20 MiB reserved segment (try FEWER_VIEWS=0 and
   DEQUANT_REUSE variants on Modal), then fill this section and the report.
+
+## Session 2 (31 Oct afternoon, branch `claude/c1-cpu-diet-2` from main ce27a54)
+
+### 1. soup-c1-abba4 (peagverr, bc35c89 = the C1 defaults before B1, against the same commit with them off)
+
+Order warm_0 (main path), main_1, c1_1, prof_1, prof_2, c1_2, main_2 (prof = c1 + `SOUP_SOLUTION_CPU_PROFILE=1`).
+Wall: main 43.75 / 43.80 s, c1 42.65 / 42.75 (-1.08 s); steps 3+ 25.50 / 25.41 against 24.61 / 24.53
+(-0.89 s). Peak 401 MiB, reserved 272, alloc 234.6 in all seven runs (30 segment allocations each).
+Checks 3, 4, 9 pass in all; own kernels 13.9-14.0 % (c1), 14.8-15.1 % (main path). T4 pytest:
+**349 passed, 5 skipped, 0 failed** (no failing test in this session).
+
+Per step c1 - main (mean of the two runs each, by the step's token count; 62 timed steps):
+
+| tokens | steps | mean diff | median diff |
+|---|---|---|---|
+| < 400 | 3 | -52.3 ms | -52.2 |
+| 400-500 | 3 | -53.7 ms | -55.0 |
+| 500-600 | 6 | -31.8 ms | -32.0 |
+| 600-900 | 30 | -8.9 ms | -7.3 |
+| >= 900 | 20 | -5.5 ms | -5.5 |
+
+Means per bucket: < 600 tokens 331.2 / 329.5 ms (main) against 288.2 / 287.6 (c1); 600-900 368.6 /
+367.7 against 359.5 / 358.9; >= 900 523.6 / 521.4 against 518.4 / 515.5.
+
+Profiled run (prof_1, the timeline outside the profile window, mean per step size): steps under 600
+tokens issue the forward at 3.55 ms of CPU per layer with the GPU 0.6-3.1 ms behind (CPU-bound), the
+head 110.7 -> 120.4 ms CPU while the GPU ends it at 149.9 (PCIe-bound, 29 ms lag), the backward at
+4.0 ms of CPU per layer with the lag growing 0 -> 7.3 ms (the GPU catches up and falls behind at the
+end), optimizer at 282.9 ms, step end 288.2. Steps of 600-900 tokens: forward 3.6 ms CPU against 4.7
+ms GPU per layer, backward 4.0 against ~5.7 (GPU-bound, lag 29 ms at the head, 50 ms at the end).
+Against prof2 (9e72037): forward 4.0 -> 3.55, backward 4.2 -> 4.0 ms per layer. The cProfile part
+(pre-B1) still shows the FLOP counter's walk (`floating_point_ops` -> `num_parameters`, 31,942
+`named_modules` calls per step) and `model.train()` over 933 modules: both are B1's boundary.py fixes,
+in main since 1be9e55, so not present in main's step any more.
+
+**The 20 MiB reserved segment** (soup-c1-mem2, peagverr, ce27a54 = main with B1, one run each,
+no pytest): default, `FEWER_VIEWS=0`, the three switches added after 9e72037 off
+(`FEWER_VIEWS=0, MLP_ADDMM_INPLACE=0, LAYER_EXIT_HOOK=0`) and `ATTN_ONE_FUNCTION=1`: nvidia-smi
+**371 MiB, reserved 250, 28 segment allocations in all four**; alloc 225.5 MiB (one node 229.7). So
+with B1's single-thread backward (one cuBLAS workspace less: alloc -9.1, reserved -22) the page is
+gone whatever the C1 switches: before B1, 9e72037 had 252 against 272 and bc35c89 272; after B1 every
+variant has 250. Reserved - allocated is now 24.5 MiB (one 20 MiB page of the large pool plus the small
+pool); 230 MiB reserved would need the fragmentation at the peak under 4.5 MiB, which no C1 switch
+changes. Nothing to recover here; 371 MiB is main's number. (The single runs' walls rise with their
+position in the session: 41.6, 41.6, 43.6, 44.3 s; not a comparison.)
