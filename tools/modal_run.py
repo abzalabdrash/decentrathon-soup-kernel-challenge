@@ -33,7 +33,11 @@ Every call gets its own container and GPU (no slots); the ephemeral app keeps ru
 terminal goes away (detached), so `--attach --slug X --mode Y` fetches a run started earlier, and
 `--no-wait` starts one and returns. Stop a run: `modal app stop <app id>` with the same profile.
 
-Profiles: --profile or MODAL_PROFILE (else the active one of ~/.modal.toml). The image (Python 3.13,
+Profiles: --profile, else MODAL_PROFILE, else DEFAULT_PROFILE (acc6). A workspace that refuses the
+run (paused, over its spend limit, bad token) ends the tool with one ERROR line and exit code 2; no
+container getting a T4 within --start-timeout (the account's GPU limit reached, or no free T4)
+cancels the calls and exits 4; a run that dies in Modal exits 3; a run whose steps raised exits 1.
+The image (Python 3.13,
 torch 2.11.0+cu128, triton 3.6.0, the pinned Soup stack, build-essential) is built once per
 account and cached by Modal; the first run of an account also fills the Volume. See
 docs/notes/m1-modal.md.
@@ -58,6 +62,7 @@ REPO = Path(__file__).resolve().parents[1]
 TEAM_REPO = "https://github.com/BAITC-Hacks/hack-78c6e9c3-null-pointers.git"
 TOKEN_FILE = os.environ.get("SOUP_GITHUB_TOKEN_FILE", r"C:\Users\abdra\OneDrive\Desktop\github.token")
 MODES = ("bench", "diag", "full", "jury", "profile", "solution", "variants")  # kaggle_run's RUN_CELLS
+DEFAULT_PROFILE = "acc6"  # workspace enotrocket2009, credit left on 31 Oct (acc4, the active profile, is paused)
 
 # T4 $0.000164/s, CPU $0.0000131 per core and second, memory $0.00000222 per GiB and second
 PRICE_GPU_H, PRICE_CPU_H, PRICE_GIB_H = 0.5904, 0.0472, 0.0080
@@ -90,6 +95,8 @@ def early_options():
     known, _ = parser.parse_known_args()
     if known.profile:
         os.environ["MODAL_PROFILE"] = known.profile
+    elif not os.environ.get("MODAL_PROFILE"):
+        os.environ["MODAL_PROFILE"] = DEFAULT_PROFILE
     if known.github_token_file:
         os.environ["SOUP_GITHUB_TOKEN_FILE"] = known.github_token_file
     os.environ["SOUP_MODAL_APP"] = f"soup-{known.mode}-{known.slug}"
@@ -140,6 +147,7 @@ def run_remote(spec):
     """The notebook's steps in this container; returns a tar of the outputs and the log, or, on a
     host whose T4 is not on the PCIe link the run asks for, a short dict at once."""
     started = time.time()
+    claims.put(f"{spec['claim']}:started", True)  # the launcher's sign that a container got a GPU
     link = subprocess.run(["nvidia-smi", "--query-gpu=pcie.link.gen.max,pcie.link.width.current,"
                            "pcie.link.width.max", "--format=csv,noheader,nounits"],
                           capture_output=True, text=True).stdout.strip()
@@ -349,14 +357,44 @@ def finish(data, run_dir, args):
     summarize(out_dir, args.mode)
     for log in out_dir.glob("*.log"):
         print(f"\n--- tail of {log.name} ---\n{log_tail(log)}")
+    return 0 if status["status"] == "complete" else 1
+
+
+def fail(code, text):
+    print(f"\nmodal_run: ERROR: {text}", flush=True)
+    sys.exit(code)
+
+
+def cancel(calls):
+    for call in calls:
+        try:
+            call.cancel()
+        except Exception:  # noqa: BLE001 - it may have finished on its own
+            pass
+
+
+def no_start(spec, args, calls, launched):
+    """Cancel and exit when no container of this run got a GPU within --start-timeout: Modal
+    queues calls over the workspace's GPU limit (or while no T4 is free) instead of refusing them."""
+    if claims.get(f"{spec['claim']}:started") or time.time() - launched < args.start_timeout:
+        return
+    cancel(calls)
+    fail(4, f"no container got a T4 within {args.start_timeout} s on profile {os.environ.get('MODAL_PROFILE')}: "
+            "the workspace's GPU concurrency limit is reached (other runs of this account) or Modal has "
+            "no free T4; the calls are cancelled. Try another --profile.")
 
 
 def launch(spec, args):
     """Spawn the run. With --host x16 (the default): waves of --wave containers at once; each
     looks at its T4's PCIe link, an x8 one returns at once, the first x16 one claims the run in
     the Dict soup-host-claims and goes on. Returns the call that runs the steps."""
+    launched = time.time()
     if spec["host"] == "any":
-        return run_remote.spawn(spec)
+        call = run_remote.spawn(spec)
+        while not claims.get(f"{spec['claim']}:started"):
+            no_start(spec, args, [call], launched)
+            time.sleep(3)
+        return call
     seen = []
     for wave in range(1, args.waves + 1):
         calls = {}
@@ -365,13 +403,10 @@ def launch(spec, args):
             calls[call.object_id] = call
         pending, deadline = set(calls), time.time() + 300
         while pending and time.time() < deadline:
+            no_start(spec, args, [calls[c] for c in pending], launched)
             winner = claims.get(spec["claim"])
             if winner:
-                for other in pending - {winner}:
-                    try:
-                        calls[other].cancel()
-                    except Exception:  # noqa: BLE001 - it may have finished on its own
-                        pass
+                cancel(calls[other] for other in pending - {winner})
                 print(f"[modal_run] PCIe x16 host found in wave {wave} (losers: {', '.join(seen) or 'none'})",
                       flush=True)
                 return calls.get(winner) or modal.FunctionCall.from_id(winner)
@@ -385,10 +420,11 @@ def launch(spec, args):
                     seen.append(type(exc).__name__)
                     pending.discard(call_id)
             time.sleep(2)
+        cancel(calls[c] for c in pending)
         print(f"[modal_run] wave {wave}: no x16 host ({', '.join(seen)})", flush=True)
     print(f"[modal_run] WARNING: no PCIe x16 T4 in {args.waves} waves; running on any host "
           "(host-to-GPU copies at about half of Kaggle's rate)", flush=True)
-    return run_remote.spawn(dict(spec, host="any"))
+    return launch(dict(spec, host="any"), args)
 
 
 def remote_has(commit):
@@ -403,7 +439,7 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--profile", help="Modal profile of ~/.modal.toml (default: MODAL_PROFILE or the active one)")
+    parser.add_argument("--profile", help=f"Modal profile of ~/.modal.toml (default: MODAL_PROFILE, else {DEFAULT_PROFILE})")
     parser.add_argument("--repo", default=TEAM_REPO, help="git URL of the team repository")
     parser.add_argument("--github-token-file", default=TOKEN_FILE,
                         help="file with the GitHub read token (or SOUP_GITHUB_TOKEN_FILE)")
@@ -419,6 +455,8 @@ def main():
                              "on x8, ~6 GB/s); any: the first container")
     parser.add_argument("--wave", type=int, default=5, help="--host x16: containers tried at once")
     parser.add_argument("--waves", type=int, default=6, help="--host x16: waves before running on any host")
+    parser.add_argument("--start-timeout", type=int, default=300,
+                        help="exit (code 4) when no container got a T4 within this many seconds")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                         help="environment variable for the measured runs (repeatable), e.g. SOUP_SOLUTION_UNPAD=0")
     parser.add_argument("--jury-data", default="--train-rows 10000:10256 --eval-rows 50000:50256",
@@ -442,7 +480,7 @@ def main():
     sys.path.insert(0, str(REPO / "tools"))
     from kaggle_run import parse_variant
 
-    profile = os.environ.get("MODAL_PROFILE") or "the active profile of ~/.modal.toml"
+    profile = os.environ.get("MODAL_PROFILE")
     if args.attach:
         runs = sorted(Path(args.out).glob(f"*-{args.mode}-{args.slug}/call_id.txt"))
         if not runs:
@@ -450,8 +488,11 @@ def main():
         run_dir = runs[-1].parent
         call_id = runs[-1].read_text(encoding="utf-8").strip()
         print(f"waiting for {call_id} ({run_dir.name}, profile {profile}) ...", flush=True)
-        finish(modal.FunctionCall.from_id(call_id).get(), run_dir, args)
-        return
+        try:
+            data = modal.FunctionCall.from_id(call_id).get()
+        except Exception as exc:  # noqa: BLE001
+            explain(exc, profile, "run")
+        sys.exit(finish(data, run_dir, args))
     variants = [parse_variant(v) for v in args.variant]
     if (args.mode == "variants") != bool(variants):
         sys.exit("--mode variants needs --variant, and --variant needs --mode variants")
@@ -478,17 +519,41 @@ def main():
     (run_dir / "spec.json").write_text(json.dumps(spec, indent=1), encoding="utf-8")
     print(f"modal {app.name} on {profile} ({args.mode}, commit {args.commit or 'default branch'}, "
           f"{len(steps)} steps) ...", flush=True)
-    with modal.enable_output():
-        with app.run(detach=True):
-            call = launch(spec, args)
-            (run_dir / "call_id.txt").write_text(call.object_id, encoding="utf-8")
-            print(f"call {call.object_id}; outputs go to {run_dir}", flush=True)
-            if args.no_wait:
-                print(f"detached: python tools/modal_run.py --profile <same> --attach --mode {args.mode} "
-                      f"--slug {args.slug}")
-                return
-            data = call.get()
-    finish(data, run_dir, args)
+    stage = "start"
+    try:
+        with modal.enable_output():
+            with app.run(detach=True):
+                stage = "launch"
+                call = launch(spec, args)
+                (run_dir / "call_id.txt").write_text(call.object_id, encoding="utf-8")
+                print(f"call {call.object_id}; outputs go to {run_dir}", flush=True)
+                if args.no_wait:
+                    print(f"detached: python tools/modal_run.py --profile {profile} "
+                          f"--attach --mode {args.mode} --slug {args.slug}")
+                    return
+                stage = "run"
+                data = call.get()
+    except Exception as exc:  # noqa: BLE001 - Modal's refusals come as several exception types
+        explain(exc, profile, stage)
+    sys.exit(finish(data, run_dir, args))
+
+
+def explain(exc, profile, stage):
+    """A refusal or failure from Modal as one clear line and a non-zero exit, not a traceback."""
+    text = " ".join(str(exc).split())
+    low = text.lower()
+    if "spend limit" in low or "billing" in low or "credit" in low:
+        why = "the workspace is over its spend limit (its credit is used up): use another --profile"
+    elif "paused" in low:
+        why = "the workspace is paused (billing or verification in the Modal dashboard): use another --profile"
+    elif "token" in low or "auth" in low or "profile" in low:
+        why = "the profile's token is refused or the profile is unknown (python -m modal profile list)"
+    elif stage == "run":
+        why = "the run failed in Modal (container stopped: out of credit, preempted or timed out); no outputs"
+    else:
+        why = "Modal refused the run"
+    fail(3 if stage == "run" else 2,
+         f"profile {profile}, {stage}: {why}. Modal said: {type(exc).__name__}: {text[:400]}")
 
 
 if __name__ == "__main__":

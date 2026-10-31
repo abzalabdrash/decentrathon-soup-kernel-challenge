@@ -26,7 +26,7 @@ Every flag of kaggle_run works the same: `--mode full|solution|variants|jury|ben
 branch has it), `--env K=V`, `--variant`, `--repeats`, `--abba`, `--warm-run`, `--jury-seed`,
 `--jury-data=...`, `--bench`, `--skip-pytest`, `--no-wait`, `--attach` (with `--slug` and `--mode`:
 waits for the latest run of that name and fetches it). Not needed here: `--user`, `--setup-secrets`,
-`--public`, `--poll`. New: `--profile`, `--host x16|any`, `--wave`, `--waves`, `--cpu` (default 4,
+`--public`, `--poll`. New: `--profile`, `--host x16|any`, `--wave`, `--waves`, `--start-timeout`, `--cpu` (default 4,
 Kaggle's T4 x2 has 4 vCPUs), `--memory` (MiB, default 16384), `--timeout` (container seconds,
 default 5400), `--no-prewarm`, `--github-token-file`.
 
@@ -54,27 +54,45 @@ practice: found in wave 1 or 2, under 2 minutes, about $0.01-0.02 of losing cont
 
 ## Profiles (accounts)
 
-`--profile <name>` or `MODAL_PROFILE`; without either, the active profile of `~/.modal.toml`
-(`acc4`, which is paused: always pass one). Probe of 31 Oct 09:20 (a T4 function per workspace):
+`--profile <name>`, else `MODAL_PROFILE`, else the tool's default **acc6** (workspace
+enotrocket2009, about $15 left per the team lead). The active profile of `~/.modal.toml` (`acc4`)
+is paused, so the tool never falls back to it. All 15 profiles (`python -m modal profile list`
+gives the workspace; a T4 function per workspace at 09:20 and again at 10:30; October spend from
+`python -m modal billing report --for "this month" --json`, sum of `Cost`):
 
-| profile | workspace | T4 | spent in October |
+| profile | workspace | T4 on 31 Oct | spent in October |
 |---|---|---|---|
+| acc6 (default) | enotrocket2009 | ok | $44.76 |
 | glofcast-prod | abzalabdrash-bs | ok | $0.02 |
-| acc3 | aldiarzanybek055 | ok | $8.57 (+ under $1 of M1 runs) |
+| acc3 | aldiarzanybek055 | ok | $8.57 (+ about $1 of M1 runs) |
 | tripleacodex | tripleacodex | ok | $12.99 |
 | abdrashabzal-bs | abdrashabzal-bs | ok | $19.94 |
 | acc7 | abdygalimova-sh | ok | $32.61 |
 | sholpanabd79 | sholpanabd79 | ok | $42.47 |
-| acc6 | enotrocket2009 | ok | $44.76 |
-| acc4, acc8 | | workspace paused | |
-| acc5, acc9, acc10 = acc11, acc12 = nurlan-abdr2006 | | spend limit exceeded | |
+| acc4 | abdrashabzal2009 | workspace paused | $0.00 |
+| acc8 | abdrnurlan | workspace paused | $0.00 |
+| acc5 | abdrash-a2009 | spend limit exceeded | $31.12 |
+| acc9 | abdygalimov1974 | spend limit exceeded | $31.19 |
+| acc10, acc11 | abdr-n2006 (one workspace) | spend limit exceeded | $30.19 |
+| acc12, nurlan-abdr2006 | nurlan-abdr2006 (one workspace) | spend limit exceeded | $30.44 |
 
-The CLI shows spend (`python -m modal billing report --for "this month" --json`, sum of `Cost`),
-not the credit left; a workspace out of credit answers "exceeded its spend limit" at launch, then
-move to another profile. The image (built once per workspace, ~5 min, cached by Modal) and the
+acc5, acc9, acc10/11 and acc12 each spent their $30 of October credit, so they are blocked until
+the monthly credit renews (1 November) or a payment method raises the limit; acc4 and acc8 need
+their workspace un-paused in the dashboard. The CLI shows spend, not the credit left.
+
+When a workspace refuses the run the tool prints one line, `modal_run: ERROR: profile <p>, start:
+the workspace is over its spend limit ...` (or paused, or token refused/unknown profile), and exits
+with code 2 at once. Modal does not refuse a call over the workspace's GPU limit, it queues it: when
+no container of the run gets a T4 within `--start-timeout` (300 s) the tool cancels its calls and
+exits with code 4. A run that dies inside Modal (container stopped, credit ran out mid-run) exits 3
+without outputs; a run whose steps raised exits 1 with what there is; a complete run exits 0
+(whatever the checks say, as kaggle_run). All tested on 31 Oct (acc9, acc4, an unknown profile,
+`--start-timeout 1`).
+
+The image (built once per workspace, ~5 min, cached by Modal) and the
 Volume `soup-hf-cache` (model and dataset as one 3 GB tar, filled by the first run of a workspace,
-75 s) are ready on acc3, tripleacodex and glofcast-prod (image only); the other workspaces pay
-both on their first run. Suggested: one profile per session, so a session that burns its
+75 s) are ready on acc3, tripleacodex, acc6 and glofcast-prod (image only); the other workspaces
+pay both on their first run. Suggested: one profile per session, so a session that burns its
 workspace's credit does not stop the others.
 
 ## Cost and concurrency
