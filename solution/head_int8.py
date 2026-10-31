@@ -93,7 +93,6 @@ WARM_AT = os.environ.get("SOUP_SOLUTION_HEAD_INT8_WARM", "thread").strip().lower
 # with 4 warps (soup-h1-kern1)
 T_TILE, T_WARPS = 128, 8
 QUANT_ROWS = 1024  # vocabulary rows per quantization step of the build (4.5 MiB of GPU buffers)
-QUANT_WARPS = 4
 ACC_BLOCK = 512
 # warps of the chunk kernel: T4, one head at 830 tokens, 16 warps 5.8-6.0 ms against 8.5-9.8 for 8 and 8.0-9.5
 # for 4 (soup-h1-kern1; head_stream's fp16 kernel is fastest with 8); 2-8 rows per program were slower
@@ -296,24 +295,6 @@ def head_i8_acc_kernel(acc_ptr, stride_acc, g_ptr, stride_g, alpha_ptr, sp_ptr, 
     tl.store(at, g, mask=md)
 
 
-@triton.jit
-def int8_rows_kernel(x_ptr, stride_x, col_ptr, q_ptr, stride_q, s_ptr, n_cols, BLOCK: tl.constexpr):
-    # q[row] = round(x[row] * col * 127 / absmax(x[row] * col)) in int8, s[row] = absmax / 127 (the
-    # hidden rows of a head, and the weight's rows at the build). A row with a nan gets a nan scale and
-    # one with an inf an inf scale, so its products are not finite either
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK)
-    m = offs < n_cols
-    x = tl.load(x_ptr + row.to(tl.int64) * stride_x + offs, mask=m, other=0.0).to(tl.float32)
-    x = x * tl.load(col_ptr + offs, mask=m, other=0.0)
-    amax = tl.max(tl.abs(x), axis=0)
-    nan = tl.sum((x != x).to(tl.int32), axis=0) > 0
-    inv = tl.where(amax > 0.0, 127.0 / amax, 0.0)
-    q = tl.minimum(tl.maximum(tl.floor(x * inv + 0.5), -127.0), 127.0)
-    tl.store(q_ptr + row.to(tl.int64) * stride_q + offs, q.to(tl.int8), mask=m)
-    tl.store(s_ptr + row, tl.where(nan, float("nan"), amax / 127.0))
-
-
 def _pad_rows(n):
     """Rows of an `_int_mm` operand: more than 16 and a multiple of 8."""
     return max(-(-n // 8) * 8, 24)
@@ -321,15 +302,16 @@ def _pad_rows(n):
 
 def quant_rows(x, out, col, scales=None):
     """Per-row absmax int8 of x (n, D) times `col` (D,) per column into out[:n] (rows past n are left
-    as they are), with int8_rows_kernel: returns the fp32 scales absmax / 127 (into `scales` when
-    given). A zero row gets scale 0; a non-finite row a non-finite scale."""
-    n, d = x.shape
+    as they are), torch ops (a kernel of its own here was one more compilation in the build thread,
+    whose GIL share slows the first steps: soup-h1-abba4): returns the fp32 scales absmax / 127 (into
+    `scales` when given). A zero row gets scale 0; a non-finite row a non-finite scale (amax keeps nan)."""
+    xf = x.float() * col
+    amax = xf.abs().amax(dim=1)
+    inv = torch.where(amax > 0, 127.0 / amax.clamp_min(1e-30), torch.zeros_like(amax))
+    out[:x.shape[0]].copy_(torch.floor(xf.mul_(inv[:, None]).add_(0.5)).clamp_(-127, 127))
     if scales is None:
-        scales = torch.empty(n, dtype=torch.float32, device=x.device)
-    if n:
-        int8_rows_kernel[(n,)](x, x.stride(0), col, out, out.stride(0), scales, d,
-                               BLOCK=triton.next_power_of_2(d), num_warps=QUANT_WARPS)
-    return scales
+        return amax.div_(127.0)
+    return torch.div(amax, 127.0, out=scales)
 
 
 class HeadSkipInt8(Exception):
@@ -432,7 +414,7 @@ class HeadInt8:
             self.log(f"[solution] head int8 off: {self.error}")
 
     def build(self):
-        """The int8 copy, QUANT_ROWS vocabulary rows at a time: the fp16 rows to the GPU, int8_rows_kernel,
+        """The int8 copy, QUANT_ROWS vocabulary rows at a time: the fp16 rows to the GPU, quant_rows,
         the int8 rows and their scales back into the pinned buffer, all queued on a stream of its own (the
         training's queue is not waited for, nor the GIL held while the GPU works) and waited for once."""
         from .weight_stream import pinned_host_buffer
@@ -597,7 +579,7 @@ def _join_at_exit(ref):
 
 
 def warm_kernels(obj=None):
-    """Compiles the five kernels for the classes the head launches (in the build thread)."""
+    """Compiles the four kernels for the classes the head launches (in the build thread)."""
     from .warmup import HIDDEN, compile_kernel, training_half_dtype
 
     half, f32, i8, i32, i64 = training_half_dtype(), torch.float32, torch.int8, torch.int32, torch.int64
@@ -615,6 +597,4 @@ def warm_kernels(obj=None):
     compile_kernel(head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, i32, f32, f32, f32, f32,
                    f32, i32, f32, 1.0, 387, hidden, BLOCK_D=triton.next_power_of_2(hidden), FIX_LOSS=LOSS_FIX,
                    num_warps=4)
-    # the hidden rows (stride 1536) and, at the build, the weight's rows (fp16 on the T4, as the hidden rows)
-    compile_kernel(int8_rows_kernel, half, hidden, f32, i8, hidden, f32, hidden,
-                   BLOCK=triton.next_power_of_2(hidden), num_warps=QUANT_WARPS)
+
