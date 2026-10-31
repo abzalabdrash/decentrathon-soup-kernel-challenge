@@ -114,7 +114,7 @@ import threading
 import time
 
 SWITCH_INTERVAL = 0.001  # seconds: the GIL switch interval while the warm-up runs (see _run)
-EXIT_TIMEOUT = 60.0  # seconds the interpreter's exit waits for the warm-up thread (see _shutdown)
+EXIT_TIMEOUT = 60.0  # join interval of the exit's wait for the warm-up threads (see _shutdown)
 # threads that take the registrations in turn (see _run). Whole warm-up on the RTX 3050 Ti with
 # the main thread waiting / spinning a counter: 1 worker 4.8 / 6.6 s, 2 workers 3.2 / 3.7 s,
 # 3 workers 2.5 / 3.4 s, 4 workers 2.5 / 3.1 s (bench_warmup.py workers); the main thread loses
@@ -147,8 +147,8 @@ _LOCK = threading.Lock()
 
 
 def _new_state():
-    return {"thread": None, "idents": set(), "begin": None, "seconds": None, "results": {},
-            "errors": {}, "queue": queue.Queue(), "queued": set(), "closed": False}
+    return {"thread": None, "key_thread": None, "idents": set(), "begin": None, "seconds": None,
+            "results": {}, "errors": {}, "queue": queue.Queue(), "queued": set(), "closed": False}
 
 
 _STATE = _new_state()
@@ -454,11 +454,16 @@ def _shutdown():
     ("terminate called without an active exception", exit code 134; T13 saw it in 3 of 6 runs of
     the tests). Waiting for the current registration only keeps the tests' exit short, where
     waiting for the whole warm-up would add its seconds. In a training run the warm-up is long
-    done at exit: nothing to wait for."""
+    done at exit: nothing to wait for. The wait has no deadline (EXIT_TIMEOUT is only the join
+    interval): returning while a compile is still running brings the abort back, and a run that
+    never ends fails the same checks as one that aborts. The early triton-key thread is waited for
+    too (codex/review-1, 49c639b)."""
     _STOP.set()
-    thread = _STATE["thread"]
-    if thread is not None and thread is not threading.current_thread():
-        thread.join(EXIT_TIMEOUT)
+    current = threading.current_thread()
+    for thread in (_STATE["thread"], _STATE["key_thread"]):
+        if thread is not None and thread is not current:
+            while thread.is_alive():
+                thread.join(EXIT_TIMEOUT)
 
 
 def _register_shutdown():
@@ -497,6 +502,7 @@ def _worker(device, stream, log):
 def _run(device, log, workers, switch):
     begin = time.perf_counter()
     previous = ours = None
+    helpers, stream = [], None
     try:
         import torch
 
@@ -516,20 +522,28 @@ def _run(device, log, workers, switch):
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any
         # Executor, triton/runtime/_async_compile.py)
-        helpers = [threading.Thread(target=_worker, args=(device, stream, log),
-                                    name=f"solution-warmup-{i}", daemon=True)
-                   for i in range(1, workers)]
-        for helper in helpers:
+        for i in range(1, workers):
+            helper = threading.Thread(target=_worker, args=(device, stream, log),
+                                      name=f"solution-warmup-{i}", daemon=True)
             helper.start()
+            helpers.append(helper)  # only the threads that started are joined
         _worker(device, stream, log)
-        for helper in helpers:
-            helper.join()
-        stream.synchronize()
     except Exception as exc:  # noqa: BLE001
+        _STOP.set()  # the helpers finish the registration they are in and take no new one
         _STATE["errors"]["(thread)"] = repr(exc)
         if log:
             print(f"[solution] warmup thread failed: {exc!r}", flush=True)
     finally:
+        # this thread's own setup or a later helper's start can fail while an earlier helper is
+        # inside the compiler: _DONE (and the end of this thread, which the exit waits for) must
+        # mean that every worker is gone (codex/review-1, 49c639b)
+        for helper in helpers:
+            helper.join()
+        if stream is not None:
+            try:
+                stream.synchronize()
+            except Exception as exc:  # noqa: BLE001 - the warm-up is optional
+                _STATE["errors"]["(stream)"] = repr(exc)
         if ours is not None and sys.getswitchinterval() == ours:  # unless changed meanwhile
             sys.setswitchinterval(previous)
         _STATE["seconds"] = round(time.perf_counter() - begin, 3)
@@ -619,7 +633,12 @@ def start_early(log=True):
     starts here too, on this file's registrations (start_background_warmup(final=False)); by
     default it starts at the end of apply()."""
     install_launcher_build()  # -O0 launchers by default (SOUP_SOLUTION_LAUNCHER_OPT / _NICE)
-    threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True).start()
+    with _LOCK:
+        if _STATE["key_thread"] is None:  # joined at exit like the warm-up thread (_shutdown)
+            thread = threading.Thread(target=_triton_key, name="solution-triton-key", daemon=True)
+            _STATE["key_thread"] = thread
+            _register_shutdown()
+            thread.start()
     if os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "apply_begin":
         return start_background_warmup(log=log, final=False)
     return None

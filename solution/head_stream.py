@@ -266,7 +266,13 @@ class HeadStreamer:
         if self._pinned is not None:  # pinned ahead while the loader read the checkpoint
             raw, self._unpin = pinned.buffer[:nbytes], pinned.unpin
         else:
-            raw, self._unpin = pinned_host_buffer(nbytes, self)
+            try:
+                raw, self._unpin = pinned_host_buffer(nbytes, self)
+            except (RuntimeError, MemoryError) as exc:
+                # nothing of the model is changed yet: the callers keep the weight on the GPU
+                # (load_embedding: the loader's values; stream_before_prepare: the resident
+                # weight) instead of failing the load (codex/review-1, 611cade)
+                raise HeadSkip(f"cannot pin the head weight: {exc!r}") from exc
         self.host = raw.view(self.dtype).view(self.vocab, self.hidden)
         self.host.copy_(data)
         torch.cuda.synchronize(self.device)

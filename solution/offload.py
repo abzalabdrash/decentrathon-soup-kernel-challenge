@@ -166,7 +166,12 @@ def prepin(megabytes):
     def work():
         try:
             for _ in range(count):
-                slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                try:
+                    slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                except (RuntimeError, MemoryError):
+                    # page-locked memory can run out before the GPU does: the stack takes the
+                    # slabs made so far, then keeps tensors on the GPU (codex/review-1, 611cade)
+                    break
                 with _SPARE_LOCK:
                     _SPARE.append(slab)
                     _SPARE_LOCK.notify_all()
@@ -250,7 +255,14 @@ class _HostStack:
                     _SPARE_LOCK.wait()  # the prepin thread pins this slab anyway: no second one
                 spare = _SPARE.pop() if _SPARE else None
             if spare is None:
-                spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                try:
+                    spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                except (RuntimeError, MemoryError):
+                    # no more page-locked memory: the cap from here on, so the pack hook keeps
+                    # this and every later tensor on the GPU without trying to pin again per
+                    # tensor (codex/review-1, 611cade)
+                    self.limit = self.nbytes
+                    return None, None
             else:
                 self.prepinned += 1
             self.slabs.append(spare)
