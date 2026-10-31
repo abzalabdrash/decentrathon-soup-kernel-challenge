@@ -227,6 +227,8 @@ def _run(tiny_dir, tmp_path, switches, monkeypatch):
                            num_train_epochs=1, report_to=[], save_strategy="no", seed=1,
                            completion_only_loss=True, dataloader_pin_memory=True,
                            disable_tqdm=True, gradient_checkpointing=False)
+    config.device  # noqa: B018 - sets up the devices; then one GPU, as the harness runs (Kaggle's
+    config._n_gpu = 1  # notebook shows pytest two T4s, and the Trainer would go DataParallel)
     cls = rewind_hf.make_rewind_trainer_class(trl.SFTTrainer)
     trainer = cls(model=model, args=config, train_dataset=_dataset(), processing_class=_tokenizer())
     for param in model.parameters():  # TRL casts QLoRA adapters to bf16; Soup's run trains them in fp32
