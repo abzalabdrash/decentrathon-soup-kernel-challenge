@@ -115,7 +115,16 @@ soup-a1-extremes2 (peagverr, main 5f3fd27 = 8d2d0bd + S1 + A1 + R3, seed 101, `-
 - `test_offload.py::test_mode_matches_plain_and_lowers_peak[offload]`: 13 выгруженных тензоров вместо 12, лишний помечен как вход слоя. Метка `mark_residual`/`mark_offload`, не взятая в каком-то более раннем тесте (forward без графа), осталась в глобальном `_RESIDUAL["marked"]`, и fp32-тензор теста получил тот же адрес. Значения при этом верные, меняется только счёт. Исправлено в `offload.py:offload_saved_tensors`: на входе в контекст метки сбрасываются (поставленная до входа метка может быть только протухшей; в обучении контекст открывается один раз в начале `train()`, то есть это ничего не меняет). Тест `test_jury_offload_marks.py` падает на 5f3fd27 и проходит с правкой; `test_offload.py`, `test_xoffload.py` целиком проходят (28).
 - `test_trainer_build.py::test_early_probes_serve_same_answers`: `startup._shared_entry_points` (S1, `SOUP_SOLUTION_ENTRY_POINTS`, теперь включён по умолчанию) уже обернул `importlib.metadata.entry_points` и поставил `_soup_original`, когда `apply()` вызывался в более раннем тесте той же сессии; `trainer_build._patch_probes` по этому маркеру не оборачивает повторно, и утверждение `metadata.entry_points is not saved_ep` падает. В прогоне `soup train` это ни на что не влияет: `SOUP_SOLUTION_EARLY_PROBES` выключен по умолчанию, `_patch_probes` не вызывается. Правка за S1 (тест должен ставить исходный `entry_points` через monkeypatch, либо `_patch_probes` должен смотреть свой маркер, а не общий `_soup_original`).
 
-(longest2 на 5f3fd27: ниже, когда придёт)
+soup-a1-longest2 (peagverr, main 5f3fd27, seed 103, `--select longest`, все шаги по 2 048 токенов). База OOM (14 667 MiB). Решение: 68,6 / 69,6 с (на ce27a54 было 70,7 / 74,9), пик 431 MiB, reserved 310 (запас проверки 9: 130 MiB), свои ядра 10,7 / 10,6 %, медиана шага 0,78 / 0,79 с; проверки 2, 3, 4, 9, 10 пройдены; выпуск при выходе «2560 MiB of offload slabs freed, 1090 MiB unregistered in 0.52 s»; 0 повторов аллокатора и освобождений сегментов, все копии по префетчу, 10 заготовленных слабов. `pytest solution`: те же два падения, что в extremes2 (в 5f3fd27 ещё нет de0292c и правки S1).
+
+Сводка четырёх стресс-прогонов (только прогоны решения; база во всех четырёх падает по памяти):
+
+| Прогон | sha | стена, с | пик / reserved, MiB | запас пр. 9, MiB | свои ядра | откаты, поздние копии |
+|---|---|---|---|---|---|---|
+| extremes, seed 97 | ce27a54 | 56,1 / 55,8 | 471 / 350 | 131 | 10,7 / 10,8 % | нет |
+| longest, seed 83 | ce27a54 | 70,7 / 74,9 | 431 / 310 | 130 | 10,1 / 9,6 % | нет |
+| extremes2, seed 101 | 5f3fd27 | 51,8 / 52,2 | 471 / 350 | 131 | 11,5 / 11,4 % | нет |
+| longest2, seed 103 | 5f3fd27 | 68,6 / 69,6 | 431 / 310 | 130 | 10,7 / 10,6 % | нет |
 
 ## 6. Перед сдачей: что прогнать на финальном коммите
 
@@ -152,3 +161,17 @@ SOUP_APPLY_SOLUTION=1 python -m pytest tests -q -p no:cacheprovider; echo "rc=$?
 - в окружении ноутбука нет `SOUP_SOLUTION_*` (режимы `full` и `jury` их не ставят, `tools/kaggle_run.py:62-83`; `--env` не передавать). Переключатели, которые должны действовать у жюри, задаются только умолчаниями в `solution/` (как `SOUP_SOLUTION_EXIT_RELEASE=1` через `setdefault` в `__init__.py`), потому что жюри запускает `harness/run_task.py` со своим окружением. Диагностические переключатели (`SOUP_SOLUTION_DIAG`, `SOUP_SOLUTION_CPU_PROFILE`, `SOUP_SOLUTION_PROFILE_STARTUP`, `SOUP_SOLUTION_STREAM_TIMING`, `SOUP_SOLUTION_WEIGHT_RING_TIMING`, `SOUP_SOLUTION_WARMUP_AUDIT`) по умолчанию выключены; `diag.py` сбрасывает пиковую статистику torch, это читается как вмешательство в замер проверки 9.
 
 Остаточные риски, которые я не закрыл: (а) строка «[solution] warmup done ...; failed: ...» или «warmup X failed» может попасть после итога pytest, если регистрация прогрева упадёт в те миллисекунды между печатью итога и началом atexit; нужна и ошибка регистрации, и такое совпадение по времени, в прогонах T4 ошибок регистраций не было; (б) у базы на T4 почти нет запаса памяти на длинных строках (14 345–14 407 MiB на обычных, OOM на 2 048 токенов), это общий риск всех команд, от нас не зависит.
+
+## 7. Коммиты ветки `claude/a1-jury-audit`
+
+| Коммит | Что | В main |
+|---|---|---|
+| d8224d0 | выход ждёт все потоки прогрева без дедлайна (49c639b), откаты при отказе pinned (611cade), `test_jury_warmup_exit.py`, `test_jury_pin_fallback.py` | да (ca6db38) |
+| c3f44e1 | `test_jury_long_batches.py`: 2 048 / 2 047 / 1 999 токенов | да |
+| b1b2bfb | нет строки «warmup ... failed» после начала выхода (проверка 10), черновик заметки | да |
+| 32ae1e8 | `tools/fast_rows_check.py`, заметка: чеклист, перенос Codex, extremes | нет |
+| 9c5d7b0, 93a7aa6 | заметка: решение `EXIT_RELEASE=1`, разбор `exit_release.py`, что печатается после итога pytest; изоляция `test_jury_warmup_exit` от лёгкого ключа triton и лаунчеров S1 | нет |
+| de0292c | `offload.py`: контекст оффлоада стартует без протухших меток; `test_jury_offload_marks.py` (чинит `test_offload::test_mode_matches_plain_and_lowers_peak[offload]` на T4) | нет |
+| 67c2f6f … afb971d | заметка: longest, extremes2, longest2, план перед сдачей | нет |
+
+Что влить в main из ветки: de0292c (`solution/offload.py`, 5 строк, и `solution/test_jury_offload_marks.py`), две строки изоляции в `solution/test_jury_warmup_exit.py`, `tools/fast_rows_check.py`, эту заметку. Ветка стоит поверх main 5f3fd27, конфликтов с ним нет.
