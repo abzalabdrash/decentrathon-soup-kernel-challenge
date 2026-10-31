@@ -234,3 +234,43 @@ def test_dataset_hashing_hook_scope(tokenizer, monkeypatch):
     with pytest.raises(RuntimeError):
         wrapper.setup(fail=True)
     assert not getattr(_dill.Pickler.dispatch.get(kind), "_soup_fast_tokenizer", False)
+
+
+def test_shared_entry_points_same_answers(monkeypatch):
+    """SOUP_SOLUTION_ENTRY_POINTS: one read of every distribution's entry points serves all calls
+    with the original's answers, and a changed sys.path reads them again."""
+    import importlib.metadata as metadata
+
+    from solution import startup
+
+    original = metadata.entry_points
+    while getattr(original, "_soup_original", None) is not None:
+        original = original._soup_original
+    monkeypatch.setattr(metadata, "entry_points", original)
+    monkeypatch.setattr(startup, "_ENTRY_POINTS", {"path": None, "value": None, "reads": 0, "served": 0})
+    assert startup.share_entry_points() and startup.share_entry_points()  # once
+    shared = metadata.entry_points
+    assert shared is not original and getattr(shared, "_soup_shared", False)
+    everything = original()
+    assert shared() == everything
+    for params in ({"group": "console_scripts"}, {"group": "no-such-group"}, {"name": "pytest"},
+                   {"group": "pytest11"}):
+        assert shared(**params) == original(**params)
+    assert startup._ENTRY_POINTS["reads"] == 1 and startup._ENTRY_POINTS["served"] == 4
+    monkeypatch.setattr(sys, "path", sys.path + ["/nonexistent-soup-test-dir"])
+    assert shared(group="console_scripts") == original(group="console_scripts")
+    assert startup._ENTRY_POINTS["reads"] == 2
+
+
+def test_shared_entry_points_leaves_other_replacements(monkeypatch):
+    import importlib.metadata as metadata
+
+    from solution import startup
+
+    def theirs(**params):
+        return ()
+
+    theirs._soup_original = metadata.entry_points
+    monkeypatch.setattr(metadata, "entry_points", theirs)
+    assert startup.share_entry_points() is False
+    assert metadata.entry_points is theirs
