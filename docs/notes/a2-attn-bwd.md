@@ -101,3 +101,65 @@ forward's `taken` and the backward's hook return on their first comparison. Reco
 merge the `unpad.py` hook and `attn_bwd.py` into main (no gain, more for the jury to read); this note
 and the bench numbers are the result. No full run with ATTN_BWD=math was made (the brief asked for it
 only after a passing microbench).
+
+## Fallback items after the no-go
+
+(i) Labelled-only backward of the final norm and the last MLP (review 1, last block): not taken. The
+last layer's MLP has no LoRA, so its backward is three input-gradient GEMMs plus SwiGLU (~3.2 ms per
+step at 830 tokens); rows whose head gradient is zero give zero there, so gathering the labelled rows
+would save (1 - labelled share) of that, ~0.1 s per run at best, below one session's noise, and it
+needs a gather/scatter through fused_proj's `_MLP`, the offload of gate|up and int8_bwd (C1's files
+today). Not worth the risk on the last day.
+
+(ii) `SOUP_SOLUTION_NORM_HALF=1` (review 2, section 4.2; R3's row "float16_copy"), in the branch, off,
+not measured on the T4: the orchestrator stopped both fallback items before the ABBA (fused_proj.py
+and rmsnorm.py belong to C1 today) and moved me to the save tail (`docs/notes/save-tail.md`). The decoder
+layer's input norm and post-attention norm write their output's half copy in the same kernel
+(`rmsnorm.rms_norm_rows_fwd_half`), attached to the fp32 output; `_QKVRope` and `_MLP` take it through
+`rmsnorm.half_of` instead of `x.to(half)` (fused_proj.py: two lines and the import). The final norm
+does not write one (the head gathers and casts its own rows). Bitwise: the copy is the cast's value
+(round to nearest even of the same fp32 product), and the new kernel keeps rms_norm_rows_fwd's tile
+layout: left to itself Triton gives the half store 8-wide vectors, the tile becomes sizePerThread
+[1, 8] instead of [1, 4] and the sum of squares is added in another order (rstd and y then differ in
+the last bit); with stride_y16 not specialized the half store stays narrow and rstd/y are the
+original kernel's bits (tested: plain and fused-add norms; a tiny 4-bit Qwen2 with LoRA through the
+fused path gives equal hidden states, loss and every LoRA gradient with the switch on and off).
+`half_of` hands the copy over once (the fp32 output lets go of it, so it lives as long as the
+consumer keeps it, as the cast did) and falls back to the cast when the output changed since the
+norm (version check), the dtype or shape differs, or no copy exists; `_MLP` keeps its single padded
+copy when there is none. Note: test_recompute's decoder-layer memory test fails when it runs after
+any tiny-model test in the same process, on main too (order dependence, not this change).
+Laptop (RTX 3050 Ti, per norm at 830 / 1,440 rows): norm + cast 157 / 230 us (plain), 199 / 320 us
+(with the add) against 110 / 169 and 165 / 250 us: -35..-70 us per norm, 56 norms per step, plus 56
+cast launches less. Warm-up: `rms_norm_rows_fwd_half` registered by `patch_qwen2_rmsnorm` (two
+classes, as rms_norm_rows_fwd).
+
+NORM_HALF on the T4: the orchestrator allowed the ABBA after all (31 Oct ~12:40); it runs in the same
+session as the save tail (`soup-e1-tail1`, account 3, commit e4b9f3c, variant `half:`; see
+`docs/notes/save-tail.md` for how to fetch it). Merge rule: >= 0.1 s in that session, peak unchanged
+(371 MiB), bitwise (tested locally). To turn it on: `os.environ.setdefault("SOUP_SOLUTION_NORM_HALF", "1")`
+in `apply()`; its two consumer lines in fused_proj.py may conflict with C1's edits (only those lines).
+
+NORM_HALF in soup-e1-tail1 (variant `half`, positions 3 and 4 of the ABBA): steps 3+ 25.83 / 26.28 s
+against base 23.44 / 26.87 and once (no step change at all) 24.63 / 27.18: the session's drift
+(+3.4 s from the first to the last base run, concave) is 10-30x the expected effect, so the wall says
+nothing; peak 371 MiB, reserved 250, allocated 225.5 as base; rms_norm_rows_fwd_half launched in both
+half runs (check 3).
+
+Per-norm cost on the T4 (`solution.bench_norm_half 300`, peagverr soup-e1-nhb1, d79ad23; medians of
+300 CUDA-event timings; every call bitwise: y, rstd and the half copy equal to rms_norm_rows_fwd plus
+the cast):
+
+| tokens | plain: norm + cast / half-writing norm, us | fused add: norm + cast / half-writing, us | per step (1 plain + 55 add), ms |
+|---:|---|---|---:|
+| 400 | 77.8 / 65.5 | 90.1 / 84.0 | 0.35 |
+| 600 | 92.1 / 79.7 | 122.7 / 106.7 | 0.90 |
+| 830 | 115.2 / 93.8 | 149.9 / 129.2 | 1.16 |
+| 1,100 | 142.3 / 113.9 | 188.4 / 158.7 | 1.66 |
+| 1,440 | 217.1 / 137.1 | 235.9 / 196.3 | 2.26 |
+| 2,048 | 231.3 / 178.4 | 317.7 / 265.6 | 2.92 |
+
+Over the 64 steps of the task's data (simulated batches, mean 826 tokens): 76 ms of GPU time per run,
+the upper bound of the wall gain (the power-limited T4 returns only part of removed GPU work), plus
+56 cast launches less per step on the CPU. **Below the merge rule (0.1 s): NORM_HALF stays off**; the
+code (rmsnorm.py's second kernel and `half_of`, two lines in fused_proj.py) is in the branch only.
