@@ -142,3 +142,72 @@ either. What is left: fewer or cheaper compiles, an earlier start, or more worke
 
 Decided (0b1bba7): EMBED_ASYNC, TRITON_KEY=light, ENTRY_POINTS on by default; EARLY_PROBES,
 LOAD_CODE_TABLE, WARMUP_SKIP off.
+
+### soup-s1-v6 (namedesign, 0b1bba7 = new defaults on main ce27a54, means of 2 ABBA rounds)
+
+Same columns as above (the session is ~0.1 s slower at the start than v4/v5; peak 371 MiB for all):
+- new (defaults: etk) 3.36 / 3.89 / 7.23 / 9.30 / 9.41 / 5.81 / 0.12 / 1.96 / 1.19 / 0.25 / 0.51 / 44.28
+- old (EMBED_ASYNC=0, TRITON_KEY=full, ENTRY_POINTS=0) 3.62 / 4.08 / 7.76 / 9.70 / 9.86 / 5.75 / 0.00 / 2.29 / 1.06 / 0.17 / 0.50 / 44.41
+- w3 (3 workers) 3.37 / 3.95 / 7.62 / 9.37 / 9.46 / 4.63 / 0.00 / 2.23 / 1.27 / 0.39 / 0.49 / 43.95
+- wb (WARMUP_START=apply_begin) 4.67 / 5.35 / 7.92 / 9.64 / 9.75 / 7.33 / 0.00 / 1.44 / 0.89 / 0.24 / 0.49 / 44.37
+- pr (LOAD_PREAD) 3.46 / 4.01 / 7.39 / 9.49 / 9.60 / 6.04 / 0.13 / 2.01 / 0.94 / 0.15 / 0.50 / 44.31
+
+The new defaults against the old ones: first step 0.45 s earlier (third session in a row). Three
+workers end the warm-up at +8.0 s (1.3 s before train begin) but slow the main thread by about as
+much as they save (model setup +0.33 s, first step +0.05 s). The warm-up from apply begin makes
+apply 1.3 s longer: a loss of 0.34 s. LOAD_PREAD: +0.19 s.
+
+Audit (aud runs, SOUP_SOLUTION_WARMUP_AUDIT=1): every one of the 16 variants the warm-up compiles is
+launched in training (from 64 launches of head_finish_kernel and rms_norm_rows_bwd without the
+add up to 10,688 of nf4_dequant_kernel), and nothing compiles outside the warm-up: there is no
+unreachable specialization to drop (review 1, item 6: nothing to gain here).
+
+Startup profile (aud runs, SOUP_SOLUTION_STARTUP_PROFILE=1): the main thread has a CPU 56 % of the
+model setup (1.97 of 3.54 s) and 24 % of the row tokenization (0.40 of 1.69 s). The tokenization's
+time is in one line, transformers' `_encode_plus` -> the Rust `encode_batch` (1.48 s of the 1.90 s
+trainer build): each of the 512 calls releases the GIL and waits to get it back from the warm-up
+workers (HELD_ENCODE's case). In the model setup bitsandbytes' `get_4bit_type` (functional.py:854-855,
+the NF4 table per weight with a host wait) is 0.53 s of the main thread (LOAD_CODE_TABLE's case),
+the wait for staging 0.30 s. The warm-up threads spend 3.1 of their 7.1 thread-seconds of the model
+setup waiting for subprocesses: 2.2 s in the 12 launcher builds (cc -O0), the rest ptxas. With two
+workers the warm-up is on the critical path, so the switches that shorten the main thread (HELD_ENCODE,
+LOAD_CODE_TABLE) lost in v3-v5; with three workers it has 1.3 s of slack: soup-s1-v8 measures them on
+top of three workers, and LAUNCHERS_EARLY again (apply now has idle CPUs since the light triton key).
+Fixed in 2928db3: the launchers-ahead probe built nf4_dequant3's launcher while fused_proj.py (C1's
+diet) registers nf4_dequant4.
+
+### Lines for README (startup, switches on by default after this branch)
+
+- Эмбеддинг при загрузке приводится к fp16 в pinned-буфер в отдельном потоке (`copy_` из того же
+  среза safetensors, ядро приведения то же, что у `.to()`), главный поток в это время грузит слои;
+  значения читаются только после join в конце загрузки. Побитово (тесты на маленькой и на реальной
+  модели). `SOUP_SOLUTION_EMBED_ASYNC=0` возвращает исходный путь.
+- Ключ кэша Triton называет libtriton.so размером, временем изменения и inode вместо sha256 от
+  415 МБ (1,4 с CPU рядом с импортами на 4 vCPU). Кэш каждого прогона харнесс создаёт пустым,
+  ключ только именует его записи; скомпилированные ядра те же. `SOUP_SOLUTION_TRITON_KEY=full`
+  возвращает ключ Triton.
+- `importlib.metadata.entry_points()` читается один раз за прогон и отвечает `select()` на тот же
+  неизменяемый набор, пока не изменился `sys.path` (bitsandbytes, fsspec и плагины Soup спрашивали
+  три раза по ~65 мс). Ничего не устанавливается во время прогона, ответы те же; аналог
+  разрешённого кэша `packages_distributions()`. `SOUP_SOLUTION_ENTRY_POINTS=0` выключает.
+- Эффект трёх вместе на T4: первый шаг на 0,38–0,45 с раньше от начала `apply()` (три сессии:
+  soup-s1-v4, soup-s1-v5, soup-s1-v6), пик памяти тот же.
+
+### soup-s1-v8 (namedesign, 2928db3, means of 2 ABBA rounds)
+
+- new (defaults) 3.40 / 3.92 / 7.04 / 9.04 / 9.15 / 5.65 / 0.01 / 1.85 / 1.06 / 0.32 / 0.50 / 43.59
+- lahc (LAUNCHERS_EARLY + HELD_ENCODE + LOAD_CODE_TABLE) 3.83 / 4.53 / 7.51 / 9.15 / 9.25 / 3.60 / 0.00 / 1.69 / 1.07 / 0.52 / 0.50 / 43.98
+- la (LAUNCHERS_EARLY) 3.87 / 4.46 / 7.59 / 9.34 / 9.43 / 3.95 / 0.00 / 1.86 / 1.07 / 0.36 / 0.50 / 44.06
+- w3hc (3 workers + HELD_ENCODE + LOAD_CODE_TABLE) 3.37 / 4.01 / 7.55 / 9.35 / 9.46 / 5.93 / 0.00 / 2.27 / 1.33 / 0.62 / 0.50 / 44.14
+- dl (DRIVER_EARLY=libs) 3.71 / 4.51 / 7.64 / 9.46 / 9.56 / 5.29 / 0.00 / 1.88 / 1.17 / 0.27 / 0.50 / 44.27
+- w3 3.40 / 4.04 / 7.71 / 9.51 / 9.62 / 4.99 / 0.00 / 2.32 / 1.34 / 0.40 / 0.50 / 44.53
+- w3h (3 workers + HELD_ENCODE) 3.41 / 4.11 / 7.78 / 9.54 / 9.63 / 4.83 / 0.00 / 2.23 / 1.33 / 0.39 / 0.50 / 44.47
+- hc (HELD_ENCODE + LOAD_CODE_TABLE, 2 workers) 3.34 / 3.87 / 6.96 / 9.73 / 9.85 / 6.45 / 0.70 / 1.81 / 1.10 / 0.61 / 0.50 / 44.44
+
+Nothing beats the defaults. The GIL and the 4 vCPUs are shared: what one side gains the other
+loses. hc shortens the main thread (setup end -0.08 s, the trainer build is faster) and the warm-up
+grows 0.8 s, so train waits 0.70 s for it. A third worker slows the model load by 0.4-0.6 s (tensor
+loop 2.3 s against 1.85). The launchers built during the imports make apply 0.43 s longer and Soup's
+CLI 0.18 s longer; the warm-up then ends 1.7 s before train begin, and HELD_ENCODE with the code
+table take 0.5 s off the main thread: 9.25 s, still 0.1 s behind. DRIVER_EARLY=libs makes apply
+0.3 s longer and saves the warm-up only what it no longer has to wait for.
