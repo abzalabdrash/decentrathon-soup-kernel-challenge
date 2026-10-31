@@ -34,6 +34,7 @@ Triton tutorial "Matrix Multiplication", triton-lang.org, tutorials/03-matrix-mu
 import os
 import re
 import tempfile
+import threading
 
 import torch
 import triton
@@ -44,6 +45,7 @@ ABLOCK = 256  # absmax blocks per second-level scale
 PREFIX = "tc_"
 
 _STATE = {"installed": False}
+_LOCK = threading.Lock()  # warm-up threads and the training thread may install at the same time
 
 
 def _rewrite_ttgir(text):
@@ -56,6 +58,12 @@ def install():
     """Registers the stage hook (once per process; an earlier hook keeps running first)."""
     if _STATE["installed"]:
         return
+    with _LOCK:
+        if not _STATE["installed"]:
+            _install()
+
+
+def _install():
     from triton import knobs
     from triton.compiler.compiler import parse
 
