@@ -216,8 +216,8 @@ def start(argv=None):
 def view(path, offset, nbytes):
     """The uint8 host view of the file range [offset, offset + nbytes) of `path`, pinned, once its chunk
     is read (waits for it); None when it is not covered or the read failed."""
-    entry = _STATE["files"].get(os.path.realpath(path)) if _STATE["files"] else None
-    if entry is None or _STATE["released"]:
+    entry = _covered(path)
+    if entry is None:
         return None
     chunk = entry.chunk_of(offset, nbytes)
     if chunk is None:
@@ -230,19 +230,30 @@ def view(path, offset, nbytes):
     return entry.buffer[begin:begin + nbytes]
 
 
+def _covered(path):
+    """The _File read ahead for `path`, a file transformers opened, when it is the same file (real path,
+    size and modification time), else None. Resolved once per path (every tensor of a load asks)."""
+    if not _STATE["files"] or _STATE["released"]:
+        return None
+    covered = _STATE.setdefault("covered", {})  # path as transformers opened it -> _File or None
+    if path in covered:
+        return covered[path]
+    entry = _STATE["files"].get(os.path.realpath(path))
+    if entry is not None:
+        try:
+            stat = os.stat(entry.path)
+            if (stat.st_size, stat.st_mtime_ns) != entry.stamp:
+                entry = None
+        except OSError:
+            entry = None
+    covered[path] = entry
+    return entry
+
+
 def covers(path):
     """Whether `path`, a file transformers opened, is one read ahead: the same real path, size and
     modification time."""
-    if not _STATE["files"] or _STATE["released"]:
-        return False
-    entry = _STATE["files"].get(os.path.realpath(path))
-    if entry is None:
-        return False
-    try:
-        stat = os.stat(entry.path)
-    except OSError:
-        return False
-    return (stat.st_size, stat.st_mtime_ns) == entry.stamp
+    return _covered(path) is not None
 
 
 def release(log=print):
@@ -252,6 +263,7 @@ def release(log=print):
         if _STATE["released"] or not _STATE["files"]:
             return
         _STATE["released"] = True
+        _STATE.setdefault("covered", {}).clear()
         files = list(_STATE["files"].values())
     thread = _STATE["thread"]
 

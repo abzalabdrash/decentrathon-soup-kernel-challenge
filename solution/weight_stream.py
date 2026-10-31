@@ -322,7 +322,7 @@ class _HostLayer:
     """A decoder layer's 4-bit tensors in a pinned host buffer of its own, laid out as a
     WeightStreamer lays out a layer; the modules point at views of it."""
 
-    def __init__(self, layer, device, only, pinned=None):
+    def __init__(self, layer, device, only, pinned=None, sync=True):
         plan, nbytes = _plan_layer(layer, device, only)
         self.device, self.only, self.nbytes = device, only, nbytes
         if pinned is not None and pinned.buffer is not None and pinned.nbytes >= nbytes:
@@ -333,7 +333,8 @@ class _HostLayer:
             self.buffer, self._unpin = pinned_host_buffer(nbytes, self)
         for segment, tensor in plan:
             segment.view(self.buffer).copy_(tensor, non_blocking=True)
-        torch.cuda.synchronize(device)
+        if sync:  # else the caller synchronizes once before anything reads the host copies (load_stream.py)
+            torch.cuda.synchronize(device)
         self.segments = [segment for segment, _ in plan]
         for segment in self.segments:
             segment.assign(segment.view(self.buffer))
@@ -354,7 +355,7 @@ class _HostLayer:
         self.buffer = None
 
 
-def offload_loaded_layer(layer, device, only=None, pinned=None):
+def offload_loaded_layer(layer, device, only=None, pinned=None, sync=True):
     """Called by load_stream.py once the loader has quantized every 4-bit linear layer of `layer`:
     its tensors go to pinned host memory now (into `pinned`, a PinnedBuffer made ahead, when it is
     big enough), for the WeightStreamer built before peft's kbit preparation to adopt (no second
@@ -362,7 +363,7 @@ def offload_loaded_layer(layer, device, only=None, pinned=None):
     only = frozenset(only) if only else None
     if layer in _LOADED or layer in _STREAMERS:
         return 0
-    host = _HostLayer(layer, device, only, pinned)
+    host = _HostLayer(layer, device, only, pinned, sync=sync)
     _LOADED[layer] = host
     return host.nbytes
 
