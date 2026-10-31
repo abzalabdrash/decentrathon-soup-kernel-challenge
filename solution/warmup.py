@@ -83,7 +83,9 @@ exit, `_shutdown` stops the warm-up between two registrations. `watch_compiles()
 (or on-disk cache read) outside the warm-up; the log line "waited N s for the warmup" at `train`
 begin shows whether the warm-up fits.
 
-Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default),
+Measuring switches (environment): SOUP_SOLUTION_WARMUP_START=apply_begin|apply_end (default)|setup
+(the thread starts when Soup's model setup begins: Soup's command line, config and data reading
+after apply() run without the workers' GIL contention),
 SOUP_SOLUTION_WARMUP_WORKERS, SOUP_SOLUTION_WARMUP_SWITCH_MS, SOUP_SOLUTION_WARMUP_SKIP=name,name,
 SOUP_SOLUTION_WARMUP_ORDER=longest (the registrations by their T4 cost, longest first; see COSTS).
 
@@ -845,7 +847,7 @@ def start_early(log=True):
     return None
 
 
-def start_background_warmup(log=True, final=True):
+def start_background_warmup(log=True, final=True, release=False):
     """Queues every registration not queued yet and, on the first call, starts the daemon thread
     that runs them with WORKERS workers (SOUP_SOLUTION_WARMUP_WORKERS), on the caller's CUDA
     device and on a stream of its own. `final` (the call at the end of apply()): nothing more will
@@ -879,6 +881,10 @@ def start_background_warmup(log=True, final=True):
             _STATE["queue"].put((name, fn))
         if final:
             _STATE["closed"] = True
+        if (_STATE["thread"] is None and not release
+                and os.environ.get("SOUP_SOLUTION_WARMUP_START", "apply_end") == "setup"):
+            _STATE["deferred"] = True  # patch_soup_warmup starts it when Soup's setup begins
+            return None
         if _STATE["thread"] is None:
             _STATE["begin"] = time.perf_counter()
             workers = int(_setting("SOUP_SOLUTION_WARMUP_WORKERS", WORKERS, int))
@@ -1038,8 +1044,9 @@ def patch_soup_warmup(start_in_setup=False):
     original_train = cls.train
 
     def _setup_transformers(self, *args, **kwargs):
-        if start_in_setup:
-            start_background_warmup()
+        if start_in_setup or _STATE.get("deferred"):
+            _STATE["deferred"] = False
+            start_background_warmup(release=True)
         return original_setup(self, *args, **kwargs)
 
     def train(self, *args, **kwargs):

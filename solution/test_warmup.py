@@ -392,3 +392,30 @@ def test_first_call_cold_and_warm(tmp_path):
     assert out.returncode == 0, out.stderr[-3000:]
     times = dict(re.findall(r"(\w+_s)=([0-9.]+)", out.stdout))
     assert float(times["warm_first_s"]) < float(times["cold_first_s"]) / 2
+
+
+def test_start_deferred_to_soup_setup(fresh, monkeypatch):
+    """SOUP_SOLUTION_WARMUP_START=setup: apply()'s final call queues the registrations without a
+    thread; Soup's model setup starts it; train waits for it as before."""
+    from soup_cli.trainer import sft as soup_sft
+
+    cls = soup_sft.SFTTrainerWrapper
+    order = []
+    monkeypatch.setenv("SOUP_SOLUTION_WARMUP_START", "setup")
+    monkeypatch.setattr(cls, "_soup_warmup", False, raising=False)
+    monkeypatch.setattr(cls, "_setup_transformers", lambda self: order.append("setup"))
+    monkeypatch.setattr(cls, "train", lambda self: order.append("train"))
+
+    @fresh.register(name="slow")
+    def slow():
+        time.sleep(0.3)
+        order.append("warmed")
+
+    fresh.patch_soup_warmup(start_in_setup=False)
+    assert fresh.start_background_warmup(log=False) is None
+    assert not fresh.warmup_report()["started"] and fresh._STATE.get("deferred")
+    wrapper = object.__new__(cls)
+    wrapper._setup_transformers()
+    assert fresh.warmup_report()["started"] and not fresh._STATE.get("deferred")
+    wrapper.train()
+    assert order == ["setup", "warmed", "train"]
