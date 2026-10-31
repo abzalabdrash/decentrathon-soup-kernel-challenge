@@ -166,7 +166,12 @@ def prepin(megabytes):
     def work():
         try:
             for _ in range(count):
-                slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                try:
+                    slab = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                except (RuntimeError, MemoryError):
+                    # Page-locked memory can run out before the GPU does. Consumers take
+                    # the slabs made so far, then keep tensors on the GPU when pinning fails.
+                    break
                 with _SPARE_LOCK:
                     _SPARE.append(slab)
                     _SPARE_LOCK.notify_all()
@@ -224,7 +229,13 @@ class _HostStack:
                     _SPARE_LOCK.wait()  # the prepin thread pins this slab anyway: no second one
                 spare = _SPARE.pop() if _SPARE else None
             if spare is None:
-                spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                try:
+                    spare = torch.empty(SLAB_BYTES, dtype=torch.uint8, pin_memory=True)
+                except (RuntimeError, MemoryError):
+                    # Do not retry cudaHostAlloc for every saved tensor in the step.
+                    # The pack hook's existing cap fallback keeps the original tensor.
+                    self.limit = self.nbytes
+                    return None, None
             else:
                 self.prepinned += 1
             self.slabs.append(spare)

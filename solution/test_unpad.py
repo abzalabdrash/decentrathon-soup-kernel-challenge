@@ -15,6 +15,8 @@ SCALE = HEAD_DIM ** -0.5
 PATTERNS = {
     "354 tokens in 4 rows": [100, 90, 84, 80],
     "1427 tokens in 4 rows, one long": [512, 401, 311, 203],
+    "2048 tokens, four max-length rows": [512, 512, 512, 512],
+    "1999 tokens, near max-length rows": [512, 511, 509, 467],
     "rows of length 1": [1, 37, 1, 64, 1],
     "one row": [300],
 }

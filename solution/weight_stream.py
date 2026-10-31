@@ -94,6 +94,16 @@ _RING = {"timing": os.environ.get("SOUP_SOLUTION_WEIGHT_RING_TIMING", "0").strip
          not in ("0", "false", "no", "")}
 
 
+def stream_timing_enabled():
+    """Optional diagnostic events; dependency events always stay enabled.
+
+    SOUP_SOLUTION_STREAM_TIMING=0 removes only copy/wait timing from the head and
+    weight streams. Keep the measured default until a T4 comparison is available.
+    """
+    return os.environ.get("SOUP_SOLUTION_STREAM_TIMING", "1").strip().lower() not in (
+        "0", "false", "no", "")
+
+
 class StreamSkip(Exception):
     """The model is not one this module streams; it is left untouched."""
 
@@ -121,6 +131,7 @@ def pinned_host_buffer(nbytes, owner):
     if not ok or not buffer.is_pinned():
         if ok:
             _unregister(buffer)
+        del buffer  # the fallback must not temporarily hold two full host copies
         return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True), None
     return buffer, weakref.finalize(owner, _unregister, buffer)
 
@@ -494,6 +505,7 @@ class WeightStreamer:
                 for g, module in modules.items():
                     self._matrices[module] = (g, j, groups[g].first)
         self._matrix_groups = tuple(range(1, len(groups)))
+        self.timing = stream_timing_enabled()
         self.matrix_timing = _RING["timing"]
         # every copy's destination (its slot's first bytes) and source (the part of the layer's
         # pinned buffer), made once: views cost CPU time on every copy
@@ -585,7 +597,7 @@ class WeightStreamer:
         group = self._groups[g]
         s = group.first + j % group.count
         dst, src = self._copies[g][j]
-        timed = g == 0 or self.matrix_timing
+        timed = (g == 0 and self.timing) or (g != 0 and self.matrix_timing)
         self._free[s].record(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
@@ -606,7 +618,7 @@ class WeightStreamer:
         """The compute stream waits for the last copy into slot s (timed as `kind`; an MLP matrix's
         wait, kind +-2, only with SOUP_SOLUTION_WEIGHT_RING_TIMING=1)."""
         compute = torch.cuda.current_stream(self.device)
-        if kind in (2, -2) and not self.matrix_timing:
+        if (kind in (2, -2) and not self.matrix_timing) or (kind in (1, -1) and not self.timing):
             compute.wait_event(self._ready[s])
             return
         begin, end = self._event(), self._event()

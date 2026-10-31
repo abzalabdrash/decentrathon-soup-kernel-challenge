@@ -47,7 +47,7 @@ def _targets(n, pattern, seed):
     return targets
 
 
-def _reference(hidden, weight, targets, num_items):
+def _reference(hidden, weight, targets, num_items, chunk=256):
     """The base's head (fused_ce.reference_lm_head_loss) in blocks of rows, with the AMP scale on the
     backward as in a real fp16 step."""
     from solution.fused_ce import reference_lm_head_loss
@@ -56,11 +56,11 @@ def _reference(hidden, weight, targets, num_items):
     denom = float(num_items) if num_items is not None else max(int(labelled.sum()), 1)
     grad = torch.zeros_like(hidden)
     total, token_loss, entropy, correct = 0.0, [], [], []
-    for start in range(0, hidden.shape[0], 256):
-        rows = hidden[start:start + 256].detach().clone().requires_grad_(True)
-        loss, tl, en, co = reference_lm_head_loss(rows, weight, targets[start:start + 256], denom)
+    for start in range(0, hidden.shape[0], chunk):
+        rows = hidden[start:start + chunk].detach().clone().requires_grad_(True)
+        loss, tl, en, co = reference_lm_head_loss(rows, weight, targets[start:start + chunk], denom)
         (loss * SCALE).backward()
-        grad[start:start + 256] = rows.grad / SCALE
+        grad[start:start + chunk] = rows.grad / SCALE
         total += loss.item()
         token_loss.append(tl)
         entropy.append(en)
@@ -107,6 +107,7 @@ def _exact_grad(logits16, weight, targets, denom):
     (1427, "all_labelled", 16384, 2.0, None),
     (826, "mixed", 3000, 30.0, None),  # peaked rows: the running max moves between chunks
     (97, "none_labelled", 8192, 2.0, None),
+    pytest.param(2048, "mixed", 4096, 2.0, None, id="hidden-2048"),
 ])
 def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items):
     from solution.fused_ce import fused_lm_head_loss
@@ -122,7 +123,7 @@ def test_streamed_head_matches_base(streamed, n, pattern, rows, scale, num_items
     (loss * SCALE).backward()
     grad = hidden.grad / SCALE
     ref_loss, ref_token_loss, ref_entropy, ref_correct, ref_grad = _reference(
-        hidden, weight, targets, num_items)
+        hidden, weight, targets, num_items, chunk=64 if n == 2048 else 256)
 
     # statistics from the same fp16 logits: fp32 both ways, only the summation order differs
     chunk_logits, sorted_targets, order = _chunked_logits(hidden, weight, targets, rows)

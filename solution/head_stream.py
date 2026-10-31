@@ -248,7 +248,7 @@ class HeadStreamer:
             raise HeadSkip("not a contiguous 2-D weight")
         if _registered(param) is not None:
             raise HeadSkip("the weight is streamed already")
-        from .weight_stream import pinned_host_buffer
+        from .weight_stream import pinned_host_buffer, stream_timing_enabled
 
         started = time.perf_counter()
         self.vocab, self.hidden = data.shape
@@ -262,7 +262,12 @@ class HeadStreamer:
         if self._pinned is not None:  # pinned ahead while the loader read the checkpoint
             raw, self._unpin = pinned.buffer[:nbytes], pinned.unpin
         else:
-            raw, self._unpin = pinned_host_buffer(nbytes, self)
+            try:
+                raw, self._unpin = pinned_host_buffer(nbytes, self)
+            except (RuntimeError, MemoryError) as exc:
+                # No model state has changed yet: the caller can use the original
+                # resident weight when the host cannot pin another buffer.
+                raise HeadSkip(f"cannot pin the head weight: {exc!r}") from exc
         self.host = raw.view(self.dtype).view(self.vocab, self.hidden)
         self.host.copy_(data)
         torch.cuda.synchronize(self.device)
@@ -274,6 +279,7 @@ class HeadStreamer:
         self._staging, self._staging_done = None, None
         self._spans = collections.deque()
         self._spare_events = []
+        self.timing = stream_timing_enabled()
         self.loads = self.late_loads = self.heads = self.copies_timed = 0
         self.copy_ms = self.wait_ms = 0.0
         self.copy_bytes = 0
@@ -369,14 +375,18 @@ class HeadStreamer:
         c0, vc = self._chunk(c)
         compute = torch.cuda.current_stream(self.device)
         self._free[s].record(compute)
-        begin, end = self._event(), self._event()
+        if self.timing:
+            begin, end = self._event(), self._event()
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_event(self._free[s])
-            begin.record(self._copy_stream)
+            if self.timing:
+                begin.record(self._copy_stream)
             self._ring[s, :vc].copy_(self.host[c0:c0 + vc], non_blocking=True)
-            end.record(self._copy_stream)
+            if self.timing:
+                end.record(self._copy_stream)
             self._ready[s].record(self._copy_stream)
-        self._spans.append(("copy", begin, end, vc * self.hidden * self.host.element_size()))
+        if self.timing:
+            self._spans.append(("copy", begin, end, vc * self.hidden * self.host.element_size()))
         self._owner[s] = c
         self.loads += 1
 
@@ -397,11 +407,13 @@ class HeadStreamer:
             self._load(c)
             self.late_loads += 1
         compute = torch.cuda.current_stream(self.device)
-        begin, end = self._event(), self._event()
-        begin.record(compute)
+        if self.timing:
+            begin, end = self._event(), self._event()
+            begin.record(compute)
         compute.wait_event(self._ready[s])
-        end.record(compute)
-        self._spans.append(("wait", begin, end, 0))
+        if self.timing:
+            end.record(compute)
+            self._spans.append(("wait", begin, end, 0))
         return self._ring[s, :self._chunk(c)[1]]
 
     def _release(self, c):

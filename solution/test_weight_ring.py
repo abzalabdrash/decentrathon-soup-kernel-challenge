@@ -120,6 +120,35 @@ def test_type_ring_matches_layer_ring(layer_shaped_qwen_dir, night, monkeypatch,
     assert compare(resident, step())  # restored
 
 
+@pytest.mark.parametrize("lengths", [(512, 511, 509, 467), (512, 512, 512, 512)],
+                         ids=["1999-tail-to-2000", "2048-max-length"])
+def test_type_ring_hidden_lengths_without_timing(layer_shaped_qwen_dir, night, monkeypatch,
+                                                lengths):
+    """Long hidden-like batches retain exact outputs/gradients without diagnostic timing events.
+
+    One batch needs an alignment-tail token and the other reaches four max_length=512 rows.
+    Two streamed steps exercise reusing slot events; the night fixture fixes backward key splits
+    so changes from streaming cannot hide behind attention's atomic accumulation noise.
+    """
+    from solution import fused_proj, weight_stream
+    from solution.weight_stream import stream_model_weights
+
+    monkeypatch.setenv("SOUP_SOLUTION_STREAM_TIMING", "0")
+    monkeypatch.setitem(weight_stream._RING, "timing", False)
+    monkeypatch.setitem(fused_proj._MLP_MEMORY, "recompute", False)
+    model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
+    resident = _ring_step(model, lengths=lengths)
+    streamer = stream_model_weights(model, slots=2, ring="type")
+    assert streamer is not None and streamer.ring == "type"
+    assert not streamer.timing and not streamer.matrix_timing
+    try:
+        for _ in range(2):
+            assert _same(resident, _ring_step(model, lengths=lengths))
+        assert streamer.late_loads == 0
+    finally:
+        streamer.restore()
+
+
 @pytest.mark.parametrize("timing", [True, False])
 def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night, monkeypatch, timing):
     """Every layer's MLP matrices (weight, absmax, second-level absmax) point into their type's one
