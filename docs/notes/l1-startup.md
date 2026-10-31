@@ -99,3 +99,33 @@ soup-l1-v2 (f73bcec; first step / train begin / warm-up length / warm-up end / w
 - tpflo 9.88 / 9.56 / 5.42 / 8.76 / 46.23
 - tpfloc (+ LOAD_CODE_TABLE) 9.61 / 9.28 / 4.62 / 7.95 / 45.90
 Peak 395 MiB, own kernels 16.9 %.
+
+soup-l1-v3 (d1f102f; first step / train begin / setup end / warm-up length / wall):
+- base 11.34 / 11.02 / 6.90 / 7.37 / 46.29
+- lo (LAUNCHERS_ONE) 10.82 / 10.50 / 6.76 / 4.99 / 46.11
+- lofr (lo + FAST_ROWS=1, since deleted) 10.68 / 10.36 / 6.86 / - / 45.86
+- lor (lo + EARLY_ROWS) 11.38 / 11.06 / 9.63 / 5.98 / 46.55: no-go, the thread's pure-Python dill hash
+  (2.9 s) holds the GIL for whole 5 ms intervals and the main thread's model load (thousands of torch
+  ops, each releasing and retaking the GIL) grows by 2.9 s
+- lorc / lorcm / lorcme 11.35 / 11.26 / 11.22 (on top of EARLY_ROWS); LOAD_EARLY read 2944 MiB in
+  2.13 s from apply begin, all 338 tensors staged from it, the loop's staging wait 0
+Peak 395 MiB, own kernels 17.1-17.3 %.
+
+Not done, and why: the speculative NF4 quantization in a thread before from_pretrained (answer 13) runs
+into the same GIL handoffs: each torch op of the thread waits up to 5 ms while the main thread imports
+or runs Soup's CLI (pure Python), about 10-15 ops per weight for 196 weights. filelock's audit hook
+(0.41 s of the trainer build, every `builtins.id` event of dill's pickle) is installed before apply()
+and audit hooks cannot be removed. Imports in a thread (answer 14): the main thread is the importer and
+both are GIL-bound.
+
+## Lines for README (switches that end up on)
+
+- Лаунчеры ядер Triton собираются одним запуском компилятора C: поток прогрева один раз прогоняет
+  регистрации прогрева с `knobs.runtime.jit_cache_hook` Triton, отвечающим «пропустить» (ничего не
+  компилируется и не запускается, видны только сигнатуры), берёт исходники лаунчеров у `make_launcher`
+  Triton и собирает их в одну единицу трансляции (имена каждого исходника переименованы через
+  `#define`, каждый лаунчер сохраняет свой модуль). `compile_module_from_src` Triton получает готовый
+  модуль по тексту исходника; любой другой исходник и неудачная сборка идут обычным путём Triton.
+  Кубины и код запуска те же. На T4 прогрев 7,0–7,4 → 4,9–5,0 с. `SOUP_SOLUTION_LAUNCHERS_ONE=0`
+  выключает.
+- (LOAD_CODE_TABLE, META_INIT, LOAD_EARLY, TRACKER_THREAD: lines added if soup-l1-v4 keeps them.)
