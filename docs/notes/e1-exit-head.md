@@ -187,3 +187,16 @@ saves); if the orchestrator prefers to ask: «Можно ли после пос�
 pinned-буферы оффлоада и снимать регистрацию pinned-памяти весов в потоке, пока Soup сохраняет
 адаптер (значения весов остаются в обычной памяти, все выходы пишутся как раньше), и выключать
 сборщик мусора после последнего шага?»
+
+## State at hand-over (31 Oct, ~11:00 Astana)
+
+- Branch head after this commit; main 0b47c87 (B1 + M1) merged in cleanly (only a syntax check after the
+  merge: re-run the targeted tests and one T4 run on the merged code).
+- On by default: nothing new (all E1 switches are off in code). Recommended on: SOUP_SOLUTION_EXIT_RELEASE=all,
+  SOUP_SOLUTION_EXIT_NOGC=1 (-0.57..-0.65 s, measured). Recommended off: SOUP_SOLUTION_HEAD_PACK (+2 MiB).
+- In flight: no Kaggle or Modal run (all E1 sessions finished and were downloaded before the WSL restart).
+- Left: find the +2 MiB outside the allocator with the pack on (host registration's GPU page tables vs the
+  new kernel module): `python tools/modal_run.py --profile glofcast-prod --mode bench --host any --bench
+  "solution.bench_pack_mem" --slug e1-pmem --commit <head>` (prints nvidia-smi memory.used after each step).
+  If it is the registration, put the packed bytes in already-registered memory; then the pack is a small net
+  win (-0.07..-0.24 s, 0 MiB) and can be enabled with SOUP_SOLUTION_HEAD_PACK_MAX_ROWS=800.
