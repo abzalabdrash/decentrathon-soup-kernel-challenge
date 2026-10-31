@@ -125,6 +125,12 @@ byte of PCIe at any memory cost buys at most ~1.8 s on the public rows: the NF4 
 Astra's 1 s bar: partial NF4 residency is not worth memory), the head ~0.1 s, the activations ~1 s
 (I1's side). The rest of the step's idle time is the CPU.
 
+**The same upper bounds on the jury-like rows (soup-p2-ub-jury, 55f4e3e, seed 157, 4 variants x 2 rounds +
+warm run):** main 49.63 / 50.03 s (49.83); early release 50.08 / 49.93 (50.01, +0.18); all NF4 resident
+49.32 / 49.48 (49.40, -0.43 vs main, peak 1,085); everything resident 48.07 / 48.23 (48.15, -1.68 vs main,
+3,681 MiB). Early release on these rows: +0.08 and +0.18 s in two sessions (within the ~0.3 s noise, but
+not a gain); its -0.41 / -0.43 s is a public-rows effect.
+
 **Where early release's waits went (soup-p2-trace2-pub, 11ea449, CUDA-only traces of the same eight
 steps, 0-based 9-16, early release off and on, one session):** per step on the public rows
 
