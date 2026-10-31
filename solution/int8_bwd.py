@@ -55,7 +55,9 @@ _STATE["mma"] = os.environ.get("SOUP_SOLUTION_MMA_INT8_BWD", "0").strip().lower(
 # first START_CALLS MLP backwards of the run (four steps of the 28-layer model) take the fp16 path
 # meanwhile; the next one waits for the thread if it is not done, so which backwards run int8 never
 # depends on timing.
-START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_START_CALLS", "112"))
+# with SOUP_SOLUTION_MMA_INT8_BWD six steps: the tensor-core kernels take longer to compile (soup-b3-abba3:
+# the switch after four steps waited ~1 s for the thread)
+START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_START_CALLS", "168" if _STATE["mma"] else "112"))
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 W_ROWS = 128  # weight rows per program of nf4_int8_t_kernel (128-byte rows of the transposed store)
@@ -259,6 +261,10 @@ def mlp_backward(plan, gate_up, grad16, buffer):
     if _mma_bwd(inter, d):
         # 3-4 in one kernel (mma_gemm.py): the int32 product stays in registers; pmax per feature tile
         pmax = mma_gemm.int8_swiglu_bwd(w_down_t, g_q, scale_d, s_g, gate_up)
+        # one partial maximum per token for the quantization below: it reads every partial once per
+        # program, and the fused kernel leaves I / BLOCK_I of them (soup-b3-abba3: 140 of them cost
+        # ~14 ms per step); the maximum is exact, so the scales are the same
+        pmax = pmax.amax(0, keepdim=True)
     else:
         acc_h = torch._int_mm(w_down_t, g_q.t())
         # 4. the SwiGLU backward in place over (gate|up), per-token absmax per feature group
@@ -302,16 +308,17 @@ def _warm():
             compile_kernel(nf4_int8_t_kernel, i32, u8, f32, f32, f32, f32, f32, i8,
                            n_cols // QBLOCK, stride, offset, ROWS=W_ROWS, QBLOCK=QBLOCK,
                            ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
-    compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, f32, INTERMEDIATE, tokens,
-                   INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M)
     groups = GROUPS
-    if _mma_bwd(INTERMEDIATE, HIDDEN):
+    if not _mma_bwd(INTERMEDIATE, HIDDEN):
+        compile_kernel(int8_swiglu_bwd_kernel, i32, f32, f32, half, f32, INTERMEDIATE, tokens,
+                       INTERMEDIATE // GROUPS, TI=TILE_I, TM=TILE_M)
+    else:
         mma_gemm.install()
         bi, bt, bk, warps, group = mma_gemm.SWIGLU_BWD_CFG
         compile_kernel(mma_gemm.tc_int8_swiglu_bwd_kernel, i8, i8, f32, f32, half, f32, INTERMEDIATE,
                        tokens, HIDDEN, BLOCK_I=bi, BLOCK_T=bt, BLOCK_K=bk, GROUP_I=group,
                        num_warps=warps, num_stages=1)
-        groups = INTERMEDIATE // bi
+        groups = 1
         if mma_gemm.int8_scaled_mm_usable(HIDDEN, 2 * INTERMEDIATE):
             bm, bn, bk, warps, group = mma_gemm.SCALED_MM_CFG
             compile_kernel(mma_gemm.tc_int8_scaled_mm_kernel, i8, i8, f32, f32, f32, tokens, HIDDEN,
