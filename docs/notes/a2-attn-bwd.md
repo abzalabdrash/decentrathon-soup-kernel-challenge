@@ -96,6 +96,13 @@ all padding (its time follows the sum of L^2 / 2: 0.45 ms at the data's typical 
 long steps. Nothing here makes the 0.5 ms target reachable without an own tensor-core kernel (review
 2, section 2.5: not the plan for today).
 
+Worth reusing for an int8 head or a graph over a head chunk: `attn_bwd._free_tail` (scratch in the
+free tail of fused_proj's shared dequantization buffer, 15.75 MiB behind the held weights, no new
+memory, safe on the one compute stream) with `_balanced` chunking; `torch.bmm(out_dtype=torch.float32)`
+on sm_75 (0.082 ms against 0.126 for a half bmm plus cast); the tolerance test pattern (fp32 autograd
+reference and the original path, max |err| / max |ref|); and `Plan`'s per-step maps copied from
+pinned memory without a host wait. The bins and row blocks are attention-specific.
+
 The code stays in the branch, off by default (`SOUP_SOLUTION_ATTN_BWD=sdpa`): with the default, the
 forward's `taken` and the backward's hook return on their first comparison. Recommendation: do not
 merge the `unpad.py` hook and `attn_bwd.py` into main (no gain, more for the jury to read); this note
