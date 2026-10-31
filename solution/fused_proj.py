@@ -83,7 +83,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from . import int8_bwd, int8_fwd, nf4, rope, weight_stream
+from . import int8_bwd, int8_fwd, mem_policy, nf4, rope, weight_stream
 from .nf4 import dequantize_nf4
 from .swiglu import BLOCK as SWIGLU_BLOCK
 from .swiglu import example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
@@ -1340,6 +1340,8 @@ def _fused_attention(attn, x, position_embeddings, plan):
     a_q, b_q = plan.lora_q
     a_v, b_v = plan.lora_v
     cos, sin = position_embeddings
+    if mem_policy.LOG and torch.is_grad_enabled() and getattr(attn, "layer_idx", None) == 0:
+        mem_policy.step_begin(plan.n_tokens)  # SOUP_SOLUTION_MEM_LOG: a training step begins
     recompute = _recompute_for(attn, plan, x)
     dropout = 0.0 if not attn.training else attn.attention_dropout
     n = plan.n_tokens
