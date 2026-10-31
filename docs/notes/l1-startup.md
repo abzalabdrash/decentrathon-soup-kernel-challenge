@@ -118,7 +118,34 @@ or runs Soup's CLI (pure Python), about 10-15 ops per weight for 196 weights. fi
 and audit hooks cannot be removed. Imports in a thread (answer 14): the main thread is the importer and
 both are GIL-bound.
 
-## Lines for README (switches that end up on)
+soup-l1-v4 (7661609; each variant on top of the previous; first step / setup end / tensor loop / warm-up
+length / wall):
+- base 11.42 / 6.94 / 1.90 / 7.44 / 46.53
+- lo (LAUNCHERS_ONE) 10.92 / 6.84 / 1.88 / 4.82 / 45.91
+- loc (+ LOAD_CODE_TABLE) 10.85 / 6.75 / 1.85 / 5.19 / 45.83
+- locm (+ META_INIT) 10.82 / 6.70 / 1.97 / 5.12 / 45.86
+- locme (+ LOAD_EARLY) 10.76 / 6.55 / 1.35 / 5.02 / 45.83 (staging wait 0; apply +0.11 s from the reading
+  thread next to the imports)
+- locmet (+ TRACKER_THREAD) 10.83 / 6.66 / 1.46 / 5.07 / 45.70
+Peak 395 MiB, own kernels 17.2-17.4 %. The int8 kernels (I1) still compile outside the warm-up at steps
+1-3 (their own thread); their launchers now come from the one build.
+
+soup-l1-full1 (7661609, all five switches by `--env`): all 10 checks; 47.1 s / 395 MiB against the base
+84.3 s / 14 345 MiB (speedup 1.79, memory 36.3), eval -0.001 %, own kernels 16.7 %, Soup 79 passed.
+pytest solution 440 passed, 4 failed: test_jury_warmup_exit x2 (called `warmup._run` with the removed
+switch-interval argument: fixed in d43c313), test_recompute[lengths0] (memory bound; fails in P1's full
+run too), test_boundary::test_layer_slices_keep_the_lists (passes alone with and without the switches;
+in the whole process boundary.py's watched set keeps ids of collected modules and a new ModuleList can
+reuse one: B1's area).
+soup-l1-jury1 (d43c313, seed 151, train rows 38000:38256, eval rows 48000:48256, all five switches):
+all 10 checks; 47.8 s / 415 MiB against 83.2 s / 14 353 MiB (speedup 1.74, memory 34.6), eval +0.021 %,
+own kernels 17.0 %; pytest 442 passed, 2 failed (the recompute and boundary tests above).
+
+Decision (1e91696): LAUNCHERS_ONE and LOAD_CODE_TABLE on by default (together first step -0.57 s, wall
+-0.70 s in v4). Off, with their numbers: META_INIT (-0.03 s), LOAD_EARLY (-0.06 s, 2.9 GB pinned host
+memory during the load), TRACKER_THREAD (wall -0.13 s, one session), EARLY_ROWS (+0.5 s).
+
+## Lines for README (switches on by default)
 
 - Лаунчеры ядер Triton собираются одним запуском компилятора C: поток прогрева один раз прогоняет
   регистрации прогрева с `knobs.runtime.jit_cache_hook` Triton, отвечающим «пропустить» (ничего не
@@ -126,6 +153,8 @@ both are GIL-bound.
   Triton и собирает их в одну единицу трансляции (имена каждого исходника переименованы через
   `#define`, каждый лаунчер сохраняет свой модуль). `compile_module_from_src` Triton получает готовый
   модуль по тексту исходника; любой другой исходник и неудачная сборка идут обычным путём Triton.
-  Кубины и код запуска те же. На T4 прогрев 7,0–7,4 → 4,9–5,0 с. `SOUP_SOLUTION_LAUNCHERS_ONE=0`
+  Кубины и код запуска те же. На T4 прогрев 7,0–7,4 → 4,8–5,0 с. `SOUP_SOLUTION_LAUNCHERS_ONE=0`
   выключает.
-- (LOAD_CODE_TABLE, META_INIT, LOAD_EARLY, TRACKER_THREAD: lines added if soup-l1-v4 keeps them.)
+- Таблица NF4 bitsandbytes строится один раз за загрузку и копируется для каждого веса (те же 16
+  значений, свой тензор у каждого quant state); без этого `get_4bit_type` на каждый из 196 весов
+  создавал её заново с ожиданием GPU. `SOUP_SOLUTION_LOAD_CODE_TABLE=0` выключает.
