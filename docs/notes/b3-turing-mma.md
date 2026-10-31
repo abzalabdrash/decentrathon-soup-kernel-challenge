@@ -36,3 +36,14 @@ int8 `tc_matmul_i8_kernel` против `torch._int_mm` (cuBLASLt): gate|up forw
 ## Строка для README (если организаторы ответят «да»)
 
 Tensor cores from our own Triton kernels. Triton 3.6 lowers `tl.dot` to FMA code on sm_75 because its layout pass refuses MMA layouts below compute capability 80, although the library still contains the Turing lowering (`mma.sync.aligned.m16n8k8` for fp16, `m8n8k16` for int8). `solution/mma_gemm.py` registers Triton's stage hook (`triton.knobs.runtime.add_stages_inspection_hook`) for our kernels named `tc_*` only: their TTGIR is built with the Ampere layout pass and marked as a Turing (mma 2.1) cuda:75 module; LLVM lowering, PTX and ptxas run unchanged for sm_75, with `num_stages=1` (no `cp.async` on Turing). The kernels compile inside the measured run with empty caches and launch through `JITFunction.run`, so the harness counts and times them. Two of them replace a cuBLASLt int8 GEMM and the pass over its int32 result: the MLP's int8 gate|up forward with its SwiGLU epilogue, and the backward's int8 `W_down^T g` product with the SwiGLU derivative. Integer accumulation is exact and the epilogues repeat the same fp32 operations, so their outputs are bit-for-bit those of the two-kernel paths; the int32 buffers (up to 70 MiB at 2,048 tokens) are never allocated.
+
+## Цена стриминга весов и головы (`soup-b3-resident`, cb878ea = main до P1 с выключенными B3, одна сессия, 2 раунда ABBA)
+
+| Вариант | Стена, с | Медиана шага | Шаги 3+, с | Пик nvidia-smi |
+|---|---|---|---|---|
+| base | 46,96 | 0,412 | 26,24 | 395 MiB |
+| `SOUP_SOLUTION_WEIGHT_STREAM=0` (все NF4-веса на GPU) | 44,04 (−2,9) | 0,367 | 23,33 | 1 025 MiB |
+| `SOUP_SOLUTION_WEIGHT_STREAM_ONLY=mlp` (веса attention на GPU, MLP кольцом по слоям) | 45,01 (−1,95) | 0,381 | 24,08 | 487 MiB |
+| `SOUP_SOLUTION_HEAD_STREAM=0` (голова на GPU, другой алгоритм головы) | 46,52 (−0,44) | 0,397 | 25,16 | 1 625 MiB |
+
+Полная резидентность NF4 стоит 630 MiB за 2,9 с: по формуле ей нужно ~10 с. Вариант с весами attention на GPU (+92 MiB за −1,95 с) по формуле примерно в ноль (395 → 487 MiB требуют ~2 с), к тому же он меняет и расписание MLP (кольцо по слоям вместо кольца по типам), а замер сделан до влития P1. Отказ от экономии памяти не путь к −10 с.
