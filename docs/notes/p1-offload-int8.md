@@ -235,6 +235,12 @@ loss ~0.01 %), all on the merged head 9ded812:**
 | solution_2 | | 0.001 % | 0.049 % | 0.161 % | 0.291 % | 0.174 % | 51.35 s |
 | base_2 against base_1 | | 0.000 % | 0.008 % | 0.010 % | 0.111 % | 0.029 % | |
 
+**Full on the tip 5dc5146** (soup-p1-full3, slerfas; runtime code = 9ded812, plus the test_offload fix):
+**10 of 10**, 44.4 s against base 80.1 (s = 1.80), 395 MiB, eval +0.006 %, loss first 0.01 % / mean
+0.05 %, own kernels 21.3 %; T4 `pytest solution` 451 passed, 5 skipped, 1 failed
+(`test_boundary::test_layer_slices_keep_the_lists`, order-dependent, fails on main too; the
+test_offload timing failure of soup-p1-full2 is gone).
+
 Every line is inside the tightened limits (largest: accuracy 0.364 % against 0.5 %), and on the same
 rows and seed the int8 offload does not move them: off 0.049 / 0.049 % loss mean, 0.177 / 0.161 %
 entropy, 0.329 / 0.291 % accuracy, 0.165 / 0.174 % rewind; on 0.049 / 0.048, 0.145 / 0.172, 0.364 /
