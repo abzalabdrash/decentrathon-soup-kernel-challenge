@@ -173,11 +173,16 @@ def test_type_ring_slots_counters_and_waits(layer_shaped_qwen_dir, night):
         streamer.restore()
 
 
-def _settled_allocated():
-    """memory_allocated() without garbage of earlier tests freed in the middle of a measurement."""
+def _settled_requested():
+    """(bytes the tensors on the GPU asked for, tolerance): the caching allocator's requested bytes
+    (memory_allocated() counts whole cached blocks, up to 1 MiB more per large allocation when the
+    rest of a block is too small to split), with the garbage of earlier tests collected first."""
     gc.collect()
     torch.cuda.synchronize()
-    return torch.cuda.memory_allocated()
+    requested = torch.cuda.memory_stats().get("requested_bytes.all.current")
+    if requested is None:
+        return torch.cuda.memory_allocated(), 4 << 20
+    return requested, 64 << 10
 
 
 def test_type_ring_memory(layer_shaped_qwen_dir, night):
@@ -191,16 +196,16 @@ def test_type_ring_memory(layer_shaped_qwen_dir, night):
     stream_model_weights(model, slots=2, ring="layer").restore()
     held = {}
     for ring in ("layer", "type"):
-        before = _settled_allocated()
+        before, tolerance = _settled_requested()
         streamer = stream_model_weights(model, slots=2, ring=ring)
         try:
-            held[ring] = (before - _settled_allocated(), streamer.ring_bytes)
+            held[ring] = (before - _settled_requested()[0], streamer.ring_bytes)
         finally:
             streamer.restore()
     (layer_freed, layer_ring), (type_freed, type_ring) = held["layer"], held["type"]
     assert 48_000_000 < layer_ring < 48_600_000 and 26_800_000 < type_ring < 27_200_000
     saved = type_freed - layer_freed
-    assert abs(saved - (layer_ring - type_ring)) <= 64 * 1024, (saved, layer_ring - type_ring)
+    assert abs(saved - (layer_ring - type_ring)) <= tolerance, (saved, layer_ring - type_ring)
     print(f"\nring {layer_ring / 2**20:.1f} -> {type_ring / 2**20:.1f} MiB, allocated "
           f"{saved / 2**20:.1f} MiB less")
 
