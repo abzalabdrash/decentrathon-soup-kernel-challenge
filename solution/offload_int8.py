@@ -242,18 +242,32 @@ def compile_now():
 
 def _warm():
     """The training's two kernels (tokens a multiple of 16: unpad.py's tail)."""
-    from .warmup import INTERMEDIATE, SKIPPED, TOKENS, compile_kernel, training_half_dtype
+    from .warmup import SKIPPED
 
     if not _STATE["on"]:
         return SKIPPED
+    _warm_codec()
+    if raw_in_use():  # the int8 MLP backward reading the int8 form
+        from . import int8_bwd
+
+        int8_bwd.warm_int8_in(GROUP)
+    return None
+
+
+def _warm_codec():
+    """The codec's two kernels (warmup.py's offload_int8_kernels registration compiles them alone)."""
+    from .warmup import INTERMEDIATE, TOKENS, compile_kernel, training_half_dtype
+
     tokens = -(-TOKENS // 16) * 16
     half = training_half_dtype()
     compile_kernel(gu_quant_kernel, half, half, torch.int16, torch.float32, INTERMEDIATE, tokens,
                    GROUP=GROUP, TM=TILE_M, SWIGLU=True, num_warps=WARPS)
     compile_kernel(gu_dequant_kernel, torch.int16, torch.float32, half, INTERMEDIATE, tokens,
                    GROUP=GROUP, TM=TILE_M, num_warps=WARPS)
+
+
+def raw_in_use():
+    """Whether int8_bwd.py's SwiGLU backward reads the int8 form directly (its INT8_IN variants)."""
     from . import int8_bwd
 
-    if RAW["on"] and int8_bwd._STATE["on"]:  # the int8 MLP backward reading the int8 form
-        int8_bwd.warm_int8_in(GROUP)
-    return None
+    return RAW["on"] and int8_bwd._STATE["on"]
