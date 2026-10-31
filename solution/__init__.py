@@ -44,7 +44,9 @@ SOUP_SOLUTION_PAD_TOKENS=16 (0 turns the alignment tail off), SOUP_SOLUTION_VARL
 SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_STREAM=0
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
-SOUP_SOLUTION_EXIT_RELEASE=1 and SOUP_SOLUTION_EXIT_NOGC=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache);
+SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache), SOUP_SOLUTION_EXIT_NOGC=0
+(off: the organizers forbade collector tweaks), SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; allowed by the organizers, to be switched on for the soup train process),
+SOUP_SOLUTION_CHEAP_FINGERPRINT=0 and SOUP_SOLUTION_DATASET_HASH=0 (off: datasets' fingerprint must stay the base's);
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
@@ -59,6 +61,17 @@ def apply():
     from .phases import mark, patch_soup_phases
 
     mark("apply begin")
+    # Defaults of switches that other modules read at import time (int8_bwd.py reads its own when
+    # fused_proj imports it), so they come before any patch import; an environment value wins.
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # E1: pinned host memory handed back on a thread at the last step; not "all" (check 9)
+    os.environ.setdefault("SOUP_SOLUTION_EXIT_NOGC", "0")  # OFF: the organizers forbade garbage-collector tweaks in apply() (chat, answer 31)
+    # answer 29 (chat, 31 Oct): int8 tensor cores for the frozen linear layers in the forward and the backward by
+    # input, and for lm_head, are allowed when all 10 checks pass; the MLP backward int8 (int8_bwd.py) measured
+    # 10/10 on the public rows (43.1 s / 395 MiB) and on the jury rows (s 1.91 against 1.80-1.85 without it)
+    # NOT switched on here yet: a setdefault leaks into the pytest process, where 12 bitwise tests of
+    # fused_proj assume the fp16 backward; switch it on inside int8_bwd.py only for the `soup train`
+    # process (argv check as in exit_release._soup_train_process), then rerun full + jury.
+    os.environ.setdefault("SOUP_SOLUTION_INT8_BWD", "0")
     if _on("SOUP_SOLUTION_WARMUP"):
         from .warmup import start_early
 
@@ -114,10 +127,6 @@ def apply():
 
         patch_weight_stream(slots=int(os.environ.get("SOUP_SOLUTION_WEIGHT_SLOTS", "2")))
     patch_soup_phases()
-    # E1 (docs/notes/e1-exit-head.md): pinned host memory handed back on a thread at the last step and the
-    # collector off there: train end -> process end 1.84 -> 1.08 s on the T4; SOUP_SOLUTION_EXIT_RELEASE=0 turns it off
-    os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # not "all": no empty_cache right after the last step (check 9)
-    os.environ.setdefault("SOUP_SOLUTION_EXIT_NOGC", "1")
     if os.environ.get("SOUP_SOLUTION_EXIT_RELEASE", "0") not in ("0", "false", "no", ""):
         from .exit_release import patch_soup_exit_release
 
@@ -126,7 +135,7 @@ def apply():
                           patch_soup_startup_profile)
 
     patch_soup_first_step_mark()
-    if _on("SOUP_SOLUTION_DATASET_HASH"):
+    if os.environ.get("SOUP_SOLUTION_DATASET_HASH", "0") not in ("0", "false", "no", ""):  # OFF: answer 13 (fingerprint)
         patch_soup_dataset_hashing()  # datasets hashes the tokenizer in 0.09 s instead of 1 s
     if os.environ.get("SOUP_SOLUTION_PROFILE_STARTUP", "0") not in ("0", "false", "no", ""):
         patch_soup_startup_profile()  # off by default: cProfile of the trainer build, see startup.py
@@ -145,7 +154,5 @@ def apply():
         patch_soup_warmup(start_in_setup=False)
         start_background_warmup()  # compiles every registered kernel in a background thread
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
-        from .startup import freeze_imported_objects
-
-        freeze_imported_objects()  # later full garbage collections skip the imported objects
+        pass  # gc.freeze() of the imported objects removed: the organizers forbade collector tweaks in apply() (answer 31)
     mark("apply end")

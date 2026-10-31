@@ -611,9 +611,9 @@ def _run(device, log, workers, switch):
         # with it spinning a Python counter, 15.3 s at 5 ms (counter at 100% of its rate alone),
         # 5.5 s at 1 ms (89%), 4.0 s at 0.2 ms (79%). 1 ms keeps the warm-up short and costs the main
         # thread at most about 11% while it runs (SOUP_SOLUTION_WARMUP_SWITCH_MS sets it).
-        previous = sys.getswitchinterval()
-        sys.setswitchinterval(min(previous, switch))
-        ours = sys.getswitchinterval()  # read back: CPython stores it in microseconds
+        # The organizers forbade sys.setswitchinterval in apply() (chat, question 31, 31 Oct): the
+        # interval stays at the interpreter's default while the warm-up runs (`switch` is unused).
+        previous = ours = None
         _prepare_triton()
         # several workers overlap the parts outside the GIL (ptxas and C compiler runs, cubin
         # loads); triton compiles from several threads by design (its AsyncCompileMode takes any

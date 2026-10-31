@@ -630,7 +630,7 @@ def _replacements():
                 out.append((TokenizersBackend, "_encode_plus", _held_encode_plus))
         except Exception:  # noqa: BLE001
             pass
-    if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT", "1"):  # on by default since the night integration
+    if _flag("SOUP_SOLUTION_CHEAP_FINGERPRINT", "0"):  # OFF: the organizers forbade replacing datasets' fingerprint (chat, question 13, 31 Oct)
         try:
             import datasets.arrow_dataset
             import datasets.fingerprint

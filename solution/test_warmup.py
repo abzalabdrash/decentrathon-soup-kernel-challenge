@@ -80,8 +80,7 @@ def test_thread_runs_all_and_survives_errors(fresh):
     assert fresh.wait_for_warmup(30)
     report = fresh.warmup_report()
     assert sorted(seen, key=str) == sorted([("a", True, True), ("c", 1024.0, None),
-                                            ("switch", pytest.approx(min(interval,
-                                                                         fresh.SWITCH_INTERVAL)),
+                                            ("switch", pytest.approx(interval),  # unchanged: answer 31
                                              None)], key=str)
     assert sys.getswitchinterval() == interval  # restored
     assert set(report["results"]) == {"a", "c"}
