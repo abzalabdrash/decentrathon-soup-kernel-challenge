@@ -611,6 +611,76 @@ def test_tiny_load_bit_equal_and_peak(patched, tiny_dir, monkeypatch, window, ca
         assert ours["peak"] <= without["peak"] + window * (-(-largest // 512) * 512)
 
 
+def _with_fill(model):
+    """_snapshot of the model and what load_stream.py's EMBED_ASYNC did in its load."""
+    from solution import load_stream
+
+    load = load_stream.LAST["load"]
+    fill = load.embedding_fill if load is not None else None
+    outcome = dict(fill[3]) if fill else None
+    return _snapshot(model), outcome
+
+
+@cuda
+@pytest.mark.parametrize("copies", ["1", "0"])
+def test_tiny_load_embedding_fill_bit_equal(patched, tiny_dir, monkeypatch, copies):
+    """SOUP_SOLUTION_EMBED_ASYNC=1 (load_stream.py): the embedding cast into its pinned buffer by a
+    thread gives the load without it bit for bit (and transformers' own load), with and without the
+    pinned copies of the other tensors, and no higher GPU peak."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED", copies)
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
+    ours = _load_in_setup(patched, tiny_dir, _with_fill)
+    snapshot, outcome = ours["result"]
+    assert outcome is not None and outcome["error"] is None and outcome["seconds"] is not None
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_fill)
+    assert without["result"][1] is None
+    _compare(snapshot, without["result"][0])
+    plain = _load(tiny_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    _compare(snapshot, theirs)
+    assert ours["peak"] <= without["peak"]
+
+
+@cuda
+def test_tiny_load_embedding_fill_thread_fails(patched, tiny_dir, monkeypatch):
+    """A fill thread that fails: the join fills the buffer in the main thread, the same bytes."""
+    from solution import load_stream
+
+    original = load_stream._Load.embedding_job
+
+    class Flaky:
+        def __init__(self, inner):
+            self.inner, self.calls = inner, 0
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def __getitem__(self, key):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("fill failed on purpose")
+            return self.inner[key]
+
+    def embedding_job(self, job, spawn, args, kwargs):
+        made = original(self, job, spawn, args, kwargs)
+        if made is None:
+            return None
+        made_job, source, shape, dtype = made.args
+        return type(made)(made.func, made_job, Flaky(source), shape, dtype)
+
+    monkeypatch.setattr(load_stream._Load, "embedding_job", embedding_job)
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "1")
+    ours = _load_in_setup(patched, tiny_dir, _with_fill)
+    snapshot, outcome = ours["result"]
+    assert outcome is not None and outcome["error"] is None  # cleared by the main thread's fill
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_fill)
+    _compare(snapshot, without["result"][0])
+
+
 @cuda
 @pytest.mark.parametrize("cast", ["cpu", "gpu"])
 def test_tiny_training_step_is_the_same(patched, tiny_train_dir, monkeypatch, cast):

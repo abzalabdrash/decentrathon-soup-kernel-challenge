@@ -28,10 +28,24 @@ a time. If streaming is declined later, everything comes back to the GPU as it w
 (weight_stream.restore_loaded_layers, head_stream's restore). Any other load takes the original code.
 Switch: SOUP_SOLUTION_LOAD_STREAM=0. With SOUP_SOLUTION_LOAD_PINNED=1 the checkpoint -> GPU copies of
 the loads handled here go through pinned buffers filled by a thread (load_pinned.py).
+
+SOUP_SOLUTION_EMBED_ASYNC=1: the embedding's job of the loop (`_materialize_copy(slice, "cpu",
+float16)`: `slice[...]`, a view of the safetensors mmap since safetensors 0.8, then `.to(float16)`
+into a fresh 467 MB tensor) took 0.59 s of the main thread on the T4, and head_stream.py then copied
+the result into its pinned buffer (0.08 s). Here the job returns an fp16 view of that pinned buffer
+(pinned ahead by the thread below, as before) and a thread fills it with `copy_` from the same
+`slice[...]`: the cast kernel `.to()` runs, into memory that is already mapped, without the GIL
+(locally 0.03 s with torch's 4 CPU threads against 0.18 s for `.to()`), while the main thread goes on
+with the layers. head_stream.py adopts the buffer without copying. Nothing reads the values before
+the fill is joined: when the load returns (or raises), and before head_stream.py's fallback copies
+them to the GPU. If the thread fails, the main thread fills the buffer the same way at the join. Taken
+only for the embedding of a load handled here (its key read to the CPU, a safetensors slice of the
+embedding's shape, a float dtype, no thread pool or sharding) when its pinned buffer is there.
 """
 
 import functools
 import inspect
+import os
 import threading
 import time
 
@@ -40,6 +54,10 @@ import torch
 _STATE = {"depth": 0, "layers": False, "only": None, "embedding": False}
 _ACTIVE = {"load": None}  # the load in progress, when it is one this module handles
 LAST = {"load": None}  # the last load handled (counters, for the log and the tests)
+
+
+def _flag(name, default="0"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
 
 
 class _Pinner:
@@ -119,6 +137,8 @@ class _Load:
         self.failed = self.embedding_done = False
         self.layers_moved = self.layer_bytes = self.embedding_bytes = 0
         self.layer_seconds = self.embedding_seconds = 0.0  # spent here (copies to the host, pinning)
+        self.embedding_pinned = None  # the embedding's pinned buffer once its job took it
+        self.embedding_fill = None  # EMBED_ASYNC: (thread, host view, slice, outcome)
         self.pinner = _Pinner(self._requests(), device)
         from .load_pinned import new_copier
 
@@ -136,6 +156,72 @@ class _Load:
             if id(layer) in self.remaining:
                 requests.append((id(layer), predicted_layer_bytes(layer, self.only)))
         return requests
+
+    def embedding_job(self, job, spawn, args, kwargs):
+        """SOUP_SOLUTION_EMBED_ASYNC (see the module docstring): the job for the embedding's checkpoint
+        slice, or None for any other tensor (or when switched off)."""
+        if self.embed_key is None or self.embedding_fill is not None or not _flag("SOUP_SOLUTION_EMBED_ASYNC"):
+            return None
+        try:
+            bound = inspect.signature(spawn).bind(*args, **kwargs).arguments
+            source, device, dtype = bound.get("tensor"), bound.get("device"), bound.get("dtype")
+            if bound.get("thread_pool") is not None or bound.get("sharding_op") is not None:
+                return None
+            if torch.is_tensor(source) or not all(hasattr(source, n) for n in ("get_shape", "get_dtype", "__getitem__")):
+                return None
+            if not isinstance(device, (str, torch.device)) or torch.device(device).type != "cpu":
+                return None
+            weight = self.model.get_input_embeddings().weight  # meta: the load's shape and dtype
+            shape = tuple(int(size) for size in source.get_shape())
+            dtype = weight.dtype if dtype is None else dtype
+            if (shape != tuple(weight.shape) or dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                    or source.get_dtype() not in ("BF16", "F16", "F32")):
+                return None
+        except Exception:  # noqa: BLE001 - the loop's own job
+            return None
+        self.embedding_fill = ()  # one embedding per load
+        return functools.partial(self._embedding_async, job, source, shape, dtype)
+
+    def _embedding_async(self, job, source, shape, dtype):
+        """The loop's call of the embedding's job: a `dtype` view of its pinned buffer, filled by a
+        thread from the slice; the loop's own job when the buffer is not there."""
+        pinned = self.pinner.take("embedding")
+        self.embedding_pinned = pinned
+        nbytes = torch.Size(shape).numel() * dtype.itemsize
+        if pinned is None or pinned.buffer is None or pinned.nbytes < nbytes:
+            return job()
+        host = pinned.buffer[:nbytes].view(dtype).view(shape)
+        outcome = {"error": None, "seconds": None, "waited": 0.0}
+
+        def fill():
+            started = time.perf_counter()
+            try:
+                host.copy_(source[...])
+            except BaseException as exc:  # noqa: BLE001 - the join fills it in the main thread
+                outcome["error"] = exc
+            outcome["seconds"] = time.perf_counter() - started
+
+        thread = threading.Thread(target=fill, name="soup-embedding-fill", daemon=True)
+        self.embedding_fill = (thread, host, source, outcome)
+        thread.start()
+        return host
+
+    def finish_embedding(self):
+        """Waits for the embedding's fill (a no-op without one, or once done); fills the buffer in
+        this thread if the fill failed. Returns the seconds this call waited."""
+        fill = self.embedding_fill
+        if not fill:
+            return 0.0
+        thread, host, source, outcome = fill
+        started = time.perf_counter()
+        thread.join()
+        if outcome["error"] is not None:
+            print(f"[solution] embedding fill thread failed ({outcome['error']!r}); filled in the main thread")
+            outcome["error"] = None
+            host.copy_(source[...])
+        waited = time.perf_counter() - started
+        outcome["waited"] += waited
+        return waited
 
     def after_set(self, target_name):
         """A parameter was set: when it completes a decoder layer, move the layer to the host."""
@@ -281,6 +367,7 @@ def _loader(original):
         finally:
             _ACTIVE["load"] = None
             LAST["load"] = load
+            load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on
             if load.copier is not None:
                 load.copier.close()
             load.pinner.close()
@@ -289,7 +376,11 @@ def _loader(original):
                       f"({load.layer_bytes / 2**20:.0f} MiB, {load.layer_seconds:.2f} s) and the embedding "
                       f"({load.embedding_bytes / 2**20:.0f} MiB, {load.embedding_seconds:.2f} s) to pinned "
                       f"host memory as they were loaded; buffers pinned by a thread alongside the load in "
-                      f"{load.pinner.seconds:.2f} s; tensor loop {time.perf_counter() - started:.2f} s")
+                      f"{load.pinner.seconds:.2f} s; tensor loop {time.perf_counter() - started:.2f} s"
+                      + (f"; the embedding cast into its pinned buffer by a thread in "
+                         f"{load.embedding_fill[3]['seconds']:.2f} s (the load waited "
+                         f"{load.embedding_fill[3]['waited']:.2f} s for it)"
+                         if load.embedding_fill and load.embedding_fill[3]["seconds"] is not None else ""))
 
     return convert_and_load_state_dict_in_model
 
@@ -316,8 +407,9 @@ def _setter(original):
 
             load.embedding_done = True
             started = time.perf_counter()
-            param_value, nbytes = load_embedding(model, param_value, load.device,
-                                                 pinned=load.pinner.take("embedding"))
+            pinned = load.embedding_pinned if load.embedding_fill is not None else load.pinner.take("embedding")
+            param_value, nbytes = load_embedding(model, param_value, load.device, pinned=pinned,
+                                                 ready=load.finish_embedding)
             load.embedding_bytes += nbytes
             load.embedding_seconds += time.perf_counter() - started
             return original(model, target_name, param_value, *args, **kwargs)
@@ -333,7 +425,10 @@ def _spawner(original):
     def spawn_materialize(*args, **kwargs):
         job = original(*args, **kwargs)
         load = _ACTIVE["load"]
-        if load is None or load.copier is None:
+        if load is None:
+            return job
+        job = load.embedding_job(job, original, args, kwargs) or job  # EMBED_ASYNC: the embedding's
+        if load.copier is None:
             return job
         return load.copier.add(job, original, args, kwargs)  # load_pinned.py: the job the loop calls
 
@@ -359,5 +454,6 @@ def patch_loader(layers=None, only=None, embedding=None):
     _wrap(core_model_loading, "set_param_for_module", _setter)
     from .load_pinned import enabled as load_pinned_enabled
 
-    if load_pinned_enabled() and hasattr(core_model_loading, "spawn_materialize"):
+    if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC")) and hasattr(core_model_loading,
+                                                                                 "spawn_materialize"):
         _wrap(core_model_loading, "spawn_materialize", _spawner)

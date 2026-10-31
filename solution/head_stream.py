@@ -236,9 +236,11 @@ class HeadStreamer:
 
     def __init__(self, param, embedding=None, lm_head=None, rows=DEFAULT_ROWS, slots=DEFAULT_SLOTS,
                  virtual_dtype=torch.float32, prefetch_at=DEFAULT_PREFETCH, norm=None, source=None,
-                 device=None, pinned=None):
+                 device=None, pinned=None, ready=None):
         """`source`: the weight's values when they are not in `param` yet (the loader read them to
-        the host, load_stream.py); then `device` is the GPU the weight belongs on."""
+        the host, load_stream.py); then `device` is the GPU the weight belongs on. When `source` is
+        already the start of `pinned` (load_stream.py's SOUP_SOLUTION_EMBED_ASYNC, still being
+        filled), it is adopted as the host copy; otherwise `ready()` comes before it is read."""
         data = param.data if source is None else source
         if not torch.cuda.is_available() or not (data.is_cuda if source is None else device is not None):
             raise HeadSkip("the weight is not on a CUDA device")
@@ -264,7 +266,10 @@ class HeadStreamer:
         else:
             raw, self._unpin = pinned_host_buffer(nbytes, self)
         self.host = raw.view(self.dtype).view(self.vocab, self.hidden)
-        self.host.copy_(data)
+        if source is None or self.host.data_ptr() != data.data_ptr():
+            if ready is not None:
+                ready()
+            self.host.copy_(data)
         torch.cuda.synchronize(self.device)
         self.fp32_out = None  # probed at the first head: the probe is the process's first cuBLAS call
         # SOUP_SOLUTION_HEAD_COPY_PRIORITY=high: the chunk copies on a high-priority stream (to measure
@@ -696,12 +701,13 @@ def _norm_of(model):
     return norm if isinstance(norm, torch.nn.Module) else None
 
 
-def load_embedding(model, value, device, log=print, pinned=None):
+def load_embedding(model, value, device, log=print, pinned=None, ready=None):
     """Called by load_stream.py with the input embedding's values, read to the host by the loader
     (`value`, a CPU tensor in the dtype the model loads in): they go to pinned host memory and the
     module gets a placeholder Parameter on `device`, with the lookup and lm_head overrides (the lm_head
     is tied to it when the load ends). Returns (what to set as the parameter, bytes moved); on any
-    problem the values themselves on `device`, as the loader would have set them."""
+    problem the values themselves on `device`, as the loader would have set them. `ready()` (when
+    given) completes `value` before anything here reads it: load_stream.py may still be filling it."""
     rows, slots, prefetch_at = _config()
     try:
         embedding, lm_head = model.get_input_embeddings(), model.get_output_embeddings()
@@ -712,9 +718,11 @@ def load_embedding(model, value, device, log=print, pinned=None):
         param = torch.nn.Parameter(torch.empty(0, dtype=value.dtype), requires_grad=value.is_floating_point())
         streamer = HeadStreamer(param, embedding, lm_head, rows=rows, slots=slots, virtual_dtype=value.dtype,
                                 prefetch_at=prefetch_at, norm=_norm_of(model), source=value, device=device,
-                                pinned=pinned)
+                                pinned=pinned, ready=ready)
     except HeadSkip as exc:
         log(f"[solution] embedding kept on the GPU at load: {exc}")
+        if ready is not None:
+            ready()
         return value.to(device), 0
     atexit.register(_report, weakref.ref(streamer), log)
     return param, streamer.host_bytes
