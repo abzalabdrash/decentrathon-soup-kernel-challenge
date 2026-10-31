@@ -371,11 +371,16 @@ def test_slot_not_overwritten_while_read(slots):
         streamer.restore()
 
 
-def test_race_check_detects_a_missing_wait():
+def test_race_check_detects_a_missing_wait(monkeypatch):
     """The check above catches the bug it is there for: copies that skip the wait for the compute
-    (events that are never recorded, so the copy stream waits for nothing) corrupt the result."""
+    (events that are never recorded, so the copy stream waits for nothing) corrupt the result. (With
+    SOUP_SOLUTION_STREAM_DIET the copies call the event methods of torch's C class directly, past the
+    override that injects the bug: the diet is off here.)"""
+    from solution import weight_stream
     from solution.nf4 import patch_bnb_matmul4bit
     from solution.weight_stream import WeightStreamer
+
+    monkeypatch.setattr(weight_stream, "_DIET", False)
 
     class NeverRecorded(torch.cuda.Event):
         def record(self, stream=None):

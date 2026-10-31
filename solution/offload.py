@@ -120,6 +120,14 @@ MARKED_MIN_BYTES = 64 << 10  # a marked tensor below this stays on the GPU
 # events (the backward's for each (gate|up) and layer input, the forward's for the D2H window), summed
 # in the summary line; off by default (two events per wait)
 TIMING = os.environ.get("SOUP_SOLUTION_OFFLOAD_TIMING", "0").strip().lower() not in ("0", "false", "no", "")
+# SOUP_SOLUTION_STREAM_DIET=1 (task P3: less CPU per copy): the side stream's events come from a pool and
+# are recorded again instead of made per copy (re-recording one on the same side stream only makes a
+# stale wait wait longer, never shorter); the forward's drain and window wait once, for the newest copy
+# in flight (the side stream completes its copies in order); the event calls skip torch's Python wrappers;
+# the int8 form's views of a pinned slot are cached (offload_int8.host_views)
+DIET = os.environ.get("SOUP_SOLUTION_STREAM_DIET", "1").strip().lower() not in ("0", "false", "no", "")
+_record = torch._C._CudaEventBase.record  # Event.record / Event.wait without the Python wrapper
+_wait_on = torch._C._CudaEventBase.wait
 
 
 def mark_offload(tensor, keep=False):
@@ -224,6 +232,9 @@ def release_host_memory():
         _SPARE.clear()
     released = sum(slab.numel() for slab in spares)
     del spares
+    from .offload_int8 import clear_host_views
+
+    clear_host_views()  # cached views of the slots hold the slabs
     offloader = _ACTIVE["offloader"]
     if offloader is not None:
         with offloader.lock:
@@ -306,7 +317,7 @@ class _Saved:
     tensor it was made from (at `version`), and the unpack decodes the buffer."""
 
     __slots__ = ("shape", "dtype", "device", "index", "slot", "host", "copied", "gpu", "ready",
-                 "home", "keep", "unpacked", "codec", "source", "version", "__weakref__")
+                 "home", "keep", "unpacked", "codec", "source", "version", "pool", "__weakref__")
 
     def __del__(self):
         slot = getattr(self, "slot", None)
@@ -317,6 +328,11 @@ class _Saved:
                 self.home.wait_event(self.ready)
             except Exception:  # noqa: BLE001 - interpreter shutdown
                 pass
+        pool = getattr(self, "pool", None)
+        if pool is not None:  # its side-stream events back to the Offloader's pool (DIET)
+            for event in (getattr(self, "copied", None), getattr(self, "ready", None)):
+                if event is not None:
+                    pool.append(event)
 
 
 class Offloader:
@@ -354,13 +370,26 @@ class Offloader:
         self.lock = threading.Lock()
         self.stats = collections.Counter()
         self.spans = collections.deque()  # (kind, begin, end) of timed waits not read yet
+        self.events = []  # DIET: side-stream events free to be recorded again
+        self.read_events = []  # DIET: current-stream events free to be recorded again
         self.wait_ms = collections.Counter()
         self.wait_n = collections.Counter()
+
+    def _side_event(self):
+        """An event recorded on the side stream now: from the pool with DIET, else a new one."""
+        if not DIET:
+            return self.stream.record_event()
+        event = self.events.pop() if self.events else torch.cuda.Event()
+        _record(event, self.stream)
+        return event
 
     def _wait(self, stream, event, kind):
         """stream waits for event; timed as `kind` with SOUP_SOLUTION_OFFLOAD_TIMING."""
         if not TIMING:
-            stream.wait_event(event)
+            if DIET:
+                _wait_on(event, stream)
+            else:
+                stream.wait_event(event)
             return
         begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         begin.record(stream)
@@ -452,22 +481,32 @@ class Offloader:
                 wire, codec = offload_int8.encode(tensor)
         else:
             wire = tensor
-        self._order.record(home)
-        side.wait_event(self._order)
-        for event in self.reads:
-            side.wait_event(event)
+        if DIET:
+            _record(self._order, home)
+            _wait_on(self._order, side)
+            for event in self.reads:
+                _wait_on(event, side)
+            self.read_events += self.reads  # waited for: free to be recorded again
+        else:
+            self._order.record(home)
+            side.wait_event(self._order)
+            for event in self.reads:
+                side.wait_event(event)
         self.reads.clear()
         if codec is None:
             host = host.view(wire.dtype).view(wire.shape)
         with self._side():
             if type(wire) is tuple:  # (q, s): into the halves of the one host buffer the H2D brings back
-                for part, dest in zip(wire, offload_int8.views(host, *tensor.shape)):
+                dests = (offload_int8.host_views(host, *tensor.shape) if DIET
+                         else offload_int8.views(host, *tensor.shape))
+                for part, dest in zip(wire, dests):
                     dest.copy_(part, non_blocking=True)
             else:
                 host.copy_(wire, non_blocking=True)
         saved = _Saved()
         saved.shape, saved.dtype, saved.device = tensor.shape, tensor.dtype, tensor.device
-        saved.slot, saved.host, saved.copied = slot, host, side.record_event()
+        saved.slot, saved.host, saved.copied = slot, host, self._side_event()
+        saved.pool = self.events if DIET else None
         saved.gpu, saved.ready, saved.home = wire, None, home
         saved.keep, saved.unpacked = False, False
         saved.codec, saved.version = codec, tensor._version
@@ -476,6 +515,17 @@ class Offloader:
         self.count += 1
         self.by_index[saved.index] = saved
         inflight.append(saved)
+        if DIET and len(inflight) > self.max_inflight:
+            # the copies leave the side stream in order: one wait for the newest one dropped
+            dropped = [inflight.popleft() for _ in range(len(inflight) - self.max_inflight)]
+            if all(d.home == home for d in dropped):
+                self._wait(home, dropped[-1].copied, "forward window")  # on the GPU: the CPU goes on
+            else:
+                for d in dropped:
+                    self._wait(d.home, d.copied, "forward window")
+            for d in dropped:
+                d.gpu = None
+                self.stats["waited"] += 1
         while len(inflight) > self.max_inflight:
             oldest = inflight.popleft()
             self._wait(oldest.home, oldest.copied, "forward window")  # on the GPU: the CPU goes on
@@ -499,12 +549,19 @@ class Offloader:
                 self._wait(current, saved.copied, kind + " fetched")
                 tensor = torch.empty(saved.host.shape, dtype=saved.host.dtype, device=saved.device)
                 tensor.copy_(saved.host, non_blocking=True)
-                self.reads.append(current.record_event())
+                if DIET:
+                    event = self.read_events.pop() if self.read_events else torch.cuda.Event()
+                    _record(event, current)
+                    self.reads.append(event)
+                else:
+                    self.reads.append(current.record_event())
                 self.stats["fetched"] += 1
             elif saved.ready is not None:
                 self._wait(current, saved.ready, kind + " prefetched")
                 if saved.home != current:
                     tensor.record_stream(current)
+                if DIET:  # waited for: free to be recorded again
+                    self.events.append(saved.ready)
                 saved.gpu = saved.ready = None
                 self.stats["prefetch_hits"] += 1
             else:
@@ -537,12 +594,16 @@ class Offloader:
                 continue
             tensor = torch.empty(saved.host.shape, dtype=saved.host.dtype, device=saved.device)
             if not waited:
-                self._order.record(current)
-                side.wait_event(self._order)
+                if DIET:
+                    _record(self._order, current)
+                    _wait_on(self._order, side)
+                else:
+                    self._order.record(current)
+                    side.wait_event(self._order)
                 waited = True
             with self._side():
                 tensor.copy_(saved.host, non_blocking=True)
-            saved.gpu, saved.ready, saved.home = tensor, side.record_event(), current
+            saved.gpu, saved.ready, saved.home = tensor, self._side_event(), current
             self.stats["prefetched"] += 1
 
     def close(self):
@@ -672,6 +733,15 @@ def drain_inflight():
         return
     with offloader.lock:
         offloader.early.clear()  # any handle not packed by now is stale
+        inflight = offloader.inflight
+        if DIET and inflight and all(s.home == inflight[-1].home for s in inflight):
+            # the copies leave the side stream in order: one wait for the newest one
+            newest = inflight[-1]
+            offloader._wait(newest.home, newest.copied, "forward drain")
+            for saved in inflight:
+                saved.gpu = None
+            offloader.stats["drained"] += len(inflight)
+            inflight.clear()
         while offloader.inflight:
             oldest = offloader.inflight.popleft()
             offloader._wait(oldest.home, oldest.copied, "forward drain")

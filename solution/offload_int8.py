@@ -130,6 +130,25 @@ def views(wire, rows, tokens):
     return q, s
 
 
+_HOST_VIEWS = {}  # (data_ptr, rows, tokens) of a pinned slot -> its (q, s) views (offload.DIET)
+
+
+def host_views(host, rows, tokens):
+    """views() of a pinned host slot, made once per slot address and shape: the offload's slots are
+    slabs that live for the run, at the same few offsets every step (clear_host_views at release)."""
+    key = (host.data_ptr(), rows, tokens)
+    found = _HOST_VIEWS.get(key)
+    if found is None:
+        if len(_HOST_VIEWS) > 1024:
+            _HOST_VIEWS.clear()
+        found = _HOST_VIEWS[key] = views(host, rows, tokens)
+    return found
+
+
+def clear_host_views():
+    _HOST_VIEWS.clear()
+
+
 def _grid(rows, tokens):
     return (rows // 2 // GROUP, triton.cdiv(tokens, TILE_M))
 

@@ -731,3 +731,77 @@ def test_patch_mlp_memory_switch(restore_classes, monkeypatch):
     assert patch_mlp_memory("none") == "none" and applied() == (False, False, False)
     assert patch_mlp_memory("recompute") == "recompute" and applied() == (False, False, True)
     assert patch_mlp_memory() == "offload" and applied() == (True, False, False)
+
+
+def test_diet_drain_waits_for_the_newest_copy(monkeypatch):
+    """SOUP_SOLUTION_STREAM_DIET: the forward's drain waits once, for the newest copy in flight (the side
+    stream completes its copies in order). The side stream is held back by a GPU sleep before every copy,
+    and the blocks the drain frees are overwritten at once on the compute stream: a drain that let the
+    compute stream go before the last copy would send overwritten values to the host."""
+    from solution import offload
+
+    monkeypatch.setattr(offload, "DIET", True)
+    n, k = 1 << 20, 4
+    values = [torch.randn(n, device="cuda").half() for _ in range(k)]
+    xs = [leaf(n) for _ in range(k)]
+    torch.cuda.synchronize()
+    with offload.offload_saved_tensors(min_numel=1000, max_inflight=k, prefetch=1) as off:
+        ys = []
+        for x, v in zip(xs, values):
+            with torch.cuda.stream(off.stream):
+                torch.cuda._sleep(SLEEP // 8)  # the copy of this tensor starts late
+            t = activation(v)
+            offload.offload_early(t)
+            ys.append(Keep.apply(x, t))
+            del t
+        assert len(off.inflight) == k
+        offload.drain_inflight()
+        assert not off.inflight and off.stats["drained"] == k
+        junk = [torch.full((n,), 7.0, device="cuda", dtype=torch.float16) for _ in range(2 * k)]
+        sum(y.float().sum() for y in ys).backward()
+        del junk
+    torch.cuda.synchronize()
+    for x, v in zip(xs, values):
+        assert torch.equal(x.grad, v)
+
+
+def test_diet_reuses_side_stream_events(monkeypatch):
+    """SOUP_SOLUTION_STREAM_DIET: the copies' and prefetches' events come back to the Offloader's pool once
+    their handle is gone or their prefetch is read; a second pass through the same Offloader makes (almost)
+    no new events, and every value still comes back exactly, the GPU kept far behind the CPU."""
+    from solution import offload
+
+    monkeypatch.setattr(offload, "DIET", True)
+    made = [0]
+    original_new = torch.cuda.Event.__new__
+
+    def counting_new(cls, *args, **kwargs):
+        made[0] += 1
+        return original_new(cls, *args, **kwargs)
+
+    n, k = 1 << 20, 6
+    off = offload.Offloader(min_numel=1000, max_inflight=1, prefetch=1)
+
+    def chain():
+        values = [torch.randn(n, device="cuda").half() for _ in range(k)]
+        xs = [leaf(n) for _ in range(k)]
+        with torch.autograd.graph.saved_tensors_hooks(off.pack, off.unpack):
+            ys = [Keep.apply(x, activation(v)) for x, v in zip(xs, values)]
+            torch.cuda._sleep(SLEEP)
+            sum(y.float().sum() for y in ys).backward()
+        del ys
+        torch.cuda.synchronize()
+        for x, v in zip(xs, values):
+            assert torch.equal(x.grad, v)
+
+    chain()
+    import gc
+
+    gc.collect()
+    pooled = len(off.events)
+    assert pooled >= k  # every copy's event and the read prefetches' came back
+    monkeypatch.setattr(torch.cuda.Event, "__new__", counting_new)
+    chain()
+    monkeypatch.undo()
+    off.close()
+    assert made[0] <= 1, made[0]
