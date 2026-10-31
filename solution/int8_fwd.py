@@ -459,12 +459,14 @@ def channels(mlp, x2):
 
 
 def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=None, release=None,
-                    hidden=False, idx=None, x_k=None):
+                    hidden=False, idx=None, x_k=None, before_alloc=None):
     """(gate|up) (2I, M) in `half` from the quantized input, and the per-group maxima of
     silu(gate) * up (GROUPS, M) for `down_forward`, or with `hidden` silu(gate) * up itself (I, M) in
     `half` (MODE "gu"). `buffer` is fused_proj's flat half buffer of one (I, D) weight (taken as int8
     bytes); acquire / release: weight_stream ring hooks around the decode (or None). idx / x_k: the
-    top-k channels (`channels`) and their values (`quantize_tokens`), added in fp32."""
+    top-k channels (`channels`) and their values (`quantize_tokens`), added in fp32. before_alloc:
+    called once the decode and the first int8 product are queued, right before (gate|up) is
+    allocated (fused_proj.py lets the previous layer's (gate|up) copy to the host finish there)."""
     padded, d = x_q.shape
     device = x_q.device
     chunk = inter // CHUNKS
@@ -477,16 +479,19 @@ def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=Non
     _decode_gate_up(gate_ops, up_ops, w, s_w, inter, d, chunk, idx, w_k)
     if release is not None:
         release()
-    gate_up = torch.empty((2 * inter, padded), dtype=half, device=device)
-    pmax = (torch.empty((inter, padded), dtype=half, device=device) if hidden else
-            torch.empty((inter // PG, padded), dtype=torch.float32, device=device))
     x_t = x_q.t()
     if not k:
         x_k, w_k = _dummy(device, torch.float32), _dummy(device, torch.float32)
-    acc = None
+    acc = gate_up = pmax = None
     for c in range(CHUNKS):
         rows = w[2 * chunk * c:2 * chunk * (c + 1)]
         acc = torch._int_mm(rows, x_t) if acc is None else torch._int_mm(rows, x_t, out=acc)
+        if gate_up is None:
+            if before_alloc is not None:
+                before_alloc()
+            gate_up = torch.empty((2 * inter, padded), dtype=half, device=device)
+            pmax = (torch.empty((inter, padded), dtype=half, device=device) if hidden else
+                    torch.empty((inter // PG, padded), dtype=torch.float32, device=device))
         int8_gate_up_kernel[(triton.cdiv(padded, TM), chunk // PG)](
             acc, s_w[2 * chunk * c:], s_x, gate_up, pmax, x_k, w_k[2 * chunk * c:] if k else w_k,
             chunk, inter, padded, c * chunk, PG, c * (chunk // PG), TI=TI, TM=TM, HIDDEN=hidden,

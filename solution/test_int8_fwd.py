@@ -263,3 +263,32 @@ def _layers_parse():
 
     return (_layers("0-4") == {0, 1, 2, 3, 4} and _layers("1.2.4") == {1, 2, 4}
             and _layers("") == frozenset() and _layers("2,26") == {2, 26})
+
+
+def test_drain_after_first_product(int8_on, monkeypatch):
+    """With the early offload, the int8 forward lets the copies in flight finish right before its
+    (gate|up) is allocated (after the decode and the first int8 product), once; the fp16 forward
+    before anything of its own."""
+    from solution import offload
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    calls = []
+    monkeypatch.setattr(offload, "EARLY", True)
+    monkeypatch.setattr(offload, "drain_inflight", lambda: calls.append(int8_on._STATE["calls"]))
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=24).cuda().train()
+    x = torch.randn(1, 832, 1536, device="cuda", requires_grad=True)
+    seen = []
+    real = int8_on.gate_up_forward
+
+    def spy(*args, before_alloc=None, **kwargs):
+        seen.append(before_alloc is not None)
+        return real(*args, before_alloc=before_alloc, **kwargs)
+
+    monkeypatch.setattr(int8_on, "gate_up_forward", spy)
+    with torch.autocast("cuda", dtype=torch.float16):
+        mlp(x)
+    assert seen == [True] and len(calls) == 1
+    int8_on._STATE["on"] = False
+    with torch.autocast("cuda", dtype=torch.float16):
+        mlp(x)
+    assert seen == [True] and len(calls) == 2

@@ -1395,7 +1395,8 @@ def set_mlp_recompute(on):
 
 
 class _MLPPlan:
-    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early", "ring", "int8")
+    __slots__ = ("gate", "up", "down", "half", "split", "recompute", "early", "ring", "int8",
+                 "drain")
 
 
 def _mlp_plan(mlp, x):
@@ -1435,6 +1436,7 @@ def _mlp_plan(mlp, x):
     plan.early = False  # set by the patched forward (offload.EARLY)
     plan.ring = ring  # weight_stream.py's type ring holding the three matrices, or None
     plan.int8 = None  # int8_fwd.py's operands of the three weights when the forward runs int8
+    plan.drain = False  # the int8 forward lets the copies in flight finish (offload.drain_inflight)
     return plan
 
 
@@ -1556,8 +1558,14 @@ def _int8_forward(plan, x2, n, padded):
     gu_only = int8_fwd.MODE == "gu"  # down stays the fp16 GEMM on the epilogue's SwiGLU output
     pos, idx = topk if topk is not None else (None, None)
     x_q, s_x, x_k = int8_fwd.quantize_tokens(x2, n, padded, pos)
+    drain = None
+    if plan.drain:
+        # the previous layer's (gate|up) copy to the host gets the decode and the first int8 product
+        # of this layer as well before the compute stream waits for it (fp16: the wait comes first)
+        from .offload import drain_inflight as drain
     gate_up, pmax = int8_fwd.gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter,
-                                             *hooks_gu, hidden=gu_only, idx=idx, x_k=x_k)
+                                             *hooks_gu, hidden=gu_only, idx=idx, x_k=x_k,
+                                             before_alloc=drain)
     del x_q, s_x, x_k
     if plan.early:
         from .offload import offload_early
@@ -1726,7 +1734,10 @@ def patch_qwen2_mlp_fused():
             plan.early = EARLY and not plan.recompute and x.requires_grad
             plan.int8 = _int8_forward_ops(plan, x, self)
             if plan.early or (DRAIN_LAST and self is _CTX["last_mlp"]):
-                drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
+                if plan.int8 is not None:  # later, right before its (gate|up) is allocated
+                    plan.drain = True
+                else:
+                    drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
 
     forward._soup_weight_ring = True  # weight_stream.py: the matrices' reads go through acquire()
