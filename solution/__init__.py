@@ -46,6 +46,7 @@ SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
 SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache, =late starts after Soup's final save),
 SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; on by default, answer 29),
+SOUP_SOLUTION_EXIT_FAST=1 (off by default, exit_fast.py: os._exit(0) after Soup's run() ended with 0 and every atexit callback of ours),
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
 
@@ -60,6 +61,10 @@ def apply():
     from .phases import mark, patch_soup_phases
 
     mark("apply begin")
+    from .exit_fast import enabled as exit_fast_enabled, register_exit, wrap_cli_run
+
+    if exit_fast_enabled():
+        register_exit()  # first of our atexit callbacks, so it runs after all of them (exit_fast.py)
     # Defaults of switches that other modules read at import time (int8_bwd.py reads its own when
     # fused_proj imports it), so they come before any patch import; an environment value wins.
     os.environ.setdefault("SOUP_SOLUTION_EXIT_RELEASE", "1")  # E1: pinned host memory handed back on a thread at the last step; not "all" (check 9)
@@ -148,4 +153,9 @@ def apply():
         start_background_warmup()  # compiles every registered kernel in a background thread
     if _on("SOUP_SOLUTION_IMPORT_DIET"):
         pass  # gc.freeze() of the imported objects removed: the organizers forbade collector tweaks in apply() (answer 31)
+    if exit_fast_enabled():
+        try:
+            wrap_cli_run()  # off by default: os._exit after a clean exit of Soup's run() and every atexit callback
+        except Exception as exc:  # noqa: BLE001 - without the wrapper the process exits the normal way
+            print(f"[solution] exit fast off: {exc!r}", flush=True)
     mark("apply end")
