@@ -94,3 +94,15 @@ Left: decide defaults from v4/v5; one ABBA session of new defaults vs old; `--mo
 the switches that stay on (embedding cast in a thread, preadv staging, light triton key, shared
 entry points); tests for these switches pass locally (targeted), the full `pytest solution` goes to
 Kaggle/Modal (Modal runner: tools/modal_run.py on main, profile tripleacodex for this task).
+
+## soup-s1-v4 result (peagverr, 836ec72; ABBA x2; first step from apply begin / wall / apply / model setup)
+
+- base 9.30 / 44.73 / 3.36 / 3.48
+- embed 9.21 / 45.04 / 3.34 / 3.07 (waits 0.15 s for the warm-up: it is now the critical path)
+- tk 9.23 / 45.17 / 3.30 / 3.46; ep 9.30 / 45.20
+- etk 8.88 / 44.63 / 3.18 / 3.19; **etkp (etk + EARLY_PROBES=p2p + LOAD_CODE_TABLE) 8.77 / 44.64** / 3.22 / 3.11
+- etks (etk + skip step_ops) 8.80, but step 0 0.70 s against 0.53: no.
+So: first step -0.53 s with EMBED_ASYNC + TRITON_KEY=light + ENTRY_POINTS + EARLY_PROBES=p2p +
+LOAD_CODE_TABLE, wall within noise (median step differs by 5 ms between variants). v5 (LOAD_PREAD
+on top) still to fetch: `wsl -d Ubuntu -- bash tools/kaggle_wsl.sh 1 --attach --slug soup-s1-v5 --mode variants`.
+Recommended defaults (pending v5): the etkp set, plus LOAD_PREAD if v5 shows it.
