@@ -55,6 +55,10 @@ reserved 274 in both; own kernels 19.4 -> 20.3 %.
   less per layer. The int8 backward's compile thread compiles both variants (fp32 rounded, half as is).
 - Local: test_int8_glue + test_int8_bwd + test_offload_int8 37 passed; test_fused_proj + test_model_path 43.
 
+- Modal h2-abba2 (e4a866c = this branch on main faaa190 with the cast fold; x16, ABBA 3 rounds + warm): glue off
+  48.16 s wall / steps 3+ 27.68; **on 47.45 (-0.71) / 27.08**; steps 6+ -0.69 s (-11.9 ms per step), steps 0-5
+  +0.12; peak 395 MiB and reserved 274 in both; own kernels 20.0 -> 21.0 %.
+
 ## What is left of the glue (h2-diag1's stacks, with the glue on)
 
 - The GQA expansions (`clone` of (1, N, 2, 6, 128), ~6 per layer and step) and their group sums (2 per layer),
