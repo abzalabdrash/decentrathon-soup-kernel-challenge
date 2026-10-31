@@ -21,7 +21,8 @@ acct=$1; shift
 case "$acct" in
   1) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle1.token; user=namedesign ;;
   2) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle2.token; user=peagverr ;;
-  *) echo "first argument: account 1 (namedesign) or 2 (peagverr)"; exit 2 ;;
+  3) tok=/mnt/c/Users/abdra/OneDrive/Desktop/kaggle3.token; user=slerfas ;;
+  *) echo "first argument: account 1 (namedesign), 2 (peagverr) or 3 (slerfas)"; exit 2 ;;
 esac
 slug=soup-kernel-run
 prev=""

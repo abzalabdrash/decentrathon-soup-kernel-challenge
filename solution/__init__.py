@@ -45,7 +45,7 @@ SOUP_SOLUTION_REBUILD_X16=0, SOUP_SOLUTION_CARRY_RESIDUAL=0, SOUP_SOLUTION_HEAD_
 (SOUP_SOLUTION_HEAD_ROWS, SOUP_SOLUTION_HEAD_SLOTS, SOUP_SOLUTION_HEAD_PREFETCH=norm|embedding|head),
 SOUP_SOLUTION_IMPORT_DIET=0, SOUP_SOLUTION_DATASET_HASH=0, SOUP_SOLUTION_HEAD_PACK=1 (off by default),
 SOUP_SOLUTION_EXIT_RELEASE=1 (on by default, exit_release.py; =0 turns off, =all also empties the cache), SOUP_SOLUTION_EXIT_NOGC=0
-(off: the organizers forbade collector tweaks), SOUP_SOLUTION_INT8_BWD=0 (int8 MLP backward, int8_bwd.py; allowed by the organizers, to be switched on for the soup train process),
+(off: the organizers forbade collector tweaks), SOUP_SOLUTION_INT8_BWD (int8 MLP backward, int8_bwd.py; on by default in the soup train process only, answer 29; =0 off, =1 also under pytest),
 SOUP_SOLUTION_CHEAP_FINGERPRINT=0 and SOUP_SOLUTION_DATASET_HASH=0 (off: datasets' fingerprint must stay the base's);
 diagnostics SOUP_SOLUTION_PROFILE_STARTUP=1.
 """
@@ -67,11 +67,9 @@ def apply():
     os.environ.setdefault("SOUP_SOLUTION_EXIT_NOGC", "0")  # OFF: the organizers forbade garbage-collector tweaks in apply() (chat, answer 31)
     # answer 29 (chat, 31 Oct): int8 tensor cores for the frozen linear layers in the forward and the backward by
     # input, and for lm_head, are allowed when all 10 checks pass; the MLP backward int8 (int8_bwd.py) measured
-    # 10/10 on the public rows (43.1 s / 395 MiB) and on the jury rows (s 1.91 against 1.80-1.85 without it)
-    # NOT switched on here yet: a setdefault leaks into the pytest process, where 12 bitwise tests of
-    # fused_proj assume the fp16 backward; switch it on inside int8_bwd.py only for the `soup train`
-    # process (argv check as in exit_release._soup_train_process), then rerun full + jury.
-    os.environ.setdefault("SOUP_SOLUTION_INT8_BWD", "0")
+    # 10/10 on the public rows (43.1 s / 395 MiB) and on the jury rows (s 1.91 against 1.80-1.85 without it).
+    # int8_bwd.py switches itself on in the `soup train` process only (no setdefault here: it would leak into
+    # the pytest process, where 12 bitwise tests of fused_proj assume the fp16 backward).
     if _on("SOUP_SOLUTION_WARMUP"):
         from .warmup import start_early
 
