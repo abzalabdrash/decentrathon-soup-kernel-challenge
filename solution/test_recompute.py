@@ -243,7 +243,7 @@ def _layer_forward(layer, rotary, lengths, seed=5):
 
 
 @pytest.mark.parametrize("lengths", [[212, 187, 310, 117], [500, 480, 447]])
-def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths):
+def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths, cuda_bytes):
     """One layer between an input and the next layer's input norm (which consumes the layer's two
     outputs, as in training, so that what stays allocated is what the layer keeps for its
     backward): outputs and gradients against the kept path, and the bytes per token kept."""
@@ -268,7 +268,7 @@ def test_decoder_layer_recompute_bitwise_and_memory(modes, decoder_1p5b, lengths
         out = (mlp_out.detach().cpu(), residual.detach().cpu())
         del mlp_out, residual
         torch.cuda.synchronize()
-        held = torch.cuda.memory_allocated()
+        held = cuda_bytes.now()
         g = torch.Generator("cuda").manual_seed(8)
         grads = [torch.randn(s_next.shape, device="cuda", generator=g),
                  torch.randn(y_next.shape, device="cuda", generator=g)]

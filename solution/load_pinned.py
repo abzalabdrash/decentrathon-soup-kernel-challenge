@@ -101,6 +101,15 @@ def new_copier(device, log=print, locate=None):
         return None
 
 
+def _early_covers(path):
+    try:
+        from . import load_early
+
+        return load_early.covers(path)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _read_into(fd, offset, buffer, nbytes):
     """`nbytes` of the file `fd` from `offset` into the start of the uint8 CPU tensor `buffer`
     (preadv may return less than asked: it is called again for the rest)."""
@@ -130,12 +139,13 @@ class _Entry:
     """One checkpoint tensor of the plan and where it is: staged in a buffer, copied (ahead) to the GPU."""
 
     __slots__ = ("index", "source", "shape", "src_dtype", "dtype", "stage_dtype", "nbytes", "job", "where", "ready",
-                 "released", "staged", "error", "out", "event")
+                 "released", "staged", "error", "out", "event", "early")
 
     def __init__(self, index, source, shape, src_dtype, dtype, stage_dtype, job):
         self.index, self.source, self.shape = index, source, shape
         self.src_dtype, self.dtype, self.job = src_dtype, dtype, job
         self.where = None  # (file descriptor, byte offset) when it is read from the file (LOAD_PREAD)
+        self.early = None  # (path, byte offset) when load_early.py read its bytes ahead (LOAD_EARLY)
         self.stage_dtype = stage_dtype  # in the buffer and copied: `dtype`, or `src_dtype` cast on the GPU
         numel = 1
         for size in shape:
@@ -167,7 +177,7 @@ class PinnedCopier:
         self._signature = None
         self.slot_bytes = self.planned = 0
         self.reason = None  # why the copies stopped early, if they did
-        self.copied = self.copied_ahead = self.fallbacks = self.copied_bytes = 0
+        self.copied = self.copied_ahead = self.fallbacks = self.copied_bytes = self.copied_early = 0
         self.wait_seconds = 0.0  # the loop waiting for a tensor to be staged
         self.fill_seconds = 0.0  # the thread staging (slice and conversion into a buffer)
         self.slot_wait_seconds = 0.0  # the thread waiting for a buffer's copy to finish
@@ -277,6 +287,9 @@ class PinnedCopier:
                 if (found is not None and found[2] == entry.nbytes and found[3] == source.get_dtype()
                         and tuple(found[4]) == entry.shape):
                     entry.where = (found[0], found[1])
+                    path = getattr(self.locate, "fd_path", {}).get(found[0])
+                    if path is not None and _early_covers(path):
+                        entry.early = (path, found[1])
             except Exception:  # noqa: BLE001 - staged from the slice
                 entry.where = None
         return entry
@@ -331,6 +344,20 @@ class PinnedCopier:
             self._hand_over(entry.event)
             return out
         started = time.perf_counter()
+        if entry.early is not None:  # LOAD_EARLY: its bytes are in pinned memory read ahead (no ring slot)
+            from .load_early import view
+
+            staged = view(entry.early[0], entry.early[1], entry.nbytes)
+            self.wait_seconds += time.perf_counter() - started
+            if staged is None:
+                return None  # the loop's own job for this tensor
+            entry.staged = staged.view(entry.stage_dtype).view(entry.shape)
+            out, entry.event = self._copy(entry)
+            entry.staged = None
+            self.copied += 1
+            self.copied_early += 1
+            self.copied_bytes += entry.nbytes
+            return out
         entry.ready.wait()
         self.wait_seconds += time.perf_counter() - started
         if entry.staged is None:
@@ -367,12 +394,17 @@ class PinnedCopier:
         started = time.perf_counter()
         try:
             self._thread_setup()
+            ring = [entry for entry in self._entries if entry.early is None]  # LOAD_EARLY entries need no slot
             for entry in self._entries:
+                if entry.early is not None:
+                    entry.released.set()
+                    entry.ready.set()
+            for position, entry in enumerate(ring):
                 if self._stop:
                     break
-                slot = entry.index % self.slots
-                if entry.index >= self.slots:  # the buffer's previous tensor must be out of it
-                    previous = self._entries[entry.index - self.slots]
+                slot = position % self.slots
+                if position >= self.slots:  # the buffer's previous tensor must be out of it
+                    previous = ring[position - self.slots]
                     waited = time.perf_counter()
                     previous.released.wait()
                     if self._stop:
@@ -472,6 +504,7 @@ class PinnedCopier:
         if self.planned:
             self.log(f"[solution] pinned load copies: {self.copied} of {self.planned} checkpoint tensors "
                      + (f"({self.read_from_file} read from the file with preadv) " if self.read_from_file else "")
+                     + (f"({self.copied_early} from the checkpoint read ahead) " if self.copied_early else "")
                      + f"({self.copied_bytes / 2**20:.0f} MiB, {self.copied_ahead} copied ahead on a side stream, "
                      f"window {self.window}, cast on the {self.cast.upper()}) through {len(buffers)} pinned buffers of "
                      f"{self.slot_bytes / 2**20:.1f} MiB; staging {self.fill_seconds:.2f} s in a thread "

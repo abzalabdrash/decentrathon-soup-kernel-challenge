@@ -962,3 +962,131 @@ def test_real_load_bit_equal(patched, real_dir, monkeypatch, cast):
     print(f"real load with the copies (cast on the {cast}) {ours['seconds']:.2f} s (GPU peak "
           f"{ours['peak'] / 2**20:.0f} MiB); "
           f"snapshot {time.perf_counter() - started:.2f} s")
+
+
+# ---- SOUP_SOLUTION_LOAD_EARLY (load_early.py) ---------------------------------------------------------
+
+
+def _early_read(monkeypatch, path, chunk_bytes=64 << 10, fail=False, read_from=None):
+    """load_early.py's reading thread started on the checkpoint in `path` (small chunks: several per
+    file), its switch on, the safe_open hook installed; returns the module's state."""
+    from transformers import modeling_utils
+
+    from solution import load_early, load_stream
+
+    monkeypatch.setattr(modeling_utils, "safe_open", modeling_utils.safe_open)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "1")
+    monkeypatch.setattr(load_early, "CHUNK_BYTES", chunk_bytes)
+    state = {"thread": None, "files": {}, "error": None, "seconds": None, "bytes": 0, "used": 0, "released": False}
+    monkeypatch.setattr(load_early, "_STATE", state)
+    files = [load_early._plan(p) for p in sorted(glob.glob(os.path.join(str(read_from or path), "*.safetensors")))]
+    assert files and all(len(f.chunks) > 1 for f in files)
+    state["files"] = {f.path: f for f in files}
+    if fail:
+        monkeypatch.setattr(load_early, "_read_into", None, raising=False)
+
+        def broken(files_, device):
+            for f in files_:
+                f.failed = True
+                for c in f.chunks:
+                    c.ready.set()
+
+        target = broken
+    else:
+        target = load_early._read
+    state["thread"] = threading.Thread(target=target, args=(files, torch.cuda.current_device()), daemon=True)
+    state["thread"].start()
+    load_stream.patch_loader()  # the safe_open hook (installed when the switch is on)
+    assert getattr(modeling_utils.safe_open, "_soup_load_stream", False)
+    return state
+
+
+def _with_early(model):
+    from solution import load_pinned
+
+    copier = load_pinned.LAST["copier"]
+    return _snapshot(model), (copier.copied_early, copier.planned, copier.copied, copier.fallbacks, copier.reason)
+
+
+@cuda
+@pytest.mark.parametrize("embed_async", ["1", "0"])
+def test_tiny_load_early_bit_equal(patched, tiny_dir, monkeypatch, embed_async):
+    """SOUP_SOLUTION_LOAD_EARLY=1: every planned tensor (and the embedding's cast) from the checkpoint
+    read ahead into pinned memory; the load is the plain one bit for bit; the memory released after."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_EMBED_ASYNC", embed_async)
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_early)
+    assert without["result"][1][0] == 0
+    state = _early_read(monkeypatch, tiny_dir)
+    ours = _load_in_setup(patched, tiny_dir, _with_early)
+    snapshot, (early, planned, copied, fallbacks, reason) = ours["result"]
+    assert reason is None and fallbacks == 0 and planned == copied == early == LAYERS * 12 + 1
+    assert state["used"] == planned + (1 if embed_async == "1" else 0) and state["error"] is None
+    assert state["released"]
+    _compare(snapshot, without["result"][0])
+    plain = _load(tiny_dir)
+    theirs = _snapshot(plain)
+    del plain
+    gc.collect()
+    _compare(snapshot, theirs)
+
+
+@cuda
+def test_tiny_load_early_failed_read(patched, tiny_dir, monkeypatch):
+    """A read that failed: every tensor takes the loop's own job (no early bytes), the same load."""
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_early)
+    _early_read(monkeypatch, tiny_dir, fail=True)
+    ours = _load_in_setup(patched, tiny_dir, _with_early)
+    snapshot, (early, planned, copied, fallbacks, reason) = ours["result"]
+    assert early == 0 and fallbacks == planned
+    _compare(snapshot, without["result"][0])
+
+
+def test_early_files_from_config_and_cache(tmp_path, monkeypatch):
+    """The checkpoint files of Soup's config: a hub repo's snapshot (refs/main), a sharded index, a local
+    directory; nothing without a config or a snapshot."""
+    from solution import load_early
+
+    hub = tmp_path / "hub"
+    snap = hub / "models--Org--Model" / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (hub / "models--Org--Model" / "refs").mkdir()
+    (hub / "models--Org--Model" / "refs" / "main").write_text("abc123\n")
+    (snap / "model.safetensors").write_bytes(b"")
+    config = tmp_path / "task.yaml"
+    config.write_text("# x\nbase: Org/Model\ntask: sft\n")
+    monkeypatch.setenv("HF_HUB_CACHE", str(hub))
+    base = load_early._config_base(["soup", "train", "--config", str(config), "--yes"])
+    assert base == "Org/Model"
+    assert load_early.checkpoint_files(base) == [str(snap / "model.safetensors")]
+    (snap / "model.safetensors.index.json").write_text('{"weight_map": {"a": "m-2.safetensors", "b": "m-1.safetensors", "c": "m-2.safetensors"}}')
+    assert load_early.checkpoint_files(base) == [str(snap / "m-1.safetensors"), str(snap / "m-2.safetensors")]
+    assert load_early.checkpoint_files(str(snap)) == [str(snap / "m-1.safetensors"), str(snap / "m-2.safetensors")]
+    assert load_early.checkpoint_files("Org/Other") == []  # no snapshot in the cache
+    assert load_early._config_base(["soup", "train"]) is None
+    monkeypatch.delenv("SOUP_SOLUTION_LOAD_EARLY", raising=False)
+    assert not load_early.enabled()
+
+
+@cuda
+def test_tiny_load_early_other_files_dropped(patched, tiny_dir, monkeypatch, tmp_path):
+    """The files read ahead are not the ones the load opens (another copy of the checkpoint): the
+    buffers are dropped when the load starts, every tensor is staged the usual way, the same load."""
+    import shutil
+
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PINNED_CAST", "gpu")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_PREAD", "0")
+    monkeypatch.setenv("SOUP_SOLUTION_LOAD_EARLY", "0")
+    without = _load_in_setup(patched, tiny_dir, _with_early)
+    other = tmp_path / "copy"
+    shutil.copytree(tiny_dir, other)
+    state = _early_read(monkeypatch, tiny_dir, read_from=other)
+    ours = _load_in_setup(patched, tiny_dir, _with_early)
+    snapshot, (early, planned, copied, fallbacks, reason) = ours["result"]
+    assert early == 0 and state["used"] == 0 and state["released"] and reason is None
+    _compare(snapshot, without["result"][0])

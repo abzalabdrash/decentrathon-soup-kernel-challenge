@@ -134,7 +134,7 @@ def parse_variant(text):
 
 def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=(), variants=(),
                    bench="", skip_pytest=False, abba=False, warm=False,
-                   jury=("--train-rows 10000:10256 --eval-rows 50000:50256", 7)):
+                   jury=("--train-rows 10000:10256 --eval-rows 50000:50256", 7), variant_data=""):
     nb = json.loads(TEMPLATE.read_text(encoding="utf-8"))
     cells = nb["cells"]
     code_cells = [c for c in cells if c["cell_type"] == "code"]
@@ -150,10 +150,15 @@ def build_notebook(repo_url, commit, mode, secrets_dataset=None, repeats=1, env=
                 cell["source"] = ["!cd /kaggle/working/repo && mkdir -p runs_bench && python -m "
                                   f"{bench} 2>&1 | tee runs_bench/bench.log\n"]
             elif mode == "variants":
-                cell["source"] = [
+                # --variant-data: every run trains on tools/jury_data.py's rows with --jury-seed
+                data = (" --train-file runs_jury/data/train.jsonl --eval-file runs_jury/data/eval.jsonl"
+                        f" --seed {jury[1]}" if variant_data else "")
+                cell["source"] = ([
+                    f"!cd /kaggle/working/repo && python tools/jury_data.py --out runs_jury/data {variant_data}\n"]
+                    if variant_data else []) + [
                     "!cd /kaggle/working/repo && "
                     + "".join(f"{k}={v} " for k, v in run_env.items())
-                    + f"python harness/run_task.py --only solution --out runs_var/{name}\n"
+                    + f"python harness/run_task.py --only solution --out runs_var/{name}{data}\n"
                     for name, run_env in runs]
             elif mode == "jury":
                 cell["source"] = [
@@ -438,6 +443,9 @@ def main():
     parser.add_argument("--jury-data", default="--train-rows 10000:10256 --eval-rows 50000:50256",
                         help="--mode jury: arguments of tools/jury_data.py (which rows train and eval)")
     parser.add_argument("--jury-seed", type=int, default=7, help="--mode jury: run_task.py --seed")
+    parser.add_argument("--variant-data", default="", metavar="ARGS",
+                        help="--mode variants: train every run on tools/jury_data.py ARGS (pass with '=', "
+                             "e.g. --variant-data='--select longest') with --jury-seed")
     parser.add_argument("--variant", action="append", default=[], metavar="LABEL:K=V,K=V",
                         help="--mode variants: one solution-only run per variant and round (repeatable)")
     parser.add_argument("--repeats", type=int, default=1,
@@ -500,7 +508,7 @@ def main():
         json.dumps(build_notebook(args.repo, args.commit, args.mode, secrets_dataset, args.repeats,
                                   [tuple(e.split("=", 1)) for e in args.env], variants,
                                   args.bench, args.skip_pytest, args.abba, args.warm_run,
-                                  (args.jury_data, args.jury_seed)),
+                                  (args.jury_data, args.jury_seed), args.variant_data),
                    ensure_ascii=False, indent=1), encoding="utf-8")
     kernel = f"{args.user}/{args.slug}"
     meta = {"id": kernel, "title": args.title or args.slug, "code_file": nb_name,
