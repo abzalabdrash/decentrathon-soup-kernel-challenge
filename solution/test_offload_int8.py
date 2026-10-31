@@ -343,3 +343,44 @@ def test_raw_unpack_feeds_the_int8_backward_directly(int8_on, monkeypatch, resto
     # takes a tensor from the unpack
     assert rebuilt == len(layers) and rebuilt_fused == on_gpu < len(layers)
     assert torch.equal(got, ref)
+
+
+def test_int8_backward_from_the_int8_form_allocates_no_more(int8_on, monkeypatch):
+    """int8_bwd.mlp_backward fed the int8 form writes the SwiGLU derivative over its int32 product:
+    its input plus what it allocates is at most the half (gate|up) path's plus the scales (the half
+    input holds the derivative there), and the result is bit for bit the same."""
+    from types import SimpleNamespace
+
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+
+    from solution import int8_bwd
+    from solution.test_fused_proj import _config, _quantize_mlp
+
+    monkeypatch.setitem(int8_bwd._STATE, "on", True)
+    int8_bwd.compile_now()
+    mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=22).cuda()
+    plan = SimpleNamespace(gate=mlp.gate_proj, up=mlp.up_proj, down=mlp.down_proj,
+                           half=torch.float16)
+    tokens = 832
+    g = torch.Generator("cuda").manual_seed(5)
+    gate_up = (torch.randn(2 * 8960, tokens, device="cuda", generator=g) * 2).half()
+    grad16 = (torch.randn(tokens, 1536, device="cuda", generator=g) * 1e-2).half()
+    buffer = torch.empty(8960 * 1536, dtype=torch.float16, device="cuda")
+    wire, codec = int8_on.encode(gate_up)
+    int8_bwd.mlp_backward(plan, gate_up.clone(), grad16, buffer)  # the weights' column scales, cached once
+    results = []
+    for form in (codec.decode(wire), wire):
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        grad_x = int8_bwd.mlp_backward(plan, form, grad16, buffer)
+        torch.cuda.synchronize()
+        nbytes = form.numel() * form.element_size()
+        results.append((grad_x, torch.cuda.max_memory_allocated() - base + nbytes))
+        del form
+    (ref, half_peak), (got, int8_peak) = results
+    assert torch.equal(got, ref)
+    print(f"\nint8 MLP backward at {tokens} tokens: (gate|up) and allocations {half_peak / 2**20:.1f} "
+          f"MiB from the half form, {int8_peak / 2**20:.1f} MiB from the int8 form")
+    scales = 4 * (2 * 8960 // int8_on.GROUP) * tokens
+    assert int8_peak <= half_peak + scales + (1 << 16)  # allocation rounding
