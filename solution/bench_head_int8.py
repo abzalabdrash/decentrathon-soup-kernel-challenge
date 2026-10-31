@@ -144,8 +144,15 @@ def profile_heads(streamer, n, frac, resident, label):
     h16, t = hidden[order].contiguous(), targets[order].contiguous()
     n_lab = int((t != -100).sum())
     int8 = streamer._int8
-    for mode in ("fp16", "int8"):
-        int8.calls = 10**6 if mode == "int8" else -10**6
+    from . import head_int8
+
+    # int8 variants: (DELTA, LOSS_FIX): the run's default, no loss correction, no rescoring at all
+    variants = {"fp16": None, "int8": (1.0, True), "int8-nofix": (1.0, False), "int8-plain": (0.0, False)}
+    saved = head_int8.DELTA, head_int8.LOSS_FIX
+    for mode, setting in variants.items():
+        int8.calls = -10**6 if setting is None else 10**6
+        if setting is not None:
+            head_int8.DELTA, head_int8.LOSS_FIX = setting
 
         def once():
             streamer.prefetch(n)
@@ -168,6 +175,7 @@ def profile_heads(streamer, n, frac, resident, label):
         total = sum(r[0] for r in rows if not r[1].lower().startswith("memcpy"))
         print(f"profile {label} N {n} labelled {n_lab} {mode}: kernels {total:.2f} ms per head; " + "; ".join(
             f"{name} x{cnt} {ms:.2f}" for ms, name, cnt in rows[:9]), flush=True)
+    head_int8.DELTA, head_int8.LOSS_FIX = saved
 
 
 def bench_kernels(n, frac, reps=7, rows=4096, d=1536, chunks=38):

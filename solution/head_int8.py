@@ -144,6 +144,7 @@ def head_i8_chunk_kernel(
     wt_ptr, stride_wt,  # half (n_lab, D): W_q[target], written by the chunk that holds the target
     first, c0, vc, n_lab, D,  # first: 1 for the vocabulary's first chunk (a runtime flag: one compile)
     IGNORE: tl.constexpr, BLOCK: tl.constexpr, BLOCK_D: tl.constexpr,
+    RUNNER_UP: tl.constexpr,  # keep the runner-up (only for head_i8_rescore_kernel)
 ):
     row = row0 + tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -198,21 +199,22 @@ def head_i8_chunk_kernel(
         tl.store(sp_ptr + row, u_max / 127.0)
         tl.store(alpha_ptr + row, alpha)
         # the runner-up: the chunk's second largest, merged with the running two (earlier ids win ties)
-        x2 = tl.where(offs == c_idx, -float("inf"), x)
-        c_max2, c_idx2 = tl.max(x2, axis=0, return_indices=True, return_indices_tie_break_left=True)
-        b2 = -float("inf")
-        i2 = 0
-        if first == 0:
-            b2 = tl.load(best2_ptr + row)
-            i2 = tl.load(idx2_ptr + row)
-        up = c_max > best_old
-        keep_v = tl.where(up, best_old, b2)
-        keep_i = tl.where(up, idx_old, i2)
-        new_v = tl.where(up, c_max2, c_max)
-        new_i = tl.where(up, c0 + c_idx2, c0 + c_idx)
-        take = new_v > keep_v
-        tl.store(best2_ptr + row, tl.where(take, new_v, keep_v))
-        tl.store(idx2_ptr + row, tl.where(take, new_i, keep_i))
+        if RUNNER_UP:
+            x2 = tl.where(offs == c_idx, -float("inf"), x)
+            c_max2, c_idx2 = tl.max(x2, axis=0, return_indices=True, return_indices_tie_break_left=True)
+            b2 = -float("inf")
+            i2 = 0
+            if first == 0:
+                b2 = tl.load(best2_ptr + row)
+                i2 = tl.load(idx2_ptr + row)
+            up = c_max > best_old
+            keep_v = tl.where(up, best_old, b2)
+            keep_i = tl.where(up, idx_old, i2)
+            new_v = tl.where(up, c_max2, c_max)
+            new_i = tl.where(up, c0 + c_idx2, c0 + c_idx)
+            take = new_v > keep_v
+            tl.store(best2_ptr + row, tl.where(take, new_v, keep_v))
+            tl.store(idx2_ptr + row, tl.where(take, new_i, keep_i))
         if hit:
             q_row = q_ptr + t_local * stride_q
             wt_row = wt_ptr + row.to(tl.int64) * stride_wt
@@ -296,6 +298,11 @@ def head_i8_acc_kernel(acc_ptr, stride_acc, g_ptr, stride_g, alpha_ptr, sp_ptr, 
     if first == 0:
         g = tl.load(at, mask=md, other=0.0) * tl.load(alpha_ptr + row) + g
     tl.store(at, g, mask=md)
+
+
+def _rescoring():
+    """Whether head_i8_rescore_kernel runs (and the chunk kernel keeps the runner-up for it)."""
+    return DELTA > 0 or LOSS_FIX
 
 
 def _pad_rows(n):
@@ -424,7 +431,8 @@ class HeadInt8:
             self.log(f"[solution] head int8: {self.vocab} x {self.hidden} in {self.n_chunks} chunks of "
                      f"{self.rows} rows ({self.total_bytes / 2**20:.0f} MiB pinned, per-row scales, smoothing "
                      f"{'on' if self.smoothed else 'off'}) in {self.seconds:.2f} s (compilation "
-                     f"{t.get('compile', 0):.2f}, pinning {t.get('pin', 0):.2f}, quantization "
+                     f"{t.get('compile', 0):.2f}: " + ", ".join(f"{k} {v:.2f}" for k, v in t.get("kernels", {}).items())
+                     + f"; pinning {t.get('pin', 0):.2f}, quantization "
                      f"{t.get('quant', 0):.2f}), ready after {self.calls} heads; heads from number "
                      f"{START_HEADS + 1} on")
         elif not self._stop.is_set():
@@ -551,7 +559,8 @@ class HeadInt8:
                 head_i8_chunk_kernel[(nb,)](
                     logits, vc, b0, p_q, vc, s_h, sv, targets, m, s, e, best, x_t, idx, best2, idx2, alpha, sp,
                     q, d, wt, wt.stride(0), int(c == 0), c0, vc, n_lab, d,
-                    IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, num_warps=self.num_warps,
+                    IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
+                    num_warps=self.num_warps,
                 )
             if n_lab:
                 q_cols = q_t[:d * vc].view(d, vc)
@@ -569,7 +578,7 @@ class HeadInt8:
             acc, acc.stride(0), wt, wt.stride(0), grad_scale, n_lab, d,
             IGNORE=IGNORE_INDEX, BLOCK_D=BLOCK_D, num_warps=4,
         )
-        if n_lab and (DELTA > 0 or LOSS_FIX) and st.host.is_pinned():
+        if n_lab and _rescoring() and st.host.is_pinned():
             head_i8_rescore_kernel[(n_lab,)](
                 hidden16, hidden16.stride(0), st.host, st.host.stride(0), targets, idx, idx2, best, best2, x_t,
                 m, s, correct, loss, DELTA, n_lab, d, BLOCK_D=triton.next_power_of_2(d), FIX_LOSS=LOSS_FIX,
@@ -600,22 +609,32 @@ def _join_at_exit(ref):
 
 
 def warm_kernels(obj=None):
-    """Compiles the four kernels for the classes the head launches (in the build thread)."""
+    """Compiles the four kernels for the classes the head launches (in the build thread); with `obj`,
+    each one's seconds go to obj.times["kernels"]."""
     from .warmup import HIDDEN, compile_kernel, training_half_dtype
 
     half, f32, i8, i32, i64 = training_half_dtype(), torch.float32, torch.int8, torch.int32, torch.int64
     rows = obj.rows if obj is not None else 4096
     hidden = obj.hidden if obj is not None else HIDDEN
     warps = obj.num_warps if obj is not None else WARPS
+    spent = {}
+
+    def timed(name, *args, **kwargs):
+        began = time.perf_counter()
+        compile_kernel(*args, **kwargs)
+        spent[name] = time.perf_counter() - began
+
     # stride_l = rows of the chunk (4096 and the last 384: divisible by 16), the hidden size 1536;
     # row0, first, c0, vc, n_lab not specialized
-    compile_kernel(head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
-                   f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
-                   IGNORE=IGNORE_INDEX, BLOCK=triton.next_power_of_2(rows), BLOCK_D=BLOCK_D, num_warps=warps)
-    compile_kernel(head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK,
-                   num_warps=4)
-    compile_kernel(int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)
-    compile_kernel(head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, i32, f32, f32, f32, f32,
-                   f32, i32, f32, 1.0, 387, hidden, BLOCK_D=triton.next_power_of_2(hidden), FIX_LOSS=LOSS_FIX,
-                   num_warps=4)
-
+    timed("chunk", head_i8_chunk_kernel, i32, rows, 0, i8, rows, f32, f32, i64, f32, f32, f32, f32, f32, i32,
+          f32, i32, f32, f32, i8, hidden, half, hidden, 1, 0, rows, 387, hidden,
+          IGNORE=IGNORE_INDEX, BLOCK=triton.next_power_of_2(rows), BLOCK_D=BLOCK_D, RUNNER_UP=_rescoring(),
+          num_warps=warps)
+    timed("acc", head_i8_acc_kernel, f32, hidden, i32, hidden, f32, f32, 1, hidden, BLOCK=ACC_BLOCK, num_warps=4)
+    timed("transpose", int8_transpose_kernel, i8, i8, rows, hidden, T=T_TILE, num_warps=T_WARPS)
+    if _rescoring():
+        timed("rescore", head_i8_rescore_kernel, half, hidden, torch.float16, hidden, i64, i32, i32, f32, f32, f32,
+              f32, f32, i32, f32, 1.0, 387, hidden, BLOCK_D=triton.next_power_of_2(hidden), FIX_LOSS=LOSS_FIX,
+              num_warps=4)
+    if obj is not None:
+        obj.times["kernels"] = spent
