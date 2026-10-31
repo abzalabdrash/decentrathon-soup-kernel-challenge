@@ -221,6 +221,47 @@ not flips: at 0.44-0.50 % it sits at the 0.5 % line on seed 139.
   27.54 / 0.889**; peak 396 both. Steps 0-5 +0.52 s (the build thread), steps 6+ -0.19 s (-3.3 ms per step; ce85dc8
   before the accuracy work: -15.6 ms per step in soup-h1-abba3).
 
+## Where the gain went (orchestrator, ~18:45: diagnose on Modal x16 before any full/jury)
+
+- Head kernels (Modal x16 h1-prof3 / x8 h1-prof4, per head, resident chunks, 830 / 504 and 1440 / 861 labelled):
+  fp16 22.5 / 46.3 ms; int8 without the rescoring 22.0 / 38.8; with the rescoring (runner-up in every chunk)
+  23.6 / 41.1: the runner-up's second reduction 1.3 / 2.3 ms, the rescore kernel 0.3-0.7 ms, the loss correction
+  ~0. 39bba80: the runner-up from each chunk's max plus the second of the chunk that takes over the running top
+  (accuracy gap 0.041 % as before; chunk kernel +0.85 / +1.4 ms instead of +1.3 / +2.3).
+- In training (Modal x16, ABBA, per step after the switch): h1-abba8 (75558d9) int8 -5.4 ms, without the loss
+  correction -3.7, plain (no rescoring, no runner-up) -5.4; h1-abba9 (39bba80) int8 -2.9, plain -1.7. So the
+  accuracy machinery was not what ate the gain: the plain int8 head itself gained only 2-5 ms per step in training
+  against -17 ms per head in the bench. Steps 0-5: +0.28..+0.39 s (the build thread: compilation 2.1 s in training:
+  chunk 0.7, acc 0.3, transpose 0.5, rescore 0.5-0.6; quantization 0.3; pinning 0.03).
+- The host side: enqueueing one head took 10.5 ms on this laptop's CPU against 3.7 for the fp16 head (8 launches per
+  chunk: two forward GEMMs and two chunk kernels for the 512-row blocks, the transpose, the backward GEMM, the
+  accumulation; fused_proj.py's C1 notes: ~50 us of CPU per Triton launch on the training path, the harness's timing
+  events included). ad4cf33: the previous chunk's accumulation inside the next chunk kernel (one head_i8_acc_kernel
+  after the loop), the forward in one block up to 1024 rows, the views once per head: 5.8 ms at 830 tokens (fp16
+  4.0), 7.7 ms at 1440 (fp16 5.5).
+
+- After the launch cut (ad4cf33), Modal ABBAs, per step against fp16:
+  h1-abba11 (x16, 3 rounds): wall 48.06 -> 47.80 (-0.26), steps 0-5 +0.41 s, steps 6+ -0.56 s (-9.7 ms per step);
+  h1-abba10 (x8 host, copy-bound, not Kaggle-like): wall -1.45, steps 6+ -35 ms per step;
+  h1-abba12 (x16, 3 rounds): fp16 46.69; int8 46.98 (+0.29: steps 0-5 +0.41, steps 6+ -6.8 ms per step); build at
+  the end of Soup's setup (SOUP_SOLUTION_HEAD_INT8_AT=setup) 46.86 (+0.17: steps 0-5 -0.06, steps 6+ -6.9 ms per
+  step, but setup end -> train begin 4.03 against 3.60 s, +0.45).
+- The build costs 0.4-0.45 s wherever it goes: compiling the four kernels is ~2.1-2.3 s in training (cold, locally:
+  chunk 1.13 s + 0.45 s launcher build, acc 0.04 + 0.34, transpose 0.09 + 0.33, rescore 0.12 + 0.39; the launcher
+  builds are gcc subprocesses, the compile proper holds the GIL) and the quantization 0.25-0.35 s; the switch then
+  gains 7-10 ms per step on x16 hosts. Net 0..-0.26 s of wall: below the 0.4-0.5 s the orchestrator asked for.
+- Host side per head now (laptop CPU, cProfile): `_int_mm` 1.4 ms (76 calls), Triton launches 2.4 ms (79, mostly
+  argument specialization of ~40 arguments), copies 0.6 ms; more cuts (fewer arguments, the transpose inside the
+  chunk kernel with a 6 MiB buffer of its own) are worth ~0.1 s per run.
+
+## Summary (31 Oct ~19:35)
+
+- Code: 75558d9..ad4cf33 on the branch, int8 head off by default (SOUP_SOLUTION_HEAD_INT8=1 turns it on).
+- Accuracy: met (full + two juries 10/10 on d3d3f65, curves <= 0.5 %, eval +0.008..+0.022 %; real hidden states:
+  accuracy 0.04 %, loss 0.05 %, rewind 0.09 %, entropy 0.19 %).
+- Speed: not met. Best ABBA on an x16 host -0.26 s wall (h1-abba11), +0.17..+0.29 s in h1-abba12; the build's
+  ~0.4 s (mostly compiling the chunk kernel) against 7-10 ms per step. No-go as the default.
+
 ## Summary (31 Oct ~18:40)
 
 - Accuracy criteria met on the final code: full + two juries 10/10, |delta eval| 0.014-0.022 %, every curve
