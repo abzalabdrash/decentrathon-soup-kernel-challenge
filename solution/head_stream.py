@@ -92,6 +92,10 @@ DEFAULT_SLOTS = 2
 DEFAULT_PREFETCH = "norm"
 MAX_ROWS = 32768  # one Triton block holds a row's whole chunk
 BLOCK_D = 512
+# SOUP_SOLUTION_KERNEL_MERGE=1 (off by default): head_chunk_kernel's first chunk runs the FIRST=False variant
+# with the runtime flag `first` (MERGE=True), one compile instead of two (0.32 s for FIRST=True in the
+# T4 audit, docs/notes/recon/startup.md 3b); the values are the same bit for bit (test_head_stream.py)
+MERGE = os.environ.get("SOUP_SOLUTION_KERNEL_MERGE", "0").strip().lower() not in ("0", "false", "no", "")
 STAGING_ROWS = 4096  # pinned staging rows of the embedding lookup (grows on demand)
 NOT_CAST = ("gptq", "aqlm", "eetq", "torchao", "hqq")  # peft leaves these models' parameters alone
 
@@ -99,7 +103,7 @@ _STREAMERS = {}  # id(Parameter) -> HeadStreamer (tensors compare elementwise: n
 _SETUP = {"depth": 0}  # > 0 while Soup's _setup_transformers runs
 
 
-@triton.jit(do_not_specialize=["c0", "vc", "n_lab"])
+@triton.jit(do_not_specialize=["c0", "vc", "n_lab", "first"])
 def head_chunk_kernel(
     logits_ptr, stride_l,  # half (rows, vc): this chunk's logits; P written in place for labelled rows
     targets_ptr,  # int64 (rows,): target token id or IGNORE
@@ -110,6 +114,8 @@ def head_chunk_kernel(
     wt_ptr, stride_wt,  # half (n_lab, D): W[target], written by the chunk that holds the target
     c0, vc, n_lab, D,  # first vocabulary id of the chunk, its rows, labelled rows, hidden size
     FIRST: tl.constexpr, IGNORE: tl.constexpr, BLOCK: tl.constexpr, BLOCK_D: tl.constexpr,
+    first=0,  # with MERGE (SOUP_SOLUTION_KERNEL_MERGE): 1 for the first chunk, which FIRST=False then runs
+    MERGE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
@@ -131,6 +137,23 @@ def head_chunk_kernel(
         best = -float("inf")
         best_idx = 0
         x_t = 0.0
+    elif MERGE:
+        # FIRST's start values when `first` (one compiled variant for every chunk): the same values,
+        # so the same results bit for bit
+        if first != 0:
+            m_old = -float("inf")
+            s = 0.0
+            e = 0.0
+            best = -float("inf")
+            best_idx = 0
+            x_t = 0.0
+        else:
+            m_old = tl.load(m_ptr + row)
+            s = tl.load(s_ptr + row)
+            e = tl.load(e_ptr + row)
+            best = tl.load(best_ptr + row)
+            best_idx = tl.load(idx_ptr + row)
+            x_t = tl.load(xt_ptr + row)
     else:
         m_old = tl.load(m_ptr + row)
         s = tl.load(s_ptr + row)
@@ -155,7 +178,10 @@ def head_chunk_kernel(
     if row < n_lab:
         tl.store(base + offs, p.to(logits_ptr.dtype.element_ty), mask=mask)
         if not FIRST:
-            if alpha < 1.0:
+            rescale = alpha < 1.0
+            if MERGE:
+                rescale = rescale & (first == 0)  # FIRST leaves acc alone (beta=0 overwrites it)
+            if rescale:
                 acc_row = acc_ptr + row.to(tl.int64) * stride_acc
                 for d0 in range(0, D, BLOCK_D):
                     od = d0 + tl.arange(0, BLOCK_D)
@@ -535,8 +561,8 @@ class HeadStreamer:
                 head_chunk_kernel[grid](
                     logits, vc, targets, m, s, e, best, x_t, idx,
                     acc, stride_acc, w, w.stride(0), wt, stride_wt, c0, vc, n_lab, d,
-                    FIRST=c == 0, IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D,
-                    num_warps=self.num_warps,
+                    FIRST=c == 0 and not MERGE, IGNORE=IGNORE_INDEX, BLOCK=self.block, BLOCK_D=BLOCK_D,
+                    first=int(c == 0), MERGE=MERGE, num_warps=self.num_warps,
                 )
                 if n_lab > 0:
                     if self.fp32_out:
@@ -982,11 +1008,11 @@ def _warm_kernels(rows):
     # the training launches: stride_l = rows of the chunk (4096 and the last 384, or 8192 and 4480:
     # divisible by 16), hidden size and its strides 1536, c0 / vc / n_lab not specialized, every
     # pointer aligned
-    for first in (True, False):
+    for first in ((False,) if MERGE else (True, False)):
         compile_kernel(head_chunk_kernel, half, rows, torch.int64, f32, f32, f32, f32, f32, torch.int32,
                        f32, HIDDEN, half, HIDDEN, half, HIDDEN, 0, rows, 387, HIDDEN,
-                       FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D,
-                       num_warps=_num_warps(block))
+                       FIRST=first, IGNORE=IGNORE_INDEX, BLOCK=block, BLOCK_D=BLOCK_D, first=0,
+                       MERGE=MERGE, num_warps=_num_warps(block))
     compile_kernel(head_finish_kernel, torch.int64, f32, f32, f32, f32, torch.int32, f32, f32, torch.int32,
                    f32, HIDDEN, half, HIDDEN, 1.0, 387, HIDDEN, IGNORE=IGNORE_INDEX, BLOCK_D=BLOCK_D,
                    num_warps=4)
