@@ -28,8 +28,8 @@ from pathlib import Path
 
 import torch
 
-SNAP_STEP = int(os.environ.get("SOUP_SOLUTION_DIAG_SNAP_STEP", "6"))
-TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "8,9").split(","))
+SNAP_STEP = int(os.environ.get("SOUP_SOLUTION_DIAG_SNAP_STEP", "8"))
+TRACE_STEPS = tuple(int(s) for s in os.environ.get("SOUP_SOLUTION_DIAG_TRACE_STEPS", "10,11").split(","))
 MAX_ENTRIES = 1_000_000
 MIB = 2 ** 20
 
