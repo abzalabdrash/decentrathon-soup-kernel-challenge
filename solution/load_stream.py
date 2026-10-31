@@ -77,6 +77,13 @@ def _flag(name, default="0"):
     return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "")
 
 
+def _early_on():
+    """SOUP_SOLUTION_LOAD_EARLY (load_early.py) and its reading thread started."""
+    from . import load_early
+
+    return load_early.enabled() and load_early._STATE["thread"] is not None
+
+
 class _Pinner:
     """Pins host buffers in a thread, in the order the load will need them, while the main thread
     reads the checkpoint and quantizes (torch's fill and cudaHostRegister release the GIL): the
@@ -222,10 +229,22 @@ class _Load:
             except Exception:  # noqa: BLE001 - from the slice
                 where = None
 
+        early = None
+        if where is not None and _early_on():
+            path = getattr(self.locate, "fd_path", {}).get(where[0])
+            early = (path, where[1], torch.Size(shape).numel() * where[2].itemsize, where[2]) if path else None
+
         def fill():
             started = time.perf_counter()
             try:
-                if where is not None:
+                staged = None
+                if early is not None:
+                    from .load_early import view as early_view
+
+                    staged = early_view(*early[:3])  # LOAD_EARLY: waits for its chunk
+                if staged is not None:
+                    host.copy_(staged.view(early[3]).view(shape))  # the cast kernel of .to(), from pinned bytes
+                elif where is not None:
                     _cast_from_file(host, *where)
                 else:
                     host.copy_(source[...])
@@ -397,6 +416,7 @@ class _FileRanges:
             for key in handle.keys():
                 self.path_of.setdefault(key, path)
         self.files = {}  # path -> (fd, data start, header)
+        self.fd_path = {}  # fd -> path (LOAD_EARLY looks the bytes up by file)
 
     def _file(self, path):
         import json
@@ -412,6 +432,7 @@ class _FileRanges:
                 os.close(fd)
                 raise
             found = self.files[path] = (fd, 8 + size, header)
+            self.fd_path[fd] = path
         return found
 
     def __call__(self, source):
@@ -548,8 +569,8 @@ def _loader(original):
             return original(*args, **kwargs)
         ranges = None
         opened, _STATE["opened"] = _STATE["opened"], []
-        if (_flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(os, "preadv") and isinstance(bound.get("state_dict"), dict)
-                and opened):
+        if ((_flag("SOUP_SOLUTION_LOAD_PREAD") or _early_on()) and hasattr(os, "preadv")
+                and isinstance(bound.get("state_dict"), dict) and opened):
             try:
                 ranges = _FileRanges(bound["state_dict"], opened)
             except Exception:  # noqa: BLE001 - staged from the slices
@@ -582,6 +603,10 @@ def _loader(original):
             load.finish_embedding()  # EMBED_ASYNC: the embedding's values are complete from here on
             if load.copier is not None:
                 load.copier.close()
+            if _early_on():
+                from .load_early import release as release_early
+
+                release_early()  # LOAD_EARLY: after the copies out of it are done (copier.close synchronizes)
             load.pinner.close()
             if ranges is not None:
                 ranges.close()
@@ -682,7 +707,7 @@ def patch_loader(layers=None, only=None, embedding=None):
     _wrap(core_model_loading, "set_param_for_module", _setter)
     from .load_pinned import enabled as load_pinned_enabled
 
-    if _flag("SOUP_SOLUTION_LOAD_PREAD") and hasattr(modeling_utils, "safe_open"):
+    if (_flag("SOUP_SOLUTION_LOAD_PREAD") or _early_on()) and hasattr(modeling_utils, "safe_open"):
         _wrap(modeling_utils, "safe_open", _opener)
     if (load_pinned_enabled() or _flag("SOUP_SOLUTION_EMBED_ASYNC", "1")) and hasattr(core_model_loading,
                                                                                  "spawn_materialize"):

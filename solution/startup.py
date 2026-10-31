@@ -240,6 +240,12 @@ def prepare_imports(log=True):
     """The imports of apply()'s patches, done first with the shortcuts of the module docstring.
     Returns {module: seconds}. Any failure leaves the rest to the plain imports of the patches."""
     seconds = {}
+    try:
+        from .load_early import start as start_early_read
+
+        start_early_read()  # SOUP_SOLUTION_LOAD_EARLY: the checkpoint read into pinned memory during the imports
+    except Exception:  # noqa: BLE001 - the loader stages as before
+        pass
     if _flag("SOUP_SOLUTION_ENTRY_POINTS", "1"):
         try:
             share_entry_points()  # before bitsandbytes and fsspec read them
