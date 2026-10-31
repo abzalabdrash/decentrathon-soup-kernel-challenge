@@ -49,7 +49,7 @@ def _reference_rows(w32):
     return _round(w32 * inv[:, None]), rowmax / 127.0
 
 
-@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("chunks", [1, 2, 5])
 def test_decode_gate_up(int8_on, monkeypatch, chunks):
     gate, up = _linear4bit(1536, 8960, seed=4), _linear4bit(1536, 8960, seed=5)
     monkeypatch.setattr(int8_on, "CHUNKS", chunks)
@@ -67,6 +67,23 @@ def test_decode_gate_up(int8_on, monkeypatch, chunks):
     assert diff.max().item() <= 1 and (diff > 0).float().mean().item() < 1e-4
 
 
+def test_decode_gate_up_topk_columns(int8_on):
+    """The extra programs of the gate|up decode: the fp32 decode of the top-k columns, in the int8
+    rows' order; the int8 rows and scales are those of the plain decode."""
+    gate, up = _linear4bit(1536, 8960, seed=4), _linear4bit(1536, 8960, seed=5)
+    idx = torch.tensor([0, 7, 63, 64, 100, 511, 512, 777, 1000, 1023, 1024, 1200, 1300, 1400, 1501,
+                        1535], dtype=torch.int32, device="cuda")
+    out = torch.empty((2 * 8960, 1536), dtype=torch.int8, device="cuda")
+    scales = torch.empty(2 * 8960, dtype=torch.float32, device="cuda")
+    w_k = torch.empty((2 * 8960, 16), dtype=torch.float32, device="cuda")
+    int8_on._decode_gate_up(_ops(gate), _ops(up), out, scales, 8960, 1536, 8960, idx, w_k)
+    ref = torch.cat([_decoded(gate), _decoded(up)])
+    assert torch.allclose(w_k, ref[:, idx.long()], rtol=1e-6, atol=0)  # fp32 ulps of the absmax
+    out0, scales0 = torch.empty_like(out), torch.empty_like(scales)
+    int8_on._decode_gate_up(_ops(gate), _ops(up), out0, scales0, 8960, 1536, 8960)
+    assert torch.equal(out, out0) and torch.equal(scales, scales0)
+
+
 def test_decode_down(int8_on):
     down = _linear4bit(8960, 1536, seed=6)
     out = torch.empty((1536, 8960), dtype=torch.int8, device="cuda")
@@ -82,16 +99,27 @@ def test_decode_down(int8_on):
 def test_quantize_tokens(int8_on, dtype):
     x = torch.randn(830, 1536, device="cuda").to(dtype)
     x[5] = 0
-    x_q, s_x = int8_on.quantize_tokens(x, 830, 832)
+    x_q, s_x, _ = int8_on.quantize_tokens(x, 830, 832)
     amax = x.float().abs().amax(1)
     assert torch.allclose(s_x[:830], amax / 127.0, rtol=1e-6, atol=0)
     inv = torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))
     diff = (x_q[:830].float() - _round(x.float() * inv[:, None])).abs()
     assert diff.max().item() <= 1 and (diff > 0).float().mean().item() < 1e-4
     assert torch.all(x_q[830:] == 0) and torch.all(s_x[830:] == 0) and torch.all(x_q[5] == 0)
+    # with top-k channels: those go to x_k in fp32 and out of the int8 rows and their scale
+    idx = torch.tensor([3, 100, 1535] + list(range(200, 213)), device="cuda")
+    pos = torch.full((1536,), -1, dtype=torch.int32, device="cuda")
+    pos[idx] = torch.arange(16, dtype=torch.int32, device="cuda")
+    x_q, s_x, x_k = int8_on.quantize_tokens(x, 830, 832, pos)
+    assert torch.equal(x_k[:830], x.float()[:, idx]) and torch.all(x_k[830:] == 0)
+    rest = x.float().clone()
+    rest[:, idx] = 0
+    amax = rest.abs().amax(1)
+    assert torch.allclose(s_x[:830], amax / 127.0, rtol=1e-6, atol=0)
+    assert torch.all(x_q[:, idx] == 0)
 
 
-@pytest.mark.parametrize("chunks", [1, 2])
+@pytest.mark.parametrize("chunks", [1, 2, 5])
 def test_mlp_forward_kernels_match_torch(int8_on, monkeypatch, chunks):
     """gate_up_forward / down_forward against the same int8 math in torch (float64 products of the
     same int8 operands): exact up to the fp32 epilogue and the half roundings."""
@@ -100,7 +128,7 @@ def test_mlp_forward_kernels_match_torch(int8_on, monkeypatch, chunks):
                       _linear4bit(8960, 1536, seed=9))
     x = torch.randn(830, 1536, device="cuda")
     buffer = torch.empty(8960 * 1536, dtype=torch.float16, device="cuda")
-    x_q, s_x = int8_on.quantize_tokens(x, 830, 832)
+    x_q, s_x, _ = int8_on.quantize_tokens(x, 830, 832)
     gate_up, pmax = int8_on.gate_up_forward(x_q, s_x, _ops(gate), _ops(up), buffer, torch.float16,
                                             8960)
     wq, ws = _reference_rows(torch.cat([_decoded(gate), _decoded(up)]))
@@ -110,6 +138,17 @@ def test_mlp_forward_kernels_match_torch(int8_on, monkeypatch, chunks):
     g, u = gate_up[:8960].float(), gate_up[8960:].float()
     h = g * torch.sigmoid(g) * u
     assert torch.allclose(pmax.amax(0), h.abs().amax(0), rtol=1e-5, atol=1e-7)
+    # with top-k channels: the int8 product of the other channels + those in fp32
+    idx = torch.arange(16, dtype=torch.int32, device="cuda") * 96 + 5
+    pos = torch.full((1536,), -1, dtype=torch.int32, device="cuda")
+    pos[idx.long()] = torch.arange(16, dtype=torch.int32, device="cuda")
+    xq2, sx2, x_k = int8_on.quantize_tokens(x, 830, 832, pos)
+    gu2, _ = int8_on.gate_up_forward(xq2, sx2, _ops(gate), _ops(up), buffer, torch.float16, 8960,
+                                     idx=idx, x_k=x_k)
+    w32 = torch.cat([_decoded(gate), _decoded(up)])
+    ref2 = ((wq.double() @ xq2.double().t()).float() * ws[:, None] * sx2[None, :]
+            + w32[:, idx.long()] @ x_k.t()).half()
+    assert _rel(gu2, ref2) < 1e-3
     out = int8_on.down_forward(gate_up, pmax, _ops(down), buffer, torch.float16, 1536)
     amax = h.abs().amax(0)
     hq = _round(h.t() * torch.where(amax > 0, 127.0 / amax, torch.zeros_like(amax))[:, None])

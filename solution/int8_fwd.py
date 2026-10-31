@@ -60,7 +60,7 @@ _STATE = {"on": _env_on("SOUP_SOLUTION_INT8_FWD", "1" if _soup_train_process() e
 # the first START_CALLS eligible forwards stay fp16 while the thread compiles (4 steps x 28 layers)
 START_CALLS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_START_CALLS", "112"))
 # products of the gate|up GEMM (2I / CHUNKS weight rows each, one int32 buffer reused)
-CHUNKS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_CHUNKS", "1"))
+CHUNKS = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_CHUNKS", "5"))
 # which GEMMs run int8: "all" (gate|up and down) or "gu" (gate|up only: its epilogue writes the
 # SwiGLU output in half as well, and down stays the fp16 GEMM of fused_proj.py)
 MODE = os.environ.get("SOUP_SOLUTION_INT8_FWD_MODE", "gu").strip().lower()
@@ -77,12 +77,19 @@ def _layers(text):
 
 # layers (decoder layer_idx, rmsnorm.py's decoder patch tags the MLP) whose MLP forward stays fp16
 FP16_LAYERS = _layers(os.environ.get("SOUP_SOLUTION_INT8_FWD_FP16_LAYERS", ""))
+# input channels of gate|up per layer kept out of the int8 product and added in fp32 (0: none): the
+# TOPK largest max |x| of the layer's fp16 forwards before the switch (see `channels`)
+TOPK = int(os.environ.get("SOUP_SOLUTION_INT8_FWD_TOPK", "16"))
 _READY = threading.Event()
 QBLOCK, ABLOCK = nf4.QBLOCK, nf4.ABLOCK
 GU_ROWS, GU_CB = 8, 8  # gate/up decode: rows per program, 64-element blocks per row per iteration
+KC_ROWS = 64  # weight rows per program of the top-k column extraction (same launch as the decode)
 DN_ROWS, DN_CB = 4, 16  # down decode (rows of 8960: 140 blocks)
 QX_ROWS = 4  # token rows per program of the x quantization
-TI, TM, PG = 32, 64, 448  # gate|up epilogue: (features, tokens) tile, features per group
+# gate|up epilogue: (features, tokens) tile, features per group. bench_int8_fwd --sweep on the T4
+# (soup-i1-sweep1, us at 832 / 1440 / 2048 tokens): (32, 64, 224) 498 / 935 / 1212, (32, 64, 448)
+# 512 / 1023 / 1223, (32, 128, 448) 562 / 919 / 1138, (64, 32, 448) 598 / 1060 / 1481
+TI, TM, PG = 32, 64, 224
 TR, TH = 64, 64  # hidden quantization: (features, tokens) tile
 OUT_ROWS, OUT_BLOCK = 8, 512  # down epilogue tile
 
@@ -136,18 +143,50 @@ def _decode_rows(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4
 
 
 @triton.jit
+def _topk_cols(words_ptr, qabsmax_ptr, code2_ptr, absmax2_ptr, offset_ptr, nf4_ptr, idx_ptr, wk_ptr,
+               program, n_cols, chunk, shift, KROWS: tl.constexpr, K: tl.constexpr,
+               QBLOCK: tl.constexpr, ABLOCK: tl.constexpr):
+    # the fp32 decode of columns idx[0:K] of rows [program*KROWS, +KROWS) of an NF4 weight ->
+    # wk[dest, 0:K] (dest as in _decode_rows), element by element in nf4.py's word layout
+    rows = program * KROWS + tl.arange(0, KROWS)
+    j = tl.arange(0, K)
+    col = tl.load(idx_ptr + j)
+    elem = rows[:, None].to(tl.int64) * n_cols + col[None, :]
+    w = tl.load(words_ptr + elem // 8)
+    e = (elem % 8).to(tl.int32)
+    code = (w >> ((e // 2) * 8 + (1 - e % 2) * 4)) & 15
+    blk = elem // QBLOCK
+    q = tl.load(qabsmax_ptr + blk).to(tl.int32)
+    a = tl.load(code2_ptr + q) * tl.load(absmax2_ptr + blk // ABLOCK)
+    a = a + tl.load(offset_ptr)
+    val = tl.load(nf4_ptr + code) * a
+    dest = (rows // chunk) * (2 * chunk) + shift + rows % chunk
+    tl.store(wk_ptr + dest[:, None].to(tl.int64) * K + j[None, :], val)
+
+
+@triton.jit
 def nf4_int8_gu_kernel(w0, qa0, c0, s0, o0, l0, w1, qa1, c1, s1, o1, l1, out_ptr, scale_ptr,
-                       programs, blocks_per_row, out_stride, chunk,
+                       idx_ptr, wk_ptr, programs, kprograms, blocks_per_row, out_stride, chunk,
                        ROWS: tl.constexpr, CB: tl.constexpr, QBLOCK: tl.constexpr,
-                       ABLOCK: tl.constexpr):
-    # gate (programs [0, programs)) and up (the next `programs`) into one interleaved int8 buffer
+                       ABLOCK: tl.constexpr, K: tl.constexpr, KROWS: tl.constexpr):
+    # gate (programs [0, programs)) and up (the next `programs`) into one interleaved int8 buffer;
+    # with K, the next 2 * kprograms take the top-k columns of gate and of up in fp32 (wk)
     pid = tl.program_id(0)
     if pid < programs:
         _decode_rows(w0, qa0, c0, s0, o0, l0, out_ptr, scale_ptr, pid, blocks_per_row, out_stride,
                      chunk, 0, ROWS=ROWS, CB=CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
-    else:
+    elif pid < 2 * programs:
         _decode_rows(w1, qa1, c1, s1, o1, l1, out_ptr, scale_ptr, pid - programs, blocks_per_row,
                      out_stride, chunk, chunk, ROWS=ROWS, CB=CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
+    if K:
+        if pid >= 2 * programs:
+            kp = pid - 2 * programs
+            if kp < kprograms:
+                _topk_cols(w0, qa0, c0, s0, o0, l0, idx_ptr, wk_ptr, kp, out_stride, chunk, 0,
+                           KROWS=KROWS, K=K, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
+            else:
+                _topk_cols(w1, qa1, c1, s1, o1, l1, idx_ptr, wk_ptr, kp - kprograms, out_stride,
+                           chunk, chunk, KROWS=KROWS, K=K, QBLOCK=QBLOCK, ABLOCK=ABLOCK)
 
 
 @triton.jit
@@ -160,15 +199,22 @@ def nf4_int8_rows_kernel(w0, qa0, c0, s0, o0, l0, out_ptr, scale_ptr, blocks_per
 
 
 @triton.jit(do_not_specialize=["n_rows"])
-def quant_rows_kernel(x_ptr, x_stride, q_ptr, scale_ptr, n_rows, padded, n_cols,
-                      ROWS: tl.constexpr, BLOCK: tl.constexpr):
+def quant_rows_kernel(x_ptr, x_stride, q_ptr, scale_ptr, pos_ptr, xk_ptr, n_rows, padded, n_cols,
+                      ROWS: tl.constexpr, BLOCK: tl.constexpr, K: tl.constexpr):
     # x (n_rows, n_cols) fp32/half -> q (padded, n_cols) int8, scale = absmax / 127 per row; rows
-    # [n_rows, padded) are zeros with scale 0
+    # [n_rows, padded) are zeros with scale 0. With K: the columns with pos[col] >= 0 go to
+    # xk[row, pos[col]] in fp32 and count as zeros in q and its scale
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     cols = tl.arange(0, BLOCK)
     in_cols = cols < n_cols
     x = tl.load(x_ptr + rows[:, None].to(tl.int64) * x_stride + cols[None, :],
                 mask=(rows < n_rows)[:, None] & in_cols[None, :], other=0.0).to(tl.float32)
+    if K:
+        pos = tl.load(pos_ptr + cols, mask=in_cols, other=-1)
+        top = pos >= 0
+        tl.store(xk_ptr + rows[:, None].to(tl.int64) * K + pos[None, :], x,
+                 mask=(rows < padded)[:, None] & top[None, :])
+        x = tl.where(top[None, :], 0.0, x)
     amax = tl.max(tl.abs(x), axis=1)
     inv = tl.where(amax > 0.0, 127.0 / amax, 0.0)
     q8 = tl.minimum(tl.maximum(tl.floor(x * inv[:, None] + 0.5), -127.0), 127.0).to(tl.int8)
@@ -186,13 +232,14 @@ def _silu_mul(g, u):
 
 
 @triton.jit(do_not_specialize=["feat0", "group0"])  # one compiled variant for every chunk
-def int8_gate_up_kernel(acc_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, pmax_ptr, chunk, inter,
-                        tokens, feat0, per_group, group0, TI: tl.constexpr, TM: tl.constexpr,
-                        HIDDEN: tl.constexpr):
+def int8_gate_up_kernel(acc_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, pmax_ptr, xk_ptr, wk_ptr,
+                        chunk, inter, tokens, feat0, per_group, group0, TI: tl.constexpr,
+                        TM: tl.constexpr, HIDDEN: tl.constexpr, K: tl.constexpr):
     # program (t, grp) of one chunk: tokens [t*TM, +TM) over the chunk's features
     # [grp*per_group, +per_group), TI at a time. acc (2 * chunk, tokens) int32: gate rows then up
     # rows; w_scale the chunk's 2 * chunk row scales in the same order. HIDDEN: pmax_ptr is the
-    # SwiGLU output (I, tokens) in half, written here (MODE "gu"), instead of the group maxima
+    # SwiGLU output (I, tokens) in half, written here (MODE "gu"), instead of the group maxima.
+    # With K: + wk (2 * chunk, K) @ xk (tokens, K)^T in fp32, the top-k input channels' share
     tok = tl.program_id(0) * TM + tl.arange(0, TM)
     grp = tl.program_id(1)
     live = tok < tokens
@@ -200,14 +247,24 @@ def int8_gate_up_kernel(acc_ptr, w_scale_ptr, x_scale_ptr, gate_up_ptr, pmax_ptr
     peak = tl.zeros([TI, TM], dtype=tl.float32)
     up_acc = chunk.to(tl.int64) * tokens
     up_out = inter.to(tl.int64) * tokens
+    if K:
+        kk = tl.arange(0, K)
+        xkt = tl.trans(tl.load(xk_ptr + tok[:, None].to(tl.int64) * K + kk[None, :],
+                               mask=live[:, None], other=0.0))
     for f0 in range(0, per_group, TI):
         feat = grp * per_group + f0 + tl.arange(0, TI)
         at = feat[:, None].to(tl.int64) * tokens + tok[None, :]
         g = tl.load(acc_ptr + at, mask=live[None, :], other=0).to(tl.float32)
         u = tl.load(acc_ptr + up_acc + at, mask=live[None, :], other=0).to(tl.float32)
-        g = (g * tl.load(w_scale_ptr + feat)[:, None] * s_tok[None, :]).to(gate_up_ptr.dtype.element_ty)
-        u = (u * tl.load(w_scale_ptr + chunk + feat)[:, None]
-             * s_tok[None, :]).to(gate_up_ptr.dtype.element_ty)
+        g = g * tl.load(w_scale_ptr + feat)[:, None] * s_tok[None, :]
+        u = u * tl.load(w_scale_ptr + chunk + feat)[:, None] * s_tok[None, :]
+        if K:
+            wg = tl.load(wk_ptr + feat[:, None].to(tl.int64) * K + kk[None, :])
+            wu = tl.load(wk_ptr + (chunk + feat)[:, None].to(tl.int64) * K + kk[None, :])
+            g = g + tl.dot(wg, xkt, input_precision="ieee")
+            u = u + tl.dot(wu, xkt, input_precision="ieee")
+        g = g.to(gate_up_ptr.dtype.element_ty)
+        u = u.to(gate_up_ptr.dtype.element_ty)
         dest = (feat0 + feat)[:, None].to(tl.int64) * tokens + tok[None, :]
         tl.store(gate_up_ptr + dest, g, mask=live[None, :])
         tl.store(gate_up_ptr + up_out + dest, u, mask=live[None, :])
@@ -292,7 +349,14 @@ def shapes_ok(hidden, inter, down_rows):
     return (CHUNKS >= 1 and inter % CHUNKS == 0 and chunk % GU_ROWS == 0 and chunk % PG == 0
             and PG % TI == 0 and inter % TR == 0 and inter % 8 == 0 and hidden % 8 == 0
             and hidden % QBLOCK == 0 and inter % QBLOCK == 0 and down_rows % DN_ROWS == 0
-            and hidden % OUT_BLOCK == 0 and hidden <= 8192)
+            and hidden % OUT_BLOCK == 0 and hidden <= 8192 and inter % KC_ROWS == 0
+            and TOPK in (0, 16, 32, 64) and hidden >= TOPK)
+
+
+def observing():
+    """Whether the forwards still run fp16 before the switch (when `observe` collects the channel
+    maxima for TOPK); call after `usable` counted the forward."""
+    return TOPK > 0 and _STATE["on"] and _STATE["calls"] <= START_CALLS
 
 
 def usable(tokens):
@@ -311,13 +375,31 @@ def usable(tokens):
     return _READY.is_set()
 
 
-def _decode_gate_up(gate_ops, up_ops, out_i8, scales, inter, hidden, chunk):
+_DUMMY = {}
+
+
+def _dummy(device, dtype):
+    """A one-element tensor for the pointer arguments a K = 0 launch does not read."""
+    key = (device, dtype)
+    t = _DUMMY.get(key)
+    if t is None:
+        t = _DUMMY[key] = torch.zeros(1, dtype=dtype, device=device)
+    return t
+
+
+def _decode_gate_up(gate_ops, up_ops, out_i8, scales, inter, hidden, chunk, idx=None, wk=None):
     """W_gate and W_up (fused_proj._nf4_args operands) -> out_i8 (2I, D) int8 rows interleaved by
-    chunk, scales (2I,) fp32 in the same order."""
+    chunk, scales (2I,) fp32 in the same order; with idx (K,) int32, wk (2I, K) fp32 gets the fp32
+    decode of those columns in the same row order."""
     programs = inter // GU_ROWS
-    nf4_int8_gu_kernel[(2 * programs,)](
-        *gate_ops[:6], *up_ops[:6], out_i8, scales, programs, hidden // QBLOCK, hidden, chunk,
-        ROWS=GU_ROWS, CB=GU_CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
+    k = 0 if idx is None else idx.numel()
+    kprograms = inter // KC_ROWS if k else 0
+    if not k:
+        idx, wk = _dummy(out_i8.device, torch.int32), _dummy(out_i8.device, torch.float32)
+    nf4_int8_gu_kernel[(2 * programs + 2 * kprograms,)](
+        *gate_ops[:6], *up_ops[:6], out_i8, scales, idx, wk, programs, kprograms, hidden // QBLOCK,
+        hidden, chunk, ROWS=GU_ROWS, CB=GU_CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK, K=k, KROWS=KC_ROWS,
+        num_warps=4, enable_fp_fusion=False)
 
 
 def _decode_down(down_ops, out_i8, scales, hidden, inter):
@@ -326,43 +408,89 @@ def _decode_down(down_ops, out_i8, scales, hidden, inter):
         ROWS=DN_ROWS, CB=DN_CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
 
 
-def quantize_tokens(x2, n, padded):
-    """x2 (n, D) -> (x_q (padded, D) int8, s_x (padded,) fp32)."""
+def quantize_tokens(x2, n, padded, pos=None):
+    """x2 (n, D) -> (x_q (padded, D) int8, s_x (padded,) fp32, x_k): with pos (D,) int32 (channel ->
+    its slot among the top k, or -1), x_k (padded, k) fp32 holds those channels and x_q / s_x leave
+    them out; else x_k is None."""
     d = x2.shape[1]
-    x_q = torch.empty((padded, d), dtype=torch.int8, device=x2.device)
-    s_x = torch.empty(padded, dtype=torch.float32, device=x2.device)
+    device = x2.device
+    x_q = torch.empty((padded, d), dtype=torch.int8, device=device)
+    s_x = torch.empty(padded, dtype=torch.float32, device=device)
+    k = 0 if pos is None else TOPK
+    x_k = torch.empty((padded, k), dtype=torch.float32, device=device) if k else None
     quant_rows_kernel[(triton.cdiv(padded, QX_ROWS),)](
-        x2, x2.stride(0), x_q, s_x, n, padded, d, ROWS=QX_ROWS, BLOCK=triton.next_power_of_2(d))
-    return x_q, s_x
+        x2, x2.stride(0), x_q, s_x, pos if k else _dummy(device, torch.int32),
+        x_k if k else _dummy(device, torch.float32), n, padded, d, ROWS=QX_ROWS,
+        BLOCK=triton.next_power_of_2(d), K=k)
+    return x_q, s_x, x_k
+
+
+def observe(mlp, x2):
+    """Before the switch (fp16 forwards): the running max |x| per input channel of this MLP, kept
+    on the module (one fp32 (D,) tensor, GPU ops only, no sync)."""
+    peak = torch.linalg.vector_norm(x2, ord=float("inf"), dim=0)
+    if peak.dtype != torch.float32:
+        peak = peak.float()
+    prev = mlp.__dict__.get("_soup_int8_peak")
+    if prev is None:
+        mlp.__dict__["_soup_int8_peak"] = peak
+    else:
+        torch.maximum(prev, peak, out=prev)
+
+
+def channels(mlp, x2):
+    """(pos (D,) int32, idx (TOPK,) int32) of this MLP's top-k input channels by the max |x| that
+    `observe` collected (this call's x when nothing was collected), fixed for the rest of the run;
+    None with TOPK = 0."""
+    if TOPK <= 0:
+        return None
+    found = mlp.__dict__.get("_soup_int8_topk")
+    if found is not None:
+        return found
+    peak = mlp.__dict__.pop("_soup_int8_peak", None)
+    if peak is None:
+        observe(mlp, x2)
+        peak = mlp.__dict__.pop("_soup_int8_peak")
+    idx = peak.topk(TOPK).indices.to(torch.int32)
+    pos = torch.full((peak.numel(),), -1, dtype=torch.int32, device=peak.device)
+    pos[idx.long()] = torch.arange(TOPK, dtype=torch.int32, device=peak.device)
+    found = mlp.__dict__["_soup_int8_topk"] = (pos, idx)
+    return found
 
 
 def gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter, acquire=None, release=None,
-                    hidden=False):
+                    hidden=False, idx=None, x_k=None):
     """(gate|up) (2I, M) in `half` from the quantized input, and the per-group maxima of
     silu(gate) * up (GROUPS, M) for `down_forward`, or with `hidden` silu(gate) * up itself (I, M) in
     `half` (MODE "gu"). `buffer` is fused_proj's flat half buffer of one (I, D) weight (taken as int8
-    bytes); acquire / release: weight_stream ring hooks around the decode (or None)."""
+    bytes); acquire / release: weight_stream ring hooks around the decode (or None). idx / x_k: the
+    top-k channels (`channels`) and their values (`quantize_tokens`), added in fp32."""
     padded, d = x_q.shape
     device = x_q.device
     chunk = inter // CHUNKS
     w = buffer.view(torch.int8)[:2 * inter * d].view(2 * inter, d)
     s_w = torch.empty(2 * inter, dtype=torch.float32, device=device)
+    k = 0 if idx is None else idx.numel()
+    w_k = torch.empty((2 * inter, k), dtype=torch.float32, device=device) if k else None
     if acquire is not None:
         acquire()
-    _decode_gate_up(gate_ops, up_ops, w, s_w, inter, d, chunk)
+    _decode_gate_up(gate_ops, up_ops, w, s_w, inter, d, chunk, idx, w_k)
     if release is not None:
         release()
     gate_up = torch.empty((2 * inter, padded), dtype=half, device=device)
     pmax = (torch.empty((inter, padded), dtype=half, device=device) if hidden else
             torch.empty((inter // PG, padded), dtype=torch.float32, device=device))
     x_t = x_q.t()
+    if not k:
+        x_k, w_k = _dummy(device, torch.float32), _dummy(device, torch.float32)
     acc = None
-    for k in range(CHUNKS):
-        rows = w[2 * chunk * k:2 * chunk * (k + 1)]
+    for c in range(CHUNKS):
+        rows = w[2 * chunk * c:2 * chunk * (c + 1)]
         acc = torch._int_mm(rows, x_t) if acc is None else torch._int_mm(rows, x_t, out=acc)
         int8_gate_up_kernel[(triton.cdiv(padded, TM), chunk // PG)](
-            acc, s_w[2 * chunk * k:], s_x, gate_up, pmax, chunk, inter, padded, k * chunk, PG,
-            k * (chunk // PG), TI=TI, TM=TM, HIDDEN=hidden)
+            acc, s_w[2 * chunk * c:], s_x, gate_up, pmax, x_k, w_k[2 * chunk * c:] if k else w_k,
+            chunk, inter, padded, c * chunk, PG, c * (chunk // PG), TI=TI, TM=TM, HIDDEN=hidden,
+            K=k)
     return gate_up, pmax
 
 
@@ -401,14 +529,16 @@ def _warm():
                               torch.uint8)
     w_args = (i32, u8, f32, f32, f32, f32)
     chunk = INTERMEDIATE // CHUNKS
-    compile_kernel(quant_rows_kernel, f32, HIDDEN, i8, f32, tokens - 3, tokens, HIDDEN,
-                   ROWS=QX_ROWS, BLOCK=triton.next_power_of_2(HIDDEN))
-    compile_kernel(nf4_int8_gu_kernel, *w_args, *w_args, i8, f32, INTERMEDIATE // GU_ROWS,
-                   HIDDEN // QBLOCK, HIDDEN, chunk, ROWS=GU_ROWS, CB=GU_CB, QBLOCK=QBLOCK,
-                   ABLOCK=ABLOCK, num_warps=4, enable_fp_fusion=False)
+    k = max(TOPK, 0)
+    compile_kernel(quant_rows_kernel, f32, HIDDEN, i8, f32, i32, f32, tokens - 3, tokens, HIDDEN,
+                   ROWS=QX_ROWS, BLOCK=triton.next_power_of_2(HIDDEN), K=k)
+    compile_kernel(nf4_int8_gu_kernel, *w_args, *w_args, i8, f32, i32, f32,
+                   INTERMEDIATE // GU_ROWS, INTERMEDIATE // KC_ROWS if k else 0, HIDDEN // QBLOCK,
+                   HIDDEN, chunk, ROWS=GU_ROWS, CB=GU_CB, QBLOCK=QBLOCK, ABLOCK=ABLOCK, K=k,
+                   KROWS=KC_ROWS, num_warps=4, enable_fp_fusion=False)
     gu_only = MODE == "gu"
-    compile_kernel(int8_gate_up_kernel, i32, f32, f32, half, half if gu_only else f32, chunk,
-                   INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only)
+    compile_kernel(int8_gate_up_kernel, i32, f32, f32, half, half if gu_only else f32, f32, f32,
+                   chunk, INTERMEDIATE, tokens, 0, PG, 0, TI=TI, TM=TM, HIDDEN=gu_only, K=k)
     if gu_only:
         return None
     compile_kernel(int8_hidden_kernel, half, f32, f32, i8, INTERMEDIATE, tokens,

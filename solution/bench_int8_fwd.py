@@ -70,16 +70,20 @@ def timing(args):
         int8_fwd._warm()
     mlp = _quantize_mlp(mq.Qwen2MLP(_config()), seed=20).cuda().train()
     ops = _ops(mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+    idx = torch.randperm(1536, generator=torch.Generator().manual_seed(1))[:max(int8_fwd.TOPK, 1)]
+    pos = torch.full((1536,), -1, dtype=torch.int32)
+    pos[idx] = torch.arange(idx.numel(), dtype=torch.int32)
+    topk = (pos.cuda(), idx.to(torch.int32).cuda()) if int8_fwd.TOPK else None
     ctx = SimpleNamespace(save_for_backward=lambda *a: None)
     results = {}
     for m in args.m:
         x = torch.randn(1, m, 1536, device="cuda", generator=torch.Generator("cuda").manual_seed(m))
         plan = fused_proj._mlp_plan(mlp, x)
-        variants = {"fp16": None, "all": ops, "gu": ops}
+        variants = {"fp16": None, "all": (*ops, None), "gu": (*ops, None), "guk": (*ops, topk)}
 
         def call(name):
             plan.int8 = variants[name]
-            int8_fwd.MODE = name if name != "fp16" else int8_fwd.MODE
+            int8_fwd.MODE = "gu" if name == "guk" else (name if name != "fp16" else int8_fwd.MODE)
             return fused_proj._MLP.forward(ctx, x, plan)
 
         for name in variants:
@@ -100,7 +104,8 @@ def timing(args):
         results[m] = med
         print(f"M={m}: fp16 {med['fp16']:.3f} ms, int8 all {med['all']:.3f} ms "
               f"(x{med['fp16'] / med['all']:.2f}), int8 gu {med['gu']:.3f} ms "
-              f"(x{med['fp16'] / med['gu']:.2f})", flush=True)
+              f"(x{med['fp16'] / med['gu']:.2f}), gu + top-{int8_fwd.TOPK} {med['guk']:.3f} ms "
+              f"(x{med['fp16'] / med['guk']:.2f})", flush=True)
         if m in args.profile:
             for name in variants:
                 kernels = _profile(lambda: call(name))
@@ -142,36 +147,41 @@ def sweep(args):
         gate_up = torch.empty((2 * inter, m), dtype=torch.float16, device="cuda")
         hidden = torch.empty((inter, m), dtype=torch.float16, device="cuda")
         moved = acc.numel() * 4 + gate_up.numel() * 2 + hidden.numel() * 2
-        for ti, tm, pg, warps in [(32, 64, 448, 4), (32, 64, 896, 4), (16, 64, 448, 4),
-                                  (64, 64, 448, 4), (32, 128, 448, 4), (32, 128, 448, 8),
-                                  (16, 128, 448, 4), (64, 32, 448, 4), (32, 64, 448, 8),
-                                  (32, 64, 224, 4), (16, 64, 224, 2), (64, 64, 448, 8)]:
+        for ti, tm, pg, warps, kk in [(32, 64, 224, 4, 0), (32, 64, 224, 4, 16),
+                                      (32, 64, 448, 4, 16), (32, 128, 224, 4, 16),
+                                      (64, 64, 224, 4, 16), (32, 64, 224, 8, 16),
+                                      (16, 64, 224, 4, 16), (32, 64, 224, 4, 32)]:
+            x_k = torch.randn(m, max(kk, 1), device="cuda")
+            w_k = torch.randn(2 * inter, max(kk, 1), device="cuda")
             grid = (triton.cdiv(m, tm), inter // pg)
 
             def fn():
-                int8_fwd.int8_gate_up_kernel[grid](acc, s_w, s_x, gate_up, hidden, inter, inter, m,
-                                                   0, pg, 0, TI=ti, TM=tm, HIDDEN=True,
-                                                   num_warps=warps)
+                int8_fwd.int8_gate_up_kernel[grid](acc, s_w, s_x, gate_up, hidden, x_k, w_k, inter,
+                                                   inter, m, 0, pg, 0, TI=ti, TM=tm, HIDDEN=True,
+                                                   K=kk, num_warps=warps)
 
             us = _time_fn(fn, args.iters, args.rounds)
-            print(f"epilogue M={m} TI={ti} TM={tm} PG={pg} warps={warps}: {us:7.1f} us "
+            print(f"epilogue M={m} TI={ti} TM={tm} PG={pg} warps={warps} K={kk}: {us:7.1f} us "
                   f"({moved / us / 1e3:.0f} GB/s)", flush=True)
     gate, up = _linear4bit(d, inter, seed=4), _linear4bit(d, inter, seed=5)
     ops = _ops(gate, up)
     out = torch.empty((2 * inter, d), dtype=torch.int8, device="cuda")
     scales = torch.empty(2 * inter, dtype=torch.float32, device="cuda")
     moved = out.numel() + out.numel() // 2 + out.numel() // 64
-    for rows, cb, warps in [(8, 8, 4), (4, 8, 4), (16, 8, 4), (8, 8, 2), (8, 8, 8), (16, 8, 8),
-                            (4, 8, 2), (8, 4, 4), (32, 8, 8), (2, 8, 1)]:
+    idx = torch.randperm(d, generator=torch.Generator().manual_seed(1))[:16].to(torch.int32).cuda()
+    w_k = torch.empty((2 * inter, 16), device="cuda")
+    for rows, cb, warps, kk in [(8, 8, 4, 0), (8, 8, 4, 16), (16, 8, 4, 16), (8, 8, 2, 16)]:
         programs = inter // rows
+        kprog = inter // int8_fwd.KC_ROWS if kk else 0
 
         def fn():
-            int8_fwd.nf4_int8_gu_kernel[(2 * programs,)](
-                *ops[0][:6], *ops[1][:6], out, scales, programs, d // 64, d, inter,
-                ROWS=rows, CB=cb, QBLOCK=64, ABLOCK=256, num_warps=warps, enable_fp_fusion=False)
+            int8_fwd.nf4_int8_gu_kernel[(2 * programs + 2 * kprog,)](
+                *ops[0][:6], *ops[1][:6], out, scales, idx, w_k, programs, kprog, d // 64, d, inter,
+                ROWS=rows, CB=cb, QBLOCK=64, ABLOCK=256, K=kk, KROWS=int8_fwd.KC_ROWS,
+                num_warps=warps, enable_fp_fusion=False)
 
         us = _time_fn(fn, args.iters, args.rounds)
-        print(f"decode ROWS={rows} CB={cb} warps={warps}: {us:7.1f} us "
+        print(f"decode ROWS={rows} CB={cb} warps={warps} K={kk}: {us:7.1f} us "
               f"({moved / us / 1e3:.0f} GB/s)", flush=True)
 
 
@@ -206,6 +216,9 @@ class _Probe:
         self.stats = collections.defaultdict(lambda: collections.defaultdict(list))
         self.fp16_layers = set(fp16_layers)
         self.only = None  # with a layer index: only that layer's MLP runs int8
+        self.calibrate = False  # collect every layer's max |x| per input channel
+        self.chan_max = {}
+        self.topk = {}  # layer -> input channels of gate|up kept in fp16 ("gud" variants)
 
     def forward(self, mlp, x):
         from solution import int8_fwd
@@ -214,6 +227,10 @@ class _Probe:
         layer = mlp._probe_layer
         shape = x.shape
         x2 = x.reshape(-1, shape[-1])
+        if self.calibrate:
+            peak = x2.float().abs().amax(0)
+            prev = self.chan_max.get(layer)
+            self.chan_max[layer] = peak if prev is None else torch.maximum(prev, peak)
         n = x2.shape[0]
         padded = -(-n // 16) * 16
         inter, d = mlp.gate_proj.out_features, shape[-1]
@@ -222,7 +239,34 @@ class _Probe:
             return self._reference(mlp, x2)[2][:n].view(*shape[:-1], d)
         ops = _ops(mlp.gate_proj, mlp.up_proj, mlp.down_proj)
         buffer = torch.empty(inter * d, dtype=torch.float16, device=x.device)
-        x_q, s_x = int8_fwd.quantize_tokens(x2, n, padded)
+        x_q, s_x, _ = int8_fwd.quantize_tokens(x2, n, padded)
+        if self.use == "gud":  # gate|up int8 without the layer's top-k channels, those in fp16
+            idx = self.topk[layer]
+            rest = x2.clone()
+            rest[:, idx] = 0
+            x_q, s_x, _ = int8_fwd.quantize_tokens(rest, n, padded)
+            gate_up, _ = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer, torch.float16,
+                                                  inter, hidden=True)
+            w_gu = torch.cat([dequantize_nf4(mlp.gate_proj.weight, mlp.gate_proj.weight.quant_state,
+                                             torch.float16),
+                              dequantize_nf4(mlp.up_proj.weight, mlp.up_proj.weight.quant_state,
+                                             torch.float16)])
+            gu = gate_up[:, :n].float() + w_gu[:, idx].float() @ x2[:, idx].float().t()
+            gu = gu.half().float()
+            h = (gu[:inter] * torch.sigmoid(gu[:inter]) * gu[inter:]).half()
+            w_d = dequantize_nf4(mlp.down_proj.weight, mlp.down_proj.weight.quant_state,
+                                 torch.float16)
+            return torch.mm(h.t(), w_d.t()).view(*shape[:-1], d)
+        if self.use == "guk":  # the kernels' top-k path with the calibrated channels
+            idx = self.topk[layer].to(torch.int32)
+            pos = torch.full((d,), -1, dtype=torch.int32, device=x.device)
+            pos[idx.long()] = torch.arange(idx.numel(), dtype=torch.int32, device=x.device)
+            x_q, s_x, x_k = int8_fwd.quantize_tokens(x2, n, padded, pos)
+            _, h = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer, torch.float16,
+                                            inter, hidden=True, idx=idx, x_k=x_k)
+            w_d = dequantize_nf4(mlp.down_proj.weight, mlp.down_proj.weight.quant_state,
+                                 torch.float16)
+            return torch.mm(h.t(), w_d.t())[:n].view(*shape[:-1], d)
         if self.use == "all":
             gate_up, pmax = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer,
                                                      torch.float16, inter)
@@ -262,7 +306,7 @@ class _Probe:
         inter = mlp.gate_proj.out_features
         ops = _ops(mlp.gate_proj, mlp.up_proj, mlp.down_proj)
         buffer = torch.empty(inter * d, dtype=torch.float16, device=x2.device)
-        x_q, s_x = int8_fwd.quantize_tokens(x2, n, padded)
+        x_q, s_x, _ = int8_fwd.quantize_tokens(x2, n, padded)
         gu8, h8 = int8_fwd.gate_up_forward(x_q, s_x, ops[0], ops[1], buffer, torch.float16, inter,
                                            hidden=True)
         gu8, h8 = gu8[:, :n], h8[:, :n]
@@ -320,6 +364,16 @@ def errors(args):
     print(f"{len(rows)} rows, {sum(len(r[0]) for r in rows)} tokens", flush=True)
     losses = collections.defaultdict(list)
     uses = ["fp16", "all", "gu"] + (["all_skip", "gu_skip"] if args.fp16_layers else [])
+    if args.topk:
+        # "step 0": the first 4 rows in fp16 give every layer's channel maxima
+        probe.calibrate = True
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            for ids, _ in rows[:4]:
+                model(input_ids=ids.cuda()[None])
+        probe.calibrate = False
+        for layer, peak in probe.chan_max.items():
+            probe.topk[layer] = peak.topk(args.topk).indices
+        uses += ["gud", "guk"] if args.topk == int8_fwd.TOPK else ["gud"]
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         for ids, n_prompt in rows:
             ids = ids.cuda()[None]
@@ -386,6 +440,9 @@ def main():
     parser.add_argument("--single", choices=["gu", "all"], default=None,
                         help="also the loss with one layer at a time in this int8 variant")
     parser.add_argument("--single-rows", type=int, default=12)
+    parser.add_argument("--topk", type=int, default=0,
+                        help="also gate|up int8 with the top-k input channels (max |x| over the "
+                             "first 4 rows) in fp16")
     args = parser.parse_args()
     if args.errors:
         errors(args)

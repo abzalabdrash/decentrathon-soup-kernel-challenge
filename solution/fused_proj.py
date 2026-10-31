@@ -1512,31 +1512,40 @@ def _recompute_backward(plan, x16, grad_hidden, padded):
     return _accumulate(result, gate_up[inter:].t(), w)
 
 
-def _int8_forward_ops(plan, n, mlp):
-    """SOUP_SOLUTION_INT8_FWD: nf4.py's operands of (gate, up, down) when int8_fwd.py takes this
-    training forward (counted by int8_fwd.usable, which fixes the switch point; the layers of
-    int8_fwd.FP16_LAYERS are counted and stay fp16), else None. The caller has checked that
-    autograd is on; (gate|up) must be what the backward keeps."""
+def _int8_forward_ops(plan, x, mlp):
+    """SOUP_SOLUTION_INT8_FWD: (operands of gate, up, down for nf4.py's layout, the layer's top-k
+    input channels or None) when int8_fwd.py takes this training forward, else None. Every such
+    forward is counted by int8_fwd.usable, which fixes the switch point; the layers of
+    int8_fwd.FP16_LAYERS are counted and stay fp16; before the switch the forward records the
+    layer's max |x| per input channel (int8_fwd.observe). The caller has checked that autograd is
+    on; (gate|up) must be what the backward keeps."""
     if not int8_fwd._STATE["on"] or plan.recompute:
         return None
     gate, up, down = plan.gate, plan.up, plan.down
     if not int8_fwd.shapes_ok(gate.in_features, gate.out_features, down.out_features):
         return None
     ops = tuple(_nf4_args(base, plan.half) for base in (gate, up, down))
-    if None in ops or not int8_fwd.usable(-(-n // 8) * 8):
+    if None in ops:
         return None
+    hidden = x.shape[-1]
+    n = x.numel() // hidden
+    take = int8_fwd.usable(-(-n // 8) * 8)
     if int8_fwd.FP16_LAYERS:
         index = mlp.__dict__.get("_soup_layer_idx")  # None: no rmsnorm decoder patch, as listed
         if index is None or index in int8_fwd.FP16_LAYERS:
             return None
-    return tuple(found[1] for found in ops)
+    if not take:
+        if int8_fwd.observing():
+            int8_fwd.observe(mlp, x.reshape(n, hidden))
+        return None
+    return (*(found[1] for found in ops), int8_fwd.channels(mlp, x.reshape(n, hidden)))
 
 
 def _int8_forward(plan, x2, n, padded):
     """((gate|up) (2I, padded), output (padded, D)) in half on int8 tensor cores (int8_fwd.py); the
     int8 weights go through the shared buffer, the type ring's slots are held around each decode."""
     half, d, inter = plan.half, x2.shape[1], plan.gate.out_features
-    gate_ops, up_ops, down_ops = plan.int8
+    gate_ops, up_ops, down_ops, topk = plan.int8
     buffer = _buffer(x2.device, half, plan.down.out_features * plan.down.in_features)
     ring = plan.ring
     hooks_gu = hooks_d = (None, None)
@@ -1545,10 +1554,11 @@ def _int8_forward(plan, x2, n, padded):
                     lambda: (ring.release(plan.gate, 1), ring.release(plan.up, 1)))
         hooks_d = (lambda: ring.acquire(plan.down, 1), lambda: ring.release(plan.down, 1))
     gu_only = int8_fwd.MODE == "gu"  # down stays the fp16 GEMM on the epilogue's SwiGLU output
-    x_q, s_x = int8_fwd.quantize_tokens(x2, n, padded)
+    pos, idx = topk if topk is not None else (None, None)
+    x_q, s_x, x_k = int8_fwd.quantize_tokens(x2, n, padded, pos)
     gate_up, pmax = int8_fwd.gate_up_forward(x_q, s_x, gate_ops, up_ops, buffer, half, inter,
-                                             *hooks_gu, hidden=gu_only)
-    del x_q, s_x
+                                             *hooks_gu, hidden=gu_only, idx=idx, x_k=x_k)
+    del x_q, s_x, x_k
     if plan.early:
         from .offload import offload_early
 
@@ -1714,7 +1724,7 @@ def patch_qwen2_mlp_fused():
 
         if torch.is_grad_enabled():
             plan.early = EARLY and not plan.recompute and x.requires_grad
-            plan.int8 = _int8_forward_ops(plan, x.numel() // x.shape[-1], self)
+            plan.int8 = _int8_forward_ops(plan, x, self)
             if plan.early or (DRAIN_LAST and self is _CTX["last_mlp"]):
                 drain_inflight()  # the previous layer's (gate|up) leaves before this one is made
         return _MLP.apply(x, plan)
