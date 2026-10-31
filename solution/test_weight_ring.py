@@ -67,17 +67,21 @@ def night(monkeypatch):
     monkeypatch.delenv("SOUP_SOLUTION_WEIGHT_RING", raising=False)
 
 
-@pytest.mark.parametrize("attention", ["recompute", "math"])
-def test_type_ring_matches_layer_ring(layer_shaped_qwen_dir, night, monkeypatch, attention):
+@pytest.mark.parametrize("attention,mlp_recompute", [("recompute", False), ("math", False),
+                                                     ("recompute", True)])
+def test_type_ring_matches_layer_ring(layer_shaped_qwen_dir, night, monkeypatch, attention,
+                                      mlp_recompute):
     """Two training steps with each ring equal the resident model's step bit for bit (and so each
     other), with every dequantization of fused_proj.py queued behind a ~3 ms sleep of the GPU: a
     copy into a matrix slot that did not wait for the read before it, or a read that did not wait
-    for its copy, changes the result. `math`: SDPA's math backend per sequence (no recompute)."""
+    for its copy, changes the result. `math`: SDPA's math backend per sequence (no recompute);
+    `mlp_recompute`: SOUP_SOLUTION_MLP_MEMORY=recompute (up dequantized twice in the backward)."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     from solution import fused_proj
     from solution.weight_stream import stream_model_weights
 
+    monkeypatch.setitem(fused_proj._MLP_MEMORY, "recompute", mlp_recompute)
     model = _soup_like(layer_shaped_qwen_dir, dropout=0.05)
     sleep = [0]
     rebuild = fused_proj._weights
