@@ -259,6 +259,13 @@ entropy, 0.329 / 0.291 % accuracy, 0.165 / 0.174 % rewind; on 0.049 / 0.048, 0.1
   quant_t 9.6 (il) against 11.4, and the forward's SwiGLU 0.42 ms per call with the int8 form against
   0.15 for the example kernel: the fused kernel runs at ~120 GB/s at its 128 x 8 tile (chosen from the
   quantization-only sweep), so its tile is the next fix (soup-p1-bench3).
+- soup-p1-bench3 (T4, 04d6ada), the forward's SwiGLU with the int8 form against the example SwiGLU, ms
+  per layer at 704 / 1,440 / 2,048 tokens: example 0.160 / 0.318 / 0.451; tile 128 x 8 (default) 0.397 /
+  0.661 / 0.707; 64 x 4 0.293 / 0.798 / 0.861; 64 x 8 0.298 / 0.801 / 0.878; 32 x 4 0.456 / 0.983 /
+  1.448; 128 x 4 0.939 / 1.757 / 2.244 (spills). No tile wins everywhere; 128 x 8 stays (best on the long
+  steps, where the copies bind). What it adds (+0.24 to +0.34 ms per layer, ~0.3-0.5 s per run) is
+  inside the measured ABBA gains; a tile by token count (64 x 4 up to ~900 tokens) would take ~0.1 ms
+  per layer off the short steps (values identical, only speed).
 - A second compressed prefetch slot: not added. The jury-row peaks are 413-453 MiB already (main's own
   peak on those rows), so an extra 18 KB/token slot (up to 35 MiB at 2,048 tokens) would cross 450 on the
   longest rows; the waits it would hide are the 20 ms left in two steps above.
